@@ -1,0 +1,88 @@
+keyword_rules:
+  - keywords: [ZOOM, NOTION, CHATGPT, OPENAI, CANVA, GOOGLE, GSUITE,
+               MICROSOFT, ADOBE, AMAZON WEB SERVICES, AWS]
+    category: "Software & Subscriptions"
+    use_type: Business
+    priority: 0
+
+  - keywords: [ANNUAL FEE, ANNUAL MEMBERSHIP FEE, INTEREST CHARGE,
+               INTEREST CHARGED, PLAN FEE]
+    category: "Bank Charges & Fees"
+    use_type: Personal
+    priority: 10
+
+  - keywords: [UBER, LYFT]
+    category: Transportation
+    use_type: Personal
+    priority: 0
+
+  - keywords: [STARBUCKS]
+    category: Coffee
+    use_type: Personal
+    priority: 0
+
+  - keywords: [SPOTIFY, NETFLIX]
+    category: Entertainment
+    use_type: Personal
+    priority: 0
+
+  - keywords: [DIRECT DEPOSIT, PAYROLL, PAYCHECK, SALARY]
+    category: "Income: Salary"
+    use_type: Personal
+    priority: 0
+
+payment_keywords:
+  - CREDIT CARD BILL PAYMENT
+  - PAYMENT - THANK
+  - AUTOPAY PAYMENT
+  - AUTO PYMT
+  - AUTO PMT
+  - AUTOMATIC PAYMENT - THANK
+  - ONLINE PAYMENT - THANK
+  - PAYMENT THANK YOU
+  - ONLINE BANKING TRANSFER
+  - ONLINE SCHEDULED TRANSFER
+  - VENMO REPAYMENT
+
+payment_exclusions:
+  - "Check "
+
+category_aliases:
+  "Food and Drink": "Food & Drink"
+  "Bank Fees": "Bank Charges & Fees"
+  "Gyms and Fitness Centers": "Health & Wellness"
+
+split_rules: []
+
+category_overrides:
+  - categories:
+      - "Software & Subscriptions"
+      - "Professional Fees"
+      - "Advertising"
+      - "Contract Labor"
+    force_use_type: Business
+    note: "Hard override: always business"
+  - categories:
+      - "Childcare"
+      - "Donations"
+      - "Health & Wellness"
+    force_use_type: Personal
+    note: "Hard override: always personal"
+
+essential_categories:
+  - Utilities
+  - Insurance
+  - Health & Wellness
+  - Rent
+  - Housing
+  - Childcare
+
+ai_parser:
+  provider: claude
+  model: claude-sonnet-4-20250514
+  max_tokens: 8192
+
+ai_categorizer:
+  provider: openai
+  model: gpt-4o-mini
+  batch_size: 20

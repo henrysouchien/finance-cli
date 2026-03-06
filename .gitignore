@@ -1,0 +1,14 @@
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.env
+
+finance_cli/data/finance.db
+finance_cli/data/*.db-shm
+finance_cli/data/*.db-wal
+logs/
+inbox/
+exports/mcp_cache/
+dist/
+build/
+*.egg-info/

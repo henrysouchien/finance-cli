@@ -1,0 +1,67 @@
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[project]
+name = "finance-cli"
+dynamic = ["version"]
+description = "Personal finance CLI: bank statement import, transaction categorization, budgets, and net worth tracking"
+readme = "README.md"
+requires-python = ">=3.11"
+license = "MIT"
+
+dependencies = [
+    "pydantic>=2.0",
+    "pyyaml>=6.0",
+]
+
+[project.optional-dependencies]
+plaid = ["plaid-python>=20.0"]
+stripe = ["stripe>=7.0"]
+schwab = ["schwab-py>=1.0"]
+mcp = ["fastmcp>=2.0"]
+providers = [
+    "finance-cli[plaid]",
+    "finance-cli[stripe]",
+    "finance-cli[schwab]",
+]
+all = [
+    "finance-cli[providers]",
+    "finance-cli[mcp]",
+]
+dev = [
+    "pytest>=7.0",
+    "finance-cli[all]",
+]
+
+[project.scripts]
+finance-cli = "finance_cli.__main__:main"
+
+[tool.hatch.version]
+path = "finance_cli/__init__.py"
+
+[tool.hatch.build.targets.wheel]
+packages = ["finance_cli"]
+exclude = [
+    "finance_cli/data/*.db",
+    "finance_cli/data/*.db-shm",
+    "finance_cli/data/*.db-wal",
+    "finance_cli/data/*backup*",
+]
+
+[tool.hatch.build.targets.sdist]
+include = [
+    "finance_cli/",
+    "pyproject.toml",
+    "README.md",
+]
+exclude = [
+    "finance_cli/data/*.db",
+    "finance_cli/data/*.db-shm",
+    "finance_cli/data/*.db-wal",
+    "finance_cli/data/*backup*",
+]
+
+[tool.pytest.ini_options]
+testpaths = ["finance_cli/tests"]
+pythonpath = ["."]
