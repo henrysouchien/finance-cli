@@ -23,14 +23,14 @@ Key files: `docs/overview/PROJECT_GUIDE.md` (quick guide), `docs/overview/HOW_IT
 - Full Plaid client: link/sync/status/unlink + products backfill
 - Balance refresh + liabilities sync lifecycle
 - Institution linking for 7 live institutions
-- Plan: `docs/planning/completed/BALANCES_LIABILITIES_PLAN.md`
+- Plan: `docs/completed/BALANCES_LIABILITIES_PLAN.md`
 
 ### Plaid API Cooldown (Feb 2026)
 - Timestamp-based cooldown on sync/balance/liabilities API calls
 - Per-item `last_sync_at`, `last_balance_refresh_at`, `last_liabilities_fetch_at` columns
 - `--force` flag to bypass, env var overrides, error-status bypass
 - Smoke-tested live: cooldown skips work, force bypasses work
-- Plan: `docs/planning/completed/COOLDOWN_PLAN.md`
+- Plan: `docs/completed/COOLDOWN_PLAN.md`
 - 97 tests at completion
 
 ### AI Statement Parser — Phase 0 of Export/Ingest (Feb 2026)
@@ -38,7 +38,7 @@ Key files: `docs/overview/PROJECT_GUIDE.md` (quick guide), `docs/overview/HOW_IT
 - 5-gate validation framework: schema → field → semantic → reconciliation → confidence
 - `import_extracted_statement()` with replace-existing-hash reimport mode
 - Migration 006: AI audit columns on `import_batches`
-- Plan: `docs/planning/completed/AI_PARSER_PLAN.md` (9 review rounds, 24 issues found and fixed)
+- Plan: `docs/completed/AI_PARSER_PLAN.md` (9 review rounds, 24 issues found and fixed)
 - 156 tests at completion
 
 **Smoke test results (gpt-4o):**
@@ -63,7 +63,7 @@ Key findings from smoke tests:
 - Barclays: robust header scanning, card ending extraction from account number, payment detection via description
 - Refactored `import_csv()` into shared `_import_row_iter()` + new `import_normalized_rows()`
 - Fixed dry-run side effects: account/category creation no longer occurs during dry-run
-- Plan: `docs/planning/completed/CSV_NORMALIZERS_PLAN.md` (3 review rounds, 4 issues found and fixed)
+- Plan: `docs/completed/CSV_NORMALIZERS_PLAN.md` (3 review rounds, 4 issues found and fixed)
 - 195 tests at completion
 
 **Smoke test results:**
@@ -80,7 +80,7 @@ Key findings from smoke tests:
 - Config knob forwarding: `max_text_chars`, `confidence_warn`, `confidence_block` from rules.yaml
 - Batch `--dir` support, `--allow-partial`, `--require-reconciled`, `--account-id`
 - Enhanced confidence calibration in AI prompt + smarter all-null/zero handling
-- Plan: `docs/planning/completed/INGEST_CLI_PLAN.md` (5 review rounds, 14 issues found and fixed)
+- Plan: `docs/completed/INGEST_CLI_PLAN.md` (5 review rounds, 14 issues found and fixed)
 - 195 tests at completion
 
 **Smoke test results (gpt-4o via `ingest statement` CLI):**
@@ -96,14 +96,14 @@ Key findings from smoke tests:
 - Row-level `dedupe_key` dedup preserved unchanged (per-row `skipped_duplicates` counts)
 - `import_normalized_rows()` accepts `file_path` as keyword-only param for batch audit
 - Phase 2 (`--require-reconciled`) already implemented in `ingest` CLI command
-- Plan: `docs/planning/completed/CSV_AUDIT_PARITY_PLAN.md` (3 review rounds, 3 issues found and fixed)
+- Plan: `docs/completed/CSV_AUDIT_PARITY_PLAN.md` (3 review rounds, 3 issues found and fixed)
 - 201 tests at completion
 
 ### Ingest CSV CLI — Phase 3b of Export/Ingest (Feb 2026)
 - `ingest csv --file X --institution apple_card [--commit]` subcommand
 - Wires CSV normalizers into CLI: `normalize_csv()` → `import_normalized_rows()` with `file_path=` for batch audit
 - Dry-run by default, `--commit` to write; `--file` and `--institution` both required
-- Plan: `docs/planning/completed/INGEST_CSV_PLAN.md`
+- Plan: `docs/completed/INGEST_CSV_PLAN.md`
 - 208 tests at completion
 
 **Smoke test results:**
@@ -121,7 +121,7 @@ Key findings from smoke tests:
 - Matching: group by `(account_id, date, amount_cents)` across sources, verify with normalized description (exact/substring)
 - Source preference: `csv_import` > `plaid` > `pdf_import`; soft-delete loser (`is_active=0`), preserve `import_batches` metadata
 - Dry-run by default, `--commit` to apply, optional `--account-id`/`--from`/`--to` scope filters
-- Plan: `docs/planning/completed/CROSS_FORMAT_DEDUP_PLAN.md` (5 review rounds, 8 blocking issues found and fixed)
+- Plan: `docs/completed/CROSS_FORMAT_DEDUP_PLAN.md` (5 review rounds, 8 blocking issues found and fixed)
 - 243 tests at completion
 
 **Smoke test results:**
@@ -137,7 +137,7 @@ Key findings from smoke tests:
 - Lazy AI config resolution: CSV-only batches skip AI setup entirely
 - Per-file error isolation: one failure doesn't stop the batch
 - Auto-archive: successfully processed files move to `inbox/processed/` on commit
-- Plan: `docs/planning/completed/INGEST_BATCH_PLAN.md` (5 review rounds, 8 issues found and fixed)
+- Plan: `docs/completed/INGEST_BATCH_PLAN.md` (5 review rounds, 8 issues found and fixed)
 - 265 tests at completion
 
 ### End-to-End Import (Feb 2026)
@@ -160,7 +160,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Auto-detection added for all 3 in `detect_csv_institution()`
 - Registry: 4 new keys (`chase_credit`, `amex`, `american_express`, `bofa_checking`)
 - Account name unification: aligned CSV/PDF/AI source names (`"BoA Checking"` not `"BofA Checking"`) + parity tests
-- Plans: `docs/planning/completed/chase_credit_normalizer_plan.md`, `docs/planning/completed/amex_normalizer_plan.md`, `docs/planning/completed/bofa_checking_normalizer_plan.md`, `docs/planning/completed/account_unification_plan.md`
+- Plans: `docs/completed/chase_credit_normalizer_plan.md`, `docs/completed/amex_normalizer_plan.md`, `docs/completed/bofa_checking_normalizer_plan.md`, `docs/completed/account_unification_plan.md`
 - 288 tests at completion
 
 **Smoke test results:**
@@ -179,7 +179,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - New CLI command: `dedup backfill-aliases` (dry-run default, `--commit` to persist)
 - CSV normalizers now emit explicit `Account Type` metadata for better alias matching
 - Documentation updates shipped: README + Project Guide include alias backfill workflow and `dedup --help` discovery
-- Plan: `docs/planning/completed/account_unification_plan.md`
+- Plan: `docs/completed/account_unification_plan.md`
 - 305 tests at completion
 
 ### Code Quality Sweep (Feb 2026)
@@ -194,13 +194,13 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - CQ-008: Replaced deprecated `datetime.utcnow()` with timezone-aware equivalent
 - CQ-009: Deferred — DB path inside package dir, `TODO(CQ-009)` in `config.py` for pre-packaging fix
 - CQ-010: Added warning log when Chase card ending can't be extracted from filename
-- Plans: `docs/planning/completed/CODE_QUALITY.md`, `docs/planning/completed/CODE_QUALITY_PLAN.md`, `docs/planning/completed/CQ005_PLAN.md`
+- Plans: `docs/planning/CODE_QUALITY.md`, `docs/completed/CODE_QUALITY_PLAN.md`, `docs/completed/CQ005_PLAN.md`
 - 351 tests at completion
 
 ### Institution Name Pre-Validation (Feb 2026)
 - Inline validation in `ai_result_to_extract_result()`: canonical name lookup + fuzzy matching for AI-extracted institution names
 - Prevents unknown institutions from reaching account creation
-- Plan: `docs/planning/completed/NAME_VALIDATION_PLAN.md` (6 review rounds)
+- Plan: `docs/completed/NAME_VALIDATION_PLAN.md` (6 review rounds)
 
 ### Multi-Backend Extractor Abstraction (Feb 2026)
 - `StatementExtractor` Protocol with 3 implementations: `AIExtractor`, `AzureExtractor`, `BSCExtractor`
@@ -210,7 +210,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Migration 010: rewrites legacy AI dedupe keys, unique index on `(file_hash_sha256, bank_parser)`
 - Universal `validate_extract_result()` for all backends
 - Lazy factory with optional Azure/BSC deps
-- Plan: `docs/planning/completed/EXTRACTOR_ABSTRACTION.md` (4 review rounds, 12 issues found and fixed)
+- Plan: `docs/completed/EXTRACTOR_ABSTRACTION.md` (4 review rounds, 12 issues found and fixed)
 - 354 tests at completion
 
 ### AI Schema Overhaul — Balance + Reconciliation Fix (Feb 2026)
@@ -222,7 +222,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Currency wired to `accounts.iso_currency_code`
 - Migration 011: new columns on `import_batches` (total_charges_cents, total_payments_cents, new_balance_cents, expected_transaction_count)
 - Prompt version bumped v4 → v5
-- Plans: `docs/planning/completed/PDF_RECONCILIATION.md` (investigation), `docs/planning/completed/PDF_RECONCILIATION_FIX.md` (v4 prompt fix), `docs/planning/completed/AI_SCHEMA_OVERHAUL.md` (full overhaul, 4 review rounds)
+- Plans: `docs/completed/PDF_RECONCILIATION.md` (investigation), `docs/completed/PDF_RECONCILIATION_FIX.md` (v4 prompt fix), `docs/completed/AI_SCHEMA_OVERHAUL.md` (full overhaul, 4 review rounds)
 - 373 tests at completion
 
 ### AI Prompt v6 — Remove Charge/Payment Reconciliation (Feb 2026)
@@ -239,7 +239,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Run 1: Found 10 issues (BofA/Merrill name mismatch, Apple Card PDF wrong type, duplicate PDF imports, plaid unlink orphans, .CSV case sensitivity, provider hardcoding, token tracking, etc.)
 - Run 2 (v6 prompt): Validated charge/payment removal, 0 false mismatches, content-hash dedup working
 - All Run 1/2 issues resolved in subsequent commits
-- Plans: `docs/planning/E2E_IMPORT_TEST.md`, `docs/planning/E2E_ISSUES.md`, `docs/planning/E2E_FIXES_PLAN.md`
+- Plans: `docs/completed/E2E_IMPORT_TEST.md`, `docs/completed/E2E_ISSUES.md`, `docs/completed/E2E_FIXES_PLAN.md`
 
 ### Pipeline Observability (Feb 2026)
 - Structured logging + token/timing tracking across AI parser, categorizer, dedup, plaid sync
@@ -255,7 +255,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Strict mode (`--require-reconciled`) uniformly rejects both `mismatch` and `no_totals` across all backends
 - `ai_model` provenance fix: stores model version not parser label
 - Batch move hardening: collision detection, per-file try/except, `move_errors` in output
-- Plan: `docs/planning/INGESTION_FINDINGS_EXECUTION_PLAN_2026-02-21.md`
+- Plan: `docs/completed/INGESTION_FINDINGS_EXECUTION_PLAN_2026-02-21.md`
 - 442 tests at completion
 
 ### E2E Test Run 3 (Feb 2026)
@@ -266,13 +266,13 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - statement_total reconciliation: 4 matched (YearEndSummary), 8 mismatch, 2 no_totals
 - Content-hash dedup: 0 leaked duplicates (eStmt blocked correctly)
 - All Run 1/2 issues confirmed resolved; data quality spot check clean
-- Plan: `docs/planning/E2E_IMPORT_TEST.md`, `docs/planning/E2E3_OBSERVATIONS.md`
+- Plan: `docs/completed/E2E_IMPORT_TEST.md`, `docs/completed/E2E3_OBSERVATIONS.md`
 
 ### Institution Management Hardening (Feb 2026)
 - **OBS-002b**: Test that all `CANONICAL_NAMES` keys are pre-normalized (`key == normalize_key(key)`)
 - **OBS-001**: Enhanced `plaid status` — per-item report with status, last_sync timestamp, error highlighting, re-link command hints; `active_count`/`error_count` in summary and data
 - **OBS-008**: New `dedup detect-equivalences` subcommand — auto-detects candidate institution pairs via shared card_ending + overlapping `(date, amount_cents)` transactions; suggestion-only output, skips pairs already in `_INSTITUTION_EQUIVALENTS`
-- Plan: `docs/planning/completed/INSTITUTION_HARDENING_PLAN.md`
+- Plan: `docs/completed/INSTITUTION_HARDENING_PLAN.md`
 - 448 tests at completion
 
 ### OBS-003: Remove statement_total from AI Prompt (Feb 2026)
@@ -281,7 +281,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Simplified AI reconciliation: always `no_totals` — transaction extraction was correct in all cases
 - `--require-reconciled` still works for Azure/BSC backends; correctly rejects AI path
 - Azure/BSC extractors, legacy PDF regex extractors, and DB schema unchanged
-- Plan: `docs/planning/completed/OBS003_STATEMENT_TOTAL_REMOVAL_PLAN.md` (3 Codex review rounds, 6 issues found and fixed)
+- Plan: `docs/completed/OBS003_STATEMENT_TOTAL_REMOVAL_PLAN.md` (3 Codex review rounds, 6 issues found and fixed)
 - 444 tests at completion
 
 ## In Progress / Next Up
@@ -295,7 +295,7 @@ Cross-format dedup handled all overlaps automatically. 6 import batches logged w
 - Validated prompt v8 (OBS-003 fix), institution hardening, and pipeline stability
 - 23/23 files, 2,759 active txns, 166 dedup matches, 0 errors, 0 new issues
 - All E2E Run 3 follow-ups confirmed resolved (OBS-001, 002b, 003, 008, 011)
-- Plan: `docs/planning/E2E4_OBSERVATIONS.md`
+- Plan: `docs/completed/E2E4_OBSERVATIONS.md`
 
 ## Architecture Quick Reference
 
