@@ -54,7 +54,8 @@ Key command groups:
 - Account management: list/show/set-type/deactivate/activate with business flags
 - Provider routing: institution-level provider switching (Plaid vs direct API)
 - Monthly runner: orchestrates sync → dedup → categorize → detect → export
-- MCP server: 130 tools exposing all CLI handlers to Claude Code
+- MCP server: 131 tools exposing all CLI handlers to Claude Code
+- Telegram bot: Claude agent with MCP tools, chat persistence, workflow loading
 - Income CSV import, Wave accounting export
 - **Dump-and-go batch import**: `ingest batch --dir ./inbox/ --commit`
 
@@ -66,7 +67,8 @@ finance_cli/
 ├── config.py                # Settings, env vars, paths
 ├── db.py                    # SQLite connection, migration runner (WAL, FK enforcement)
 ├── models.py                # Pydantic v2 domain models
-├── mcp_server.py            # FastMCP server exposing 130 tools for Claude Code
+├── mcp_server.py            # FastMCP server exposing 131 tools for Claude Code
+├── telegram_bot/            # Telegram bot: Claude agent with MCP tools + persistence
 ├── categorizer.py           # Vendor memory: exact → prefix → keyword rule → Plaid
 ├── ai_categorizer.py        # AI categorization (Claude/OpenAI, batch, auto-remember)
 ├── ai_statement_parser.py   # AI PDF parsing: PDF → LLM → JSON → validation → ExtractResult (v8 prompt)
@@ -125,8 +127,8 @@ finance_cli/
 ├── data/
 │   ├── finance.db           # SQLite database
 │   └── rules.yaml           # User rules + AI parser config + essential_categories + revenue_streams
-├── migrations/              # 001-028 SQL migrations
-└── tests/                   # 1155 tests across 65+ modules
+├── migrations/              # 001-030 SQL migrations
+└── tests/                   # 1193 tests across 70 modules
 ```
 
 ## Import Workflow
@@ -205,7 +207,7 @@ See `docs/ingest/INGEST_WORKFLOW.md` for the full operational playbook.
 ## Testing
 
 ```bash
-python3 -m pytest -q                       # 1155 tests across 65+ modules
+python3 -m pytest -q                       # 1193 tests across 70 modules
 python3 -m pytest -k "test_ingest"         # ingest command tests
 python3 -m pytest -k "test_csv_normal"     # CSV normalizer + detection tests
 python3 -m pytest -k "test_dedup"          # cross-format dedup tests
@@ -239,8 +241,8 @@ Tests use `tmp_path` fixtures with fresh SQLite databases. External APIs (Plaid,
 
 ## MCP Server
 
-130 tools registered globally as `finance-cli` in `~/.claude.json`. Wraps all CLI handlers via Python imports. See `finance_cli/mcp_server.py`.
+131 tools registered globally as `finance-cli` in `~/.claude.json`. Wraps all CLI handlers via Python imports. See `finance_cli/mcp_server.py`.
 
 ## Agent Workflows
 
-8 operational playbooks in `docs/AGENT_WORKFLOWS.md`: morning briefing, monthly close, debt strategy, budget review, tax prep, new account onboarding, spending investigation, business accounting & tax compliance.
+11 operational playbooks in `docs/AGENT_WORKFLOWS.md` covering gap analysis, monthly review, debt planning, goal tracking, business tax, category design, subscription audit, budget setting/monitoring, category cleanup, and post-import QA. Available programmatically via `get_workflow(name)` MCP tool.

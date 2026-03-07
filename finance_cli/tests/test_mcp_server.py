@@ -240,6 +240,38 @@ def _seed_plaid_item(
 # 1. Status & Overview
 # ---------------------------------------------------------------------------
 
+class TestWorkflowTools:
+    def test_get_workflow_valid(self, db_path) -> None:
+        from finance_cli.mcp_server import get_workflow
+
+        result = get_workflow("monthly_review")
+
+        assert result["data"]["name"] == "monthly_review"
+        assert "Monthly Financial Review" in result["data"]["content"]
+        assert result["summary"]["workflow"] == "monthly_review"
+
+    def test_get_workflow_invalid(self, db_path) -> None:
+        from finance_cli.mcp_server import _WORKFLOW_SECTIONS, get_workflow
+
+        result = get_workflow("nonexistent")
+        expected = list(_WORKFLOW_SECTIONS.keys())
+
+        assert result["data"]["available"] == expected
+        assert result["summary"]["error"] == "Unknown workflow"
+        assert result["summary"]["available"] == expected
+
+    def test_get_workflow_all_names(self, db_path) -> None:
+        from finance_cli.mcp_server import _WORKFLOW_SECTIONS, get_workflow
+
+        for name, title in _WORKFLOW_SECTIONS.items():
+            result = get_workflow(name)
+
+            assert result["data"]["name"] == name
+            assert result["data"]["content"].strip()
+            assert result["summary"]["title"] == title
+            assert result["summary"]["lines"] > 0
+
+
 class TestStatusTools:
     def test_db_status(self, db_path, conn):
         _seed_txn(conn, is_reviewed=0)

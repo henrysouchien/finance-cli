@@ -29,7 +29,8 @@ External systems:
 | Business accounting | `commands/biz_cmd.py`, `forecasting.py` | P&L, cash flow, Schedule C, estimated tax, forecasting, runway |
 | Planning/reporting | `budget_engine.py`, `liquidity.py`, `subscriptions.py`, `exporters.py` | downstream analytics/exports |
 | Financial visibility | `commands/summary_cmd.py`, `commands/spending_cmd.py`, `commands/projection_cmd.py`, `commands/goal_cmd.py` | health dashboard, trend analysis, net worth projection, goal tracking |
-| MCP server | `mcp_server.py` | 130 tools exposing CLI handlers to Claude Code via FastMCP |
+| MCP server | `mcp_server.py` | 131 tools exposing CLI handlers to Claude Code via FastMCP |
+| Telegram bot | `telegram_bot/` | Claude agent with MCP tools, chat persistence, request metrics |
 
 ## 1) Every command starts the same way
 
@@ -407,7 +408,7 @@ Important: all balance queries exclude aliased accounts (`AND a.id NOT IN (SELEC
 
 ## 7) Storage architecture
 
-Migrations are authoritative for schema (`finance_cli/migrations/001–026_*.sql`).
+Migrations are authoritative for schema (`finance_cli/migrations/001–030_*.sql`).
 
 | Domain | Tables |
 |---|---|
@@ -469,7 +470,7 @@ Each command flow has specific tables it touches and a key that prevents duplica
 
 ## 9) MCP server
 
-`finance_cli/mcp_server.py` exposes 130 tools via FastMCP, wrapping CLI handlers directly via Python imports. Registered globally in `~/.claude.json` as `finance-cli`.
+`finance_cli/mcp_server.py` exposes 131 tools via FastMCP, wrapping CLI handlers directly via Python imports. Registered globally in `~/.claude.json` as `finance-cli`.
 
 Tool categories span: transactions, categories, accounts, balances, debt, budgets, subscriptions, business accounting, Stripe, Plaid, dedup, export, setup, projections, goals, and more.
 
@@ -497,6 +498,6 @@ Think of the system in five layers:
 2. **Pipeline layer:** parsing/normalization/import logic (`extractors/*`, `ai_statement_parser.py`, `importers/*`, `plaid_client.py`, `stripe_client.py`)
 3. **Analysis layer:** `debt_calculator.py`, `spending_analysis.py`, `forecasting.py`, `budget_engine.py`, `liquidity.py`, `subscriptions.py`
 4. **Identity + dedup layer:** `institution_names.py`, importer account helpers, `dedup.py`
-5. **Storage layer:** SQLite schema + 26 migrations (`finance_cli/db.py`, `finance_cli/migrations/`)
+5. **Storage layer:** SQLite schema + 30 migrations (`finance_cli/db.py`, `finance_cli/migrations/`)
 
 If you trace a bug in this order, root cause isolation is usually fast.

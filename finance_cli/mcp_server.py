@@ -10,6 +10,7 @@ Register with Claude Code:
 import functools
 import inspect
 import json
+import re
 import sys
 import uuid
 
@@ -191,6 +192,20 @@ _SIMULATION_CAP_CAVEAT = (
     "time/interest savings estimates are approximate."
 )
 
+_WORKFLOW_SECTIONS = {
+    "gap_analysis": "Financial Gap Analysis & Action Planning",
+    "monthly_review": "Monthly Financial Review",
+    "debt_planning": "Debt Payoff Planning",
+    "goal_tracking": "Goal Setting & Tracking",
+    "business_tax": "Business Accounting & Tax Compliance",
+    "category_design": "Category Taxonomy Design",
+    "subscription_audit": "Subscription Audit",
+    "budget_setting": "Expense Budget Setting",
+    "budget_monitoring": "Budget Monitoring & Alerts",
+    "category_cleanup": "Category Data Quality Cleanup",
+    "post_import_qa": "Post-Import QA",
+}
+
 
 def _attach_simulation_cap_caveat(result: dict[str, Any]) -> dict[str, Any]:
     data = dict(result.get("data", {}))
@@ -200,9 +215,65 @@ def _attach_simulation_cap_caveat(result: dict[str, Any]) -> dict[str, Any]:
     return {"data": data, "summary": result.get("summary", {})}
 
 
+def _unknown_workflow_response() -> dict:
+    available = list(_WORKFLOW_SECTIONS.keys())
+    return {
+        "data": {"available": available},
+        "summary": {"error": "Unknown workflow", "available": available},
+    }
+
+
 # ===================================================================
-# 1. Status & Overview (3 tools, read-only)
+# 1. Status & Overview (4 tools, read-only)
 # ===================================================================
+
+@mcp.tool()
+def get_workflow(name: str) -> dict:
+    """Get a documented agent workflow by name. Available workflows:
+    - gap_analysis: Financial gap analysis & action planning
+    - monthly_review: Monthly financial review check-in
+    - debt_planning: Debt payoff planning & optimization
+    - goal_tracking: Goal setting & tracking
+    - business_tax: Business accounting & tax compliance
+    - category_design: Category taxonomy design
+    - subscription_audit: Subscription audit & cleanup
+    - budget_setting: Expense budget setting
+    - budget_monitoring: Budget monitoring & alerts
+    - category_cleanup: Category data quality cleanup
+    - post_import_qa: Post-import transaction QA
+
+    Args:
+        name: Workflow name (e.g., "monthly_review", "debt_planning")
+    """
+    title = _WORKFLOW_SECTIONS.get(name)
+    if title is None:
+        return _unknown_workflow_response()
+
+    workflows_path = Path(__file__).resolve().parent.parent / "docs" / "AGENT_WORKFLOWS.md"
+    text = workflows_path.read_text(encoding="utf-8")
+
+    for section in re.split(r"^## ", text, flags=re.MULTILINE):
+        if not section.strip():
+            continue
+        section_title, separator, body = section.partition("\n")
+        if not separator:
+            continue
+        section_title = section_title.strip()
+        if section_title != title:
+            continue
+
+        section_text = f"## {section_title}\n{body}".strip()
+        return {
+            "data": {"name": name, "content": section_text},
+            "summary": {
+                "workflow": name,
+                "title": section_title,
+                "lines": len(section_text.splitlines()),
+            },
+        }
+
+    return _unknown_workflow_response()
+
 
 @mcp.tool()
 def db_status() -> dict:

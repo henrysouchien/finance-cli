@@ -24,6 +24,7 @@ log = logging.getLogger(__name__)
 # to the MCP server are excluded by default until explicitly allowed here.
 _ALLOWED_TOOLS: frozenset[str] = frozenset(
     {
+        "get_workflow",
         "db_status",
         "setup_check",
         "setup_status",
@@ -95,6 +96,17 @@ Known targets and context:
 - Personal discretionary budget targets: Dining $400/month, Shopping $150/month, Entertainment $100/month.
 - Optimize for closing the monthly gap and watching for debt-trap situations where minimum payments do not cover interest.
 - If data is missing or inconsistent, say that plainly and ask a targeted follow-up.
+
+You have access to documented workflows via the get_workflow tool. Workflows are advisory guides written with CLI command names — map them to your available MCP tools. If a workflow step requires a tool you don't have, skip it or tell the user it needs the CLI.
+
+Trigger workflows when the user asks for structured processes:
+- "monthly review" / "how am I doing" -> get_workflow("monthly_review")
+- "help with debt" / "payoff plan" -> get_workflow("debt_planning")
+- "audit subscriptions" -> get_workflow("subscription_audit")
+- "set budgets" -> get_workflow("budget_setting")
+- "check budgets" / "budget alerts" -> get_workflow("budget_monitoring")
+- "financial overview" / "where do I stand" -> get_workflow("gap_analysis")
+- "business taxes" / "schedule c" -> get_workflow("business_tax")
 """
 
 
