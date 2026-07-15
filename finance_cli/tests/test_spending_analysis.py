@@ -76,6 +76,18 @@ def test_load_essential_categories_from_rules(monkeypatch) -> None:
     assert loaded == frozenset({"Entertainment", "Utilities"})
 
 
+def test_load_essential_categories_uses_explicit_rules_path(tmp_path: Path) -> None:
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        "essential_categories:\n  - Entertainment\n  - Utilities\n",
+        encoding="utf-8",
+    )
+
+    loaded = spending_analysis.load_essential_categories(rules_path=rules_path)
+
+    assert loaded == frozenset({"Entertainment", "Utilities"})
+
+
 def test_is_essential_case_insensitive() -> None:
     essential = frozenset({"Utilities"})
     assert spending_analysis.is_essential("utilities", essential)

@@ -51,6 +51,17 @@ def _seed_transaction(conn, *, account_id, amount_cents, date="2026-02-15",
     return tid
 
 
+def _last_complete_month_midpoints(conn) -> list[str]:
+    row = conn.execute(
+        """
+        SELECT date('now', 'start of month', '-3 months', '+14 days') AS month_1,
+               date('now', 'start of month', '-2 months', '+14 days') AS month_2,
+               date('now', 'start of month', '-1 month', '+14 days') AS month_3
+        """
+    ).fetchone()
+    return [str(row["month_1"]), str(row["month_2"]), str(row["month_3"])]
+
+
 def test_projection_empty_db(db_path: Path) -> None:
     """Projection on empty DB returns all zeros."""
     with connect(db_path) as conn:
@@ -121,13 +132,16 @@ def test_projection_negative_net_savings(db_path: Path) -> None:
     with connect(db_path) as conn:
         aid = _seed_account(conn, account_type="checking", balance_cents=1_000_000)
         # Seed expenses in last 3 complete months (use dates that are complete months)
-        for month in ["2025-12-15", "2026-01-15", "2026-02-15"]:
+        for month in _last_complete_month_midpoints(conn):
             _seed_transaction(conn, account_id=aid, amount_cents=-500_00, date=month)
             _seed_transaction(conn, account_id=aid, amount_cents=100_00, date=month)
         result = projection_cmd.handle_projection(_ns(months=12), conn)
 
     data = result["data"]
-    assert data["net_savings_cents"] < 0
+    assert data["months_with_data"] == 3
+    assert data["avg_income_cents"] == 100_00
+    assert data["avg_expense_cents"] == 500_00
+    assert data["net_savings_cents"] == -400_00
     projection = data["projection"]
     month0 = next(r for r in projection if r["month"] == 0)
     month12 = next(r for r in projection if r["month"] == 12)

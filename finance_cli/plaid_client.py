@@ -16,19 +16,121 @@ import json
 import logging
 import os
 import re
+import secrets
 import sqlite3
+import hmac
+import threading
 import time
 import uuid
 from dataclasses import dataclass
 from datetime import date
 from hashlib import sha256
-from typing import Any, Callable
+from pathlib import Path
+from typing import TYPE_CHECKING, Any, Callable
+from urllib.parse import parse_qs, urlencode, urlparse, urlunparse
+
+from joserfc import jwk as jose_jwk
+from joserfc import jws as jose_jws
+from joserfc import jwt as jose_jwt
+from joserfc.errors import JoseError
 
 from .categorizer import map_plaid_pfc_to_category, match_transaction
+from .exceptions import IntegrationError
+from .importers import _scrub_card_ending
 from .models import dollars_to_cents
 from .provider_routing import check_provider_allowed
+from . import crypto_envelope
+from .secrets_store import migrate_provider_ref_to_vault, resolve_secret_ref
+
+if TYPE_CHECKING:
+    from .storage_client import StorageConnection
 
 logger = logging.getLogger(__name__)
+_REVOCATION_ERROR_MESSAGE_LIMIT = 200
+PLAID_COST_DB_PATH_UNAVAILABLE_REASON = "cost database path unavailable"
+_revocation_failure_handler: Callable[[dict[str, Any]], None] | None = None
+
+
+def register_revocation_failure_handler(handler: Callable[[dict[str, Any]], None]) -> None:
+    """Register a process-level handler for non-terminal Plaid revoke failures."""
+    global _revocation_failure_handler
+    _revocation_failure_handler = handler
+
+
+def clear_revocation_failure_handler() -> None:
+    """Clear the process-level revoke failure handler."""
+    global _revocation_failure_handler
+    _revocation_failure_handler = None
+
+
+def _get_revocation_failure_handler() -> Callable[[dict[str, Any]], None] | None:
+    return _revocation_failure_handler
+
+
+def _coerce_db_path_from_arg(
+    db_path_or_conn: "sqlite3.Connection | StorageConnection | str | Path | None",
+) -> str | Path | None:
+    if isinstance(db_path_or_conn, sqlite3.Connection):
+        from .db import _connected_main_db_path
+
+        return _connected_main_db_path(db_path_or_conn)
+
+    # StorageConnection: derive the per-user finance.db path. _open_db will
+    # then re-route through db.connect() which dispatches back to a fresh
+    # StorageConnection for remote-storage users (one extra OpenSession per
+    # cost write - accepted cost for independent commit semantics, see plan
+    # section 2 Option B rationale).
+    from .storage_client import StorageConnection
+
+    if isinstance(db_path_or_conn, StorageConnection):
+        from .config import CliSettings
+        from .user_provisioning import user_db_path
+
+        data_root = CliSettings().web_data_root
+        if data_root is None:
+            return None
+        return user_db_path(data_root, db_path_or_conn.user_id)
+
+    return db_path_or_conn
+
+
+def resolve_plaid_cost_db_path(
+    db_path_or_conn: "sqlite3.Connection | StorageConnection | str | Path | None",
+) -> str | Path | None:
+    """Resolve the DB path used by Plaid cost guardrails and ledger writes."""
+    return _coerce_db_path_from_arg(db_path_or_conn)
+
+
+def _record_plaid_api_call(
+    db_path_or_conn: "sqlite3.Connection | StorageConnection | str | Path | None",
+    operation: str,
+    *,
+    success: bool = True,
+    request_id: str | None = None,
+    item_id: str | None = None,
+) -> None:
+    """Record a Plaid API call in cost_ledger. Never raises."""
+    try:
+        from .cost_tracking import PLAID_OPERATION_COSTS_USD6, record_cost
+
+        cost = PLAID_OPERATION_COSTS_USD6.get(operation, 0) if success else 0
+        db_path = resolve_plaid_cost_db_path(db_path_or_conn)
+        record_cost(
+            db_path,
+            provider="plaid",
+            operation=operation,
+            cost_usd6=cost,
+            is_estimated=True,
+            request_id=request_id,
+            idempotency_key=None,
+        )
+    except Exception as exc:
+        logger.warning(
+            "plaid cost ledger record failed operation=%s item_id=%s err=%s",
+            operation,
+            item_id,
+            exc,
+        )
 
 
 @dataclass(frozen=True)
@@ -39,11 +141,13 @@ class PlaidConfigStatus:
     env: str | None
 
 
-class PlaidUnavailableError(RuntimeError):
+class PlaidUnavailableError(IntegrationError):
     """Raised when Plaid operations are requested but setup is incomplete."""
 
+    http_status = 503
 
-class PlaidSyncError(RuntimeError):
+
+class PlaidSyncError(IntegrationError):
     """Raised when Plaid sync fails."""
 
 
@@ -124,6 +228,10 @@ _INVESTMENT_TYPE_MAP: dict[str, tuple[str, bool]] = {
     "fee": ("Bank Charges & Fees", False),
     "transfer": ("Payments & Transfers", True),
 }
+_PLAID_WEBHOOK_JWK_TTL_SECONDS = 3600
+_PLAID_WEBHOOK_JWK_CACHE: dict[str, tuple[float, Any]] = {}
+_PLAID_WEBHOOK_JWK_CACHE_LOCK = threading.Lock()
+_PLAID_WEBHOOK_JWT_ALGORITHMS = ["ES256"]
 
 
 def _get_cooldown_seconds(call_type: str) -> int:
@@ -232,6 +340,101 @@ def config_status() -> PlaidConfigStatus:
     )
 
 
+def _plaid_webhook_jwk_cache_get(kid: str) -> Any | None:
+    now = time.time()
+    with _PLAID_WEBHOOK_JWK_CACHE_LOCK:
+        cached = _PLAID_WEBHOOK_JWK_CACHE.get(kid)
+        if cached is None:
+            return None
+        expires_at, key = cached
+        if expires_at > now:
+            return key
+        _PLAID_WEBHOOK_JWK_CACHE.pop(kid, None)
+    return None
+
+
+def _plaid_webhook_cache_key(kid: str, key_dict: dict[str, Any]) -> Any:
+    now = time.time()
+    expires_at = now + _PLAID_WEBHOOK_JWK_TTL_SECONDS
+    key_expired_at = key_dict.get("expired_at")
+    if isinstance(key_expired_at, int):
+        expires_at = min(expires_at, float(key_expired_at))
+
+    key = jose_jwk.import_key(key_dict)
+    with _PLAID_WEBHOOK_JWK_CACHE_LOCK:
+        _PLAID_WEBHOOK_JWK_CACHE[kid] = (expires_at, key)
+    return key
+
+
+def _get_plaid_webhook_jwk(kid: str) -> Any:
+    cached = _plaid_webhook_jwk_cache_get(kid)
+    if cached is not None:
+        return cached
+
+    client = _create_plaid_api_client()
+    from plaid.model.webhook_verification_key_get_request import WebhookVerificationKeyGetRequest
+
+    response = client.webhook_verification_key_get(WebhookVerificationKeyGetRequest(key_id=kid))
+    key_model = getattr(response, "key", None)
+    key_dict = key_model.to_dict() if key_model is not None else None
+    if not isinstance(key_dict, dict):
+        raise RuntimeError("Plaid webhook verification key response missing key data")
+    return _plaid_webhook_cache_key(kid, key_dict)
+
+
+def _extract_plaid_webhook_header(token: str) -> dict[str, Any]:
+    segments = token.split(".")
+    if len(segments) != 3:
+        raise ValueError("Invalid Plaid-Verification header")
+
+    try:
+        header = jose_jws.extract_compact(token.encode("ascii")).headers()
+    except (JoseError, UnicodeEncodeError, ValueError) as exc:
+        raise ValueError("Invalid Plaid-Verification header") from exc
+
+    if not isinstance(header, dict):
+        raise ValueError("Invalid Plaid-Verification header")
+    return header
+
+
+def verify_plaid_webhook(body: bytes, plaid_verification_header: str) -> None:
+    """Verify Plaid webhook JWT signature per Plaid docs."""
+    token = plaid_verification_header.strip()
+    if not token:
+        raise ValueError("Missing Plaid-Verification header")
+
+    header = _extract_plaid_webhook_header(token)
+    kid = str(header.get("kid") or "").strip()
+    if not kid:
+        raise ValueError("Missing Plaid webhook kid")
+
+    key = _get_plaid_webhook_jwk(kid)
+
+    try:
+        claims = jose_jwt.decode(
+            token,
+            key,
+            algorithms=_PLAID_WEBHOOK_JWT_ALGORITHMS,
+        ).claims
+    except (JoseError, ValueError) as exc:
+        raise ValueError("Plaid webhook verification failed") from exc
+
+    iat = claims.get("iat")
+    if isinstance(iat, bool) or not isinstance(iat, int | float):
+        raise ValueError("Invalid Plaid webhook iat")
+    age_seconds = time.time() - float(iat)
+    if age_seconds < 0 or age_seconds > 300:
+        raise ValueError("Invalid Plaid webhook iat")
+
+    request_body_sha256 = claims.get("request_body_sha256")
+    if not isinstance(request_body_sha256, str):
+        raise ValueError("Invalid Plaid webhook request_body_sha256")
+
+    expected_sha256 = sha256(body).hexdigest()
+    if not hmac.compare_digest(request_body_sha256, expected_sha256):
+        raise ValueError("Plaid webhook request body hash mismatch")
+
+
 def _coerce_product_names(values: Any) -> list[str]:
     if not isinstance(values, list):
         return []
@@ -324,6 +527,17 @@ def _extract_products_from_item_payload(item_payload: dict[str, Any]) -> list[st
     return []
 
 
+def _extract_consent_expiration_time_from_item_payload(item_payload: dict[str, Any]) -> str | None:
+    item = item_payload.get("item")
+    if not isinstance(item, dict):
+        item = {}
+    value = item.get("consent_expiration_time")
+    if value is None:
+        return None
+    text = str(value).strip()
+    return text[:100] if text else None
+
+
 def _slugify_institution(name: str) -> str:
     slug = re.sub(r"[^a-z0-9]+", "-", name.lower()).strip("-")
     return slug or "unknown-institution"
@@ -354,26 +568,17 @@ def _flat_secret_name(user_id: str, institution: str) -> str:
     return f"plaid_token_{user_id}_{_slugify_institution(institution)}"
 
 
-def _legacy_path_secret_name(user_id: str, institution: str) -> str:
-    return f"plaid/access_token/{user_id}/{_slugify_institution(institution)}"
-
-
 def secret_name_candidates(user_id: str, institution: str) -> list[str]:
-    # Support both key formats to preserve compatibility across tools/environments.
-    return [_flat_secret_name(user_id, institution), _legacy_path_secret_name(user_id, institution)]
+    return [_flat_secret_name(user_id, institution)]
 
 
 def _flat_item_secret_name(user_id: str, item_id: str) -> str:
     return f"plaid_token_{user_id}_item_{_slugify_institution(item_id)}"
 
 
-def _legacy_item_path_secret_name(user_id: str, item_id: str) -> str:
-    return f"plaid/access_token/{user_id}/item/{_slugify_institution(item_id)}"
-
-
 def secret_name_candidates_for_item(user_id: str, item_id: str) -> list[str]:
-    """Return deterministic per-item secret names (flat + legacy path)."""
-    return [_flat_item_secret_name(user_id, item_id), _legacy_item_path_secret_name(user_id, item_id)]
+    """Return deterministic per-item secret names."""
+    return [_flat_item_secret_name(user_id, item_id)]
 
 
 def _aws_region(region_name: str | None = None) -> str:
@@ -395,25 +600,22 @@ def secret_name_for_institution(user_id: str, institution: str) -> str:
     return secret_name_candidates(user_id, institution)[0]
 
 
-def _secret_exists(client, secret_name: str) -> bool:
-    try:
-        client.describe_secret(SecretId=secret_name)
-        return True
-    except Exception as exc:
-        code = getattr(exc, "response", {}).get("Error", {}).get("Code")
-        if code == "ResourceNotFoundException":
-            return False
-        raise
-
-
-def _put_or_create_secret(client, secret_name: str, payload: dict[str, Any]) -> None:
-    try:
-        client.put_secret_value(SecretId=secret_name, SecretString=json.dumps(payload))
-    except Exception as exc:
-        code = getattr(exc, "response", {}).get("Error", {}).get("Code")
-        if code != "ResourceNotFoundException":
-            raise
-        client.create_secret(Name=secret_name, SecretString=json.dumps(payload))
+def _effective_user_id_from_conn(conn: sqlite3.Connection | None = None, user_id: str | None = None) -> str | None:
+    explicit = str(user_id or "").strip()
+    if explicit:
+        return explicit
+    if conn is not None:
+        try:
+            row = conn.execute("SELECT user_id FROM tenant_marker WHERE singleton = 1").fetchone()
+        except sqlite3.OperationalError:
+            row = None
+        if row:
+            raw = row["user_id"] if isinstance(row, sqlite3.Row) else row[0]
+            value = str(raw or "").strip()
+            if value:
+                return value
+    env_user_id = str(os.getenv("FINANCE_CLI_USER_ID") or "").strip()
+    return env_user_id or None
 
 
 def store_plaid_token(
@@ -425,66 +627,59 @@ def store_plaid_token(
     secret_name: str | None = None,
     secret_names: list[str] | None = None,
 ) -> str:
-    candidate_names = [name for name in (secret_names or []) if str(name).strip()]
-    if not candidate_names:
-        candidate_names = [secret_name] if secret_name else secret_name_candidates(user_id, institution)
-    payload = {
-        "access_token": access_token,
-        "item_id": item_id,
-        "institution": institution,
-        "user_id": user_id,
-    }
-
-    client = _boto_secrets_client(region_name)
-
-    chosen_name = candidate_names[0]
-    for name in candidate_names:
-        if _secret_exists(client, name):
-            chosen_name = name
-            break
-
-    _put_or_create_secret(client, chosen_name, payload)
-
-    # Keep alternate key formats synchronized as best-effort aliases.
-    for alias_name in candidate_names:
-        if alias_name == chosen_name:
-            continue
-        try:
-            _put_or_create_secret(client, alias_name, payload)
-        except Exception:
-            # Alias update should not block primary token storage.
-            pass
-
-    return chosen_name
+    del institution, region_name, secret_name, secret_names
+    ref = crypto_envelope.format_vault_ref(str(user_id), "plaid", "items", str(item_id), "access_token")
+    return crypto_envelope.set_provider_secret(str(user_id), ref, access_token)
 
 
-def get_secret_payload(secret_name: str, region_name: str | None = None) -> dict[str, Any]:
-    client = _boto_secrets_client(region_name)
-    response = client.get_secret_value(SecretId=secret_name)
-    raw = response.get("SecretString")
+def get_secret_payload(
+    secret_name: str,
+    region_name: str | None = None,
+    *,
+    user_id: str | None = None,
+) -> dict[str, Any]:
+    ref = str(secret_name).strip()
+    if ref.startswith("vault://"):
+        vault_ref = crypto_envelope.parse_vault_ref(ref)
+        resolved_user_id = str(user_id or vault_ref.user_id)
+        token = str(resolve_secret_ref(ref, resolved_user_id) or "")
+        payload: dict[str, Any] = {"access_token": token}
+        if vault_ref.provider == "plaid" and len(vault_ref.path) >= 3 and vault_ref.path[0] == "items":
+            payload["item_id"] = vault_ref.path[1]
+        return payload
+    del region_name
+    raw = resolve_secret_ref(ref, str(user_id or ""))
     if not raw:
         return {}
     try:
-        value = json.loads(raw)
+        value = json.loads(str(raw))
     except json.JSONDecodeError:
-        return {"access_token": raw}
+        return {"access_token": str(raw)}
     if isinstance(value, dict):
         return value
     return {"access_token": str(value)}
 
 
-def delete_secret(secret_name: str, region_name: str | None = None) -> None:
+def delete_secret(secret_name: str, region_name: str | None = None, *, user_id: str | None = None) -> None:
+    ref = str(secret_name).strip()
+    if ref.startswith("vault://"):
+        vault_ref = crypto_envelope.parse_vault_ref(ref)
+        crypto_envelope.delete_provider_secret(str(user_id or vault_ref.user_id), ref)
+        return
     client = _boto_secrets_client(region_name)
     try:
-        client.delete_secret(SecretId=secret_name, ForceDeleteWithoutRecovery=True)
+        client.delete_secret(SecretId=ref, RecoveryWindowInDays=7)
     except Exception as exc:
         code = getattr(exc, "response", {}).get("Error", {}).get("Code")
-        if code == "ResourceNotFoundException":
+        message = str(getattr(exc, "response", {}).get("Error", {}).get("Message") or "").lower()
+        if code == "ResourceNotFoundException" or "scheduled for deletion" in message or "marked for deletion" in message:
             return
         raise
 
 
 def list_user_tokens(user_id: str, region_name: str | None = None) -> list[str]:
+    # Keep both prefixes so account deletion cleanup can still discover orphaned
+    # legacy-format secrets that no longer have DB refs.
     legacy_prefix = f"plaid/access_token/{user_id}/"
     flat_prefix = f"plaid_token_{user_id}_"
     client = _boto_secrets_client(region_name)
@@ -533,6 +728,28 @@ def _remove_remote_item(access_token: str) -> None:
     client.item_remove(ItemRemoveRequest(access_token=access_token))
 
 
+def _truncate_revocation_error_message(message: str) -> str:
+    if len(message) <= _REVOCATION_ERROR_MESSAGE_LIMIT:
+        return message
+    return message[: _REVOCATION_ERROR_MESSAGE_LIMIT - 3].rstrip() + "..."
+
+
+def revoke_item_access_structured(access_token: str) -> tuple[bool, dict[str, str | None]]:
+    try:
+        _remove_remote_item(access_token)
+    except Exception as exc:
+        return False, {
+            "error_code": _extract_error_code(exc),
+            "message": _truncate_revocation_error_message(_extract_error_message(exc)),
+        }
+    return True, {}
+
+
+def revoke_item_access(access_token: str) -> bool:
+    ok, _error = revoke_item_access_structured(access_token)
+    return ok
+
+
 def _extract_error_code(exc: Exception) -> str | None:
     code = getattr(exc, "error_code", None)
     if code:
@@ -563,11 +780,21 @@ def _extract_error_message(exc: Exception) -> str:
 
 
 def list_plaid_items(conn: sqlite3.Connection) -> list[dict]:
+    plaid_item_columns = _plaid_items_column_names(conn)
+    needs_reauth_select = "needs_reauth" if "needs_reauth" in plaid_item_columns else "0 AS needs_reauth"
+    last_webhook_select = "last_webhook_at" if "last_webhook_at" in plaid_item_columns else "NULL AS last_webhook_at"
+    consent_expiration_select = (
+        "consent_expiration_time"
+        if "consent_expiration_time" in plaid_item_columns
+        else "NULL AS consent_expiration_time"
+    )
     rows = conn.execute(
-        """
+        f"""
         SELECT id, plaid_item_id, institution_name, status, error_code,
                consented_products, access_token_ref, sync_cursor,
                last_sync_at, last_balance_refresh_at, last_liabilities_fetch_at,
+               {last_webhook_select}, {needs_reauth_select},
+               {consent_expiration_select},
                created_at, updated_at
           FROM plaid_items
          ORDER BY created_at DESC
@@ -578,6 +805,7 @@ def list_plaid_items(conn: sqlite3.Connection) -> list[dict]:
     for row in rows:
         item = dict(row)
         item["has_token_ref"] = bool(item.get("access_token_ref"))
+        item["needs_reauth"] = bool(item.get("needs_reauth"))
         items.append(item)
     return items
 
@@ -588,13 +816,24 @@ def _parse_token_payload(secret_payload: dict[str, Any]) -> tuple[str, str | Non
     return token, str(item_id) if item_id else None
 
 
-def _get_access_token_for_item(item_row: sqlite3.Row | dict, region_name: str | None = None) -> str:
+def _get_access_token_for_item(
+    item_row: sqlite3.Row | dict,
+    region_name: str | None = None,
+    *,
+    conn: sqlite3.Connection | None = None,
+    user_id: str | None = None,
+) -> str:
     access_token_ref = (item_row["access_token_ref"] if isinstance(item_row, sqlite3.Row) else item_row.get("access_token_ref"))
     plaid_item_id = (item_row["plaid_item_id"] if isinstance(item_row, sqlite3.Row) else item_row.get("plaid_item_id"))
     if not access_token_ref:
         raise PlaidSyncError("plaid item has no access_token_ref")
 
-    payload = get_secret_payload(str(access_token_ref), region_name=region_name)
+    resolved_user_id = _effective_user_id_from_conn(conn, user_id)
+    payload = get_secret_payload(
+        str(access_token_ref),
+        region_name=region_name,
+        user_id=resolved_user_id,
+    )
     token, payload_item_id = _parse_token_payload(payload)
     item_id_text = str(plaid_item_id or "").strip()
     if payload_item_id and item_id_text and payload_item_id != item_id_text:
@@ -603,6 +842,30 @@ def _get_access_token_for_item(item_row: sqlite3.Row | dict, region_name: str | 
         )
     if not token:
         raise PlaidSyncError("secret payload missing access_token")
+    if (
+        resolved_user_id
+        and item_id_text
+        and not str(access_token_ref).startswith("vault://")
+    ):
+        new_ref = migrate_provider_ref_to_vault(
+            resolved_user_id,
+            provider="plaid",
+            path=("items", item_id_text, "access_token"),
+            plaintext=token,
+            old_sm_ref=str(access_token_ref),
+        )
+        if conn is not None and new_ref != str(access_token_ref):
+            conn.execute(
+                """
+                UPDATE plaid_items
+                   SET access_token_ref = ?,
+                       updated_at = datetime('now')
+                 WHERE plaid_item_id = ?
+                   AND access_token_ref = ?
+                """,
+                (new_ref, item_id_text, str(access_token_ref)),
+            )
+            conn.commit()
     return token
 
 
@@ -862,7 +1125,7 @@ def _ensure_account(
 
     if account_payload:
         account_name = str(account_payload.get("name") or account_payload.get("official_name") or "").strip() or None
-        card_ending = str(account_payload.get("mask") or "").strip() or None
+        card_ending = _scrub_card_ending(str(account_payload.get("mask") or "").strip())
         account_type = _account_type_from_plaid(account_payload)
     balance = _extract_balance_fields(account_payload)
 
@@ -953,6 +1216,7 @@ def _apply_upsert_transaction(
     account_map: dict[str, dict],
     local_account_ids: dict[str, str | None] | None,
     mode: str,
+    rules_path: Path | None = None,
 ) -> str:
     plaid_txn_id = str(transaction.get("transaction_id") or "").strip()
     if not plaid_txn_id:
@@ -999,15 +1263,24 @@ def _apply_upsert_transaction(
 
     description = _description_from_plaid(transaction)
     try:
+        match_kwargs: dict[str, Any] = {}
+        if rules_path is not None:
+            match_kwargs["rules_path"] = rules_path
         result = match_transaction(
             conn,
             description,
             use_type=None,
             source_category=source_category,
             is_payment=is_payment_from_pfc,
+            **match_kwargs,
         )
     except Exception as exc:
-        logger.warning("match_transaction() failed for %r: %s", description, exc)
+        logger.warning(
+            "match_transaction() failed for %s acct %s: %s",
+            institution,
+            plaid_account_id[:8],
+            exc,
+        )
         result = None
 
     if result and result.category_id:
@@ -1125,6 +1398,7 @@ def apply_sync_updates(
     removed: list[dict],
     accounts: list[dict],
     next_cursor: str | None,
+    rules_path: Path | None = None,
 ) -> dict[str, int]:
     """Apply one `/transactions/sync` batch into local DB.
 
@@ -1169,11 +1443,27 @@ def apply_sync_updates(
         _record_balance_snapshot(conn, account_id, account_payload, source="sync")
 
     for tx in added:
-        status = _apply_upsert_transaction(conn, plaid_item, tx, account_map, local_account_ids, mode="added")
+        status = _apply_upsert_transaction(
+            conn,
+            plaid_item,
+            tx,
+            account_map,
+            local_account_ids,
+            mode="added",
+            rules_path=rules_path,
+        )
         counts[status] = counts.get(status, 0) + 1
 
     for tx in modified:
-        status = _apply_upsert_transaction(conn, plaid_item, tx, account_map, local_account_ids, mode="modified")
+        status = _apply_upsert_transaction(
+            conn,
+            plaid_item,
+            tx,
+            account_map,
+            local_account_ids,
+            mode="modified",
+            rules_path=rules_path,
+        )
         counts[status] = counts.get(status, 0) + 1
 
     removed_ids: list[str] = []
@@ -1270,6 +1560,7 @@ def _apply_investment_transaction(
     account_map: dict[str, dict],
     local_account_ids: dict[str, str | None],
     consumed_crossfeed_ids: set[str] | None = None,  # required for one-to-one dedup; None only for testing individual calls
+    rules_path: Path | None = None,
 ) -> str:
     inv_txn_id = str(inv_txn.get("investment_transaction_id") or "").strip()
     if not inv_txn_id:
@@ -1322,15 +1613,24 @@ def _apply_investment_transaction(
 
     # Run through standard categorization pipeline
     try:
+        match_kwargs: dict[str, Any] = {}
+        if rules_path is not None:
+            match_kwargs["rules_path"] = rules_path
         result = match_transaction(
             conn,
             description,
             use_type=None,
             source_category=source_category,
             is_payment=default_is_payment,
+            **match_kwargs,
         )
     except Exception as exc:
-        logger.warning("match_transaction() failed for investment %r: %s", description, exc)
+        logger.warning(
+            "match_transaction() failed for investment %s acct %s: %s",
+            institution,
+            plaid_account_id[:8],
+            exc,
+        )
         result = None
 
     if result and result.category_id:
@@ -1444,6 +1744,8 @@ def _fetch_investment_transactions(
     access_token: str,
     start_date: date,
     end_date: date,
+    db_path_or_conn: sqlite3.Connection | str | Path | None = None,
+    item_id: str | None = None,
 ) -> dict[str, Any]:
     from plaid.model.investments_transactions_get_request import InvestmentsTransactionsGetRequest
     from plaid.model.investments_transactions_get_request_options import InvestmentsTransactionsGetRequestOptions
@@ -1461,7 +1763,17 @@ def _fetch_investment_transactions(
             end_date=end_date,
             options=InvestmentsTransactionsGetRequestOptions(count=page_size, offset=offset),
         )
-        response = client.investments_transactions_get(request)
+        call_success = False
+        try:
+            response = client.investments_transactions_get(request)
+            call_success = True
+        finally:
+            _record_plaid_api_call(
+                db_path_or_conn,
+                "investments_transactions_get",
+                success=call_success,
+                item_id=item_id,
+            )
         page = response.to_dict() if hasattr(response, "to_dict") else dict(response)
 
         inv_txns = page.get("investment_transactions") or []
@@ -1498,6 +1810,7 @@ def _sync_investment_transactions(
     plaid_item_columns: set[str],
     force_refresh: bool,
     region_name: str | None,
+    rules_path: Path | None = None,
 ) -> dict[str, Any]:
     plaid_item_id = str(item["plaid_item_id"])
     institution_name = str(item["institution_name"] or "Unknown Institution")
@@ -1521,7 +1834,7 @@ def _sync_investment_transactions(
         if within_cooldown:
             return {"status": "skipped_cooldown", "added": 0, "modified": 0, "skipped": 0}
 
-    access_token = _get_access_token_for_item(item, region_name=region_name)
+    access_token = _get_access_token_for_item(item, region_name=region_name, conn=conn)
 
     # Determine date range
     last_sync_at = None
@@ -1551,7 +1864,14 @@ def _sync_investment_transactions(
         start_date = max_history
 
     # Fetch all pages
-    batch = _fetch_investment_transactions(client, access_token, start_date, end_date)
+    batch = _fetch_investment_transactions(
+        client,
+        access_token,
+        start_date,
+        end_date,
+        conn,
+        plaid_item_id,
+    )
 
     # Upsert accounts first (for balance data)
     account_map = batch["accounts"]
@@ -1582,6 +1902,7 @@ def _sync_investment_transactions(
             account_map,
             local_account_ids,
             consumed_crossfeed_ids=consumed_crossfeed_ids,
+            rules_path=rules_path,
         )
         counts[status] = counts.get(status, 0) + 1
 
@@ -1615,13 +1936,33 @@ def _transactions_sync_request_payload(
     return payload
 
 
-def _fetch_sync_page(client, access_token: str, cursor: str | None, days_requested: int | None) -> dict[str, Any]:
+DEFAULT_TRANSACTIONS_SYNC_HISTORY_DAYS = 730
+
+
+def _fetch_sync_page(
+    client,
+    access_token: str,
+    cursor: str | None,
+    days_requested: int | None,
+    db_path_or_conn: sqlite3.Connection | str | Path | None = None,
+    item_id: str | None = None,
+) -> dict[str, Any]:
     payload = _transactions_sync_request_payload(access_token, cursor, days_requested)
 
     from plaid.model.transactions_sync_request import TransactionsSyncRequest
 
     request = TransactionsSyncRequest(**payload)
-    response = client.transactions_sync(request)
+    call_success = False
+    try:
+        response = client.transactions_sync(request)
+        call_success = True
+    finally:
+        _record_plaid_api_call(
+            db_path_or_conn,
+            "transactions_sync",
+            success=call_success,
+            item_id=item_id,
+        )
     return response.to_dict() if hasattr(response, "to_dict") else dict(response)
 
 
@@ -1692,7 +2033,10 @@ def run_sync(
     days: int | None = None,
     item_id: str | None = None,
     force_refresh: bool = False,
+    backfill: bool = False,
     region_name: str | None = None,
+    rules_path: Path | None = None,
+    source: str = "cli",
 ) -> dict[str, Any]:
     """Sync transactions for active Plaid items via `/transactions/sync`.
 
@@ -1752,6 +2096,7 @@ def run_sync(
         "modified": 0,
         "removed": 0,
         "total_elapsed_ms": 0,
+        "backfill": bool(backfill),
         "errors": [],
         "items": [],
     }
@@ -1774,7 +2119,7 @@ def run_sync(
         }
         item_status = str(item["status"] or "")
 
-        if not force_refresh and item_status != "error" and sync_cooldown_seconds > 0:
+        if not backfill and not force_refresh and item_status != "error" and sync_cooldown_seconds > 0:
             within_cooldown, last_sync_at = _item_within_cooldown(
                 conn,
                 plaid_item_id=plaid_item_id,
@@ -1805,15 +2150,28 @@ def run_sync(
         try:
             item_started_at = time.perf_counter()
             logger.info("Plaid sync starting item_id=%s institution=%s", plaid_item_id, institution_name)
-            access_token = _get_access_token_for_item(item, region_name=region_name)
+            access_token = _get_access_token_for_item(item, region_name=region_name, conn=conn)
 
-            start_cursor = item["sync_cursor"]
+            start_cursor = None if backfill else item["sync_cursor"]
+            days_requested = days
+            if start_cursor is None and days_requested is None:
+                days_requested = DEFAULT_TRANSACTIONS_SYNC_HISTORY_DAYS
 
             def fetch_page(cursor_value: str | None) -> dict[str, Any]:
-                return _fetch_sync_page(client, access_token, cursor_value, days)
+                return _fetch_sync_page(
+                    client,
+                    access_token,
+                    cursor_value,
+                    days_requested,
+                    conn,
+                    plaid_item_id,
+                )
 
             batch = collect_transactions_sync_pages(fetch_page, starting_cursor=start_cursor)
 
+            apply_kwargs: dict[str, Any] = {}
+            if rules_path is not None:
+                apply_kwargs["rules_path"] = rules_path
             counts = apply_sync_updates(
                 conn,
                 plaid_item=item,
@@ -1822,12 +2180,16 @@ def run_sync(
                 removed=batch["removed"],
                 accounts=batch["accounts"],
                 next_cursor=batch["next_cursor"],
+                **apply_kwargs,
             )
             _touch_item_cooldown(conn, plaid_item_id, "sync", plaid_item_columns=plaid_item_columns)
             conn.commit()
 
             # Investment transaction sync (non-fatal — regular sync already committed above)
             try:
+                inv_kwargs: dict[str, Any] = {}
+                if rules_path is not None:
+                    inv_kwargs["rules_path"] = rules_path
                 inv_result = _sync_investment_transactions(
                     conn,
                     client,
@@ -1835,6 +2197,7 @@ def run_sync(
                     plaid_item_columns,
                     force_refresh=force_refresh,
                     region_name=region_name,
+                    **inv_kwargs,
                 )
                 if inv_result["status"] == "synced":
                     conn.commit()  # commit investment writes separately
@@ -1855,6 +2218,8 @@ def run_sync(
                     "next_cursor": batch.get("next_cursor"),
                     "status": "synced",
                     "elapsed_ms": int((time.perf_counter() - item_started_at) * 1000),
+                    "backfill": bool(backfill),
+                    "days_requested": days_requested if start_cursor is None else None,
                 }
             )
 
@@ -1904,10 +2269,11 @@ def run_sync(
 
 
 def refresh_balances(
-    conn: sqlite3.Connection,
+    conn: "sqlite3.Connection | StorageConnection",
     item_id: str | None = None,
     force_refresh: bool = False,
     region_name: str | None = None,
+    source: str = "cli",
 ) -> dict[str, Any]:
     """Fetch real-time balances via `/accounts/balance/get`.
 
@@ -1925,9 +2291,10 @@ def refresh_balances(
             missing_parts.append("missing env: " + ",".join(status.missing_env))
         raise PlaidUnavailableError("Plaid balance refresh unavailable: " + "; ".join(missing_parts))
 
-    client = _create_plaid_api_client()
-    from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+    from .cost_tracking import PLAID_OPERATION_COSTS_USD6, check_cost_limit
+    from .error_capture import capture_error
 
+    db_path = resolve_plaid_cost_db_path(conn)
     where = ["status IN ('active', 'pending', 'error')"]
     params: list[Any] = []
     if item_id:
@@ -1966,6 +2333,22 @@ def refresh_balances(
         "errors": [],
         "items": [],
     }
+    if db_path is None:
+        logger.warning("Plaid balance refresh blocked: %s", PLAID_COST_DB_PATH_UNAVAILABLE_REASON)
+        for item in items:
+            totals["items"].append(
+                {
+                    "plaid_item_id": str(item["plaid_item_id"]),
+                    "institution_name": str(item["institution_name"] or "Unknown Institution"),
+                    "status": "blocked_cost_limit",
+                    "reason": PLAID_COST_DB_PATH_UNAVAILABLE_REASON,
+                }
+            )
+        return totals
+
+    client = _create_plaid_api_client()
+    from plaid.model.accounts_balance_get_request import AccountsBalanceGetRequest
+
     balance_cooldown_seconds = _get_cooldown_seconds("balance")
     plaid_item_columns = _plaid_items_column_names(conn)
 
@@ -2002,8 +2385,40 @@ def refresh_balances(
                 continue
 
         try:
-            access_token = _get_access_token_for_item(item, region_name=region_name)
-            response = client.accounts_balance_get(AccountsBalanceGetRequest(access_token=access_token))
+            allowed, reason = check_cost_limit(
+                db_path,
+                "plaid",
+                projected_cost_usd6=PLAID_OPERATION_COSTS_USD6["accounts_balance_get"],
+                source=source,
+            )
+        except Exception as exc:
+            capture_error(exc, source=source, endpoint="plaid.balance_refresh", db_path=db_path)
+            logger.warning("Plaid cost guardrail check failed: %s", exc)
+            allowed, reason = True, None
+
+        if not allowed:
+            totals["items"].append(
+                {
+                    "plaid_item_id": plaid_item_id,
+                    "status": "blocked_cost_limit",
+                    "reason": reason,
+                }
+            )
+            continue
+
+        try:
+            access_token = _get_access_token_for_item(item, region_name=region_name, conn=conn)
+            call_success = False
+            try:
+                response = client.accounts_balance_get(AccountsBalanceGetRequest(access_token=access_token))
+                call_success = True
+            finally:
+                _record_plaid_api_call(
+                    conn,
+                    "accounts_balance_get",
+                    success=call_success,
+                    item_id=plaid_item_id,
+                )
             payload = response.to_dict() if hasattr(response, "to_dict") else dict(response)
             accounts = payload.get("accounts") or []
 
@@ -2276,6 +2691,7 @@ def fetch_liabilities(
     item_id: str | None = None,
     force_refresh: bool = False,
     region_name: str | None = None,
+    source: str = "cli",
 ) -> dict[str, Any]:
     """Fetch liabilities via `/liabilities/get` and apply lifecycle updates.
 
@@ -2375,8 +2791,18 @@ def fetch_liabilities(
                 continue
 
         try:
-            access_token = _get_access_token_for_item(item, region_name=region_name)
-            response = client.liabilities_get(LiabilitiesGetRequest(access_token=access_token))
+            access_token = _get_access_token_for_item(item, region_name=region_name, conn=conn)
+            call_success = False
+            try:
+                response = client.liabilities_get(LiabilitiesGetRequest(access_token=access_token))
+                call_success = True
+            finally:
+                _record_plaid_api_call(
+                    conn,
+                    "liabilities_get",
+                    success=call_success,
+                    item_id=plaid_item_id,
+                )
             payload = response.to_dict() if hasattr(response, "to_dict") else dict(response)
 
             accounts = payload.get("accounts") or []
@@ -2516,20 +2942,70 @@ def unlink_item(conn: sqlite3.Connection, item_id: str, region_name: str | None 
         )
 
     # Best-effort remote Plaid item removal; skip if token ref is shared.
-    if not shared_active_ref:
-        try:
-            status = config_status()
-            if status.configured and status.has_sdk:
-                access_token = _get_access_token_for_item(row, region_name=region_name)
-                _remove_remote_item(access_token)
-        except Exception:
-            pass
-
     if access_token_ref and not shared_active_ref:
-        try:
-            delete_secret(str(access_token_ref), region_name=region_name)
-        except Exception:
-            pass
+        remote_revoke_attempted = False
+        revoke_ok = True
+        error: dict[str, str | None] = {}
+        status = config_status()
+        if status.configured and status.has_sdk:
+            try:
+                access_token = _get_access_token_for_item(row, region_name=region_name, conn=conn)
+            except Exception:
+                access_token = None
+            if access_token:
+                remote_revoke_attempted = True
+                revoke_ok, error = revoke_item_access_structured(access_token)
+
+        if not remote_revoke_attempted or revoke_ok or error.get("error_code") == "ITEM_NOT_FOUND":
+            try:
+                delete_secret(str(access_token_ref), region_name=region_name)
+            except Exception:
+                logger.warning(
+                    "plaid_secret_delete_failed item_id=%s ref=%s",
+                    item_id,
+                    access_token_ref,
+                    exc_info=True,
+                )
+        else:
+            logger.warning(
+                "plaid_item_remove_failed item_id=%s error_code=%s msg=%s",
+                item_id,
+                error.get("error_code"),
+                error.get("message"),
+            )
+            handler = _get_revocation_failure_handler()
+            queued = False
+            if handler is not None:
+                try:
+                    handler(
+                        {
+                            "plaid_item_id": item_id,
+                            "secret_refs": [str(access_token_ref)],
+                            "user_id": None,
+                            "error": error.get("message"),
+                            "error_code": error.get("error_code"),
+                            "source": "unlink",
+                        }
+                    )
+                    queued = True
+                except Exception:
+                    logger.error("plaid_revocation_queue_write_failed item_id=%s", item_id, exc_info=True)
+
+            if queued:
+                conn.execute(
+                    """
+                    UPDATE plaid_items
+                       SET access_token_ref = NULL,
+                           updated_at = datetime('now')
+                     WHERE plaid_item_id = ?
+                    """,
+                    (item_id,),
+                )
+            else:
+                try:
+                    delete_secret(str(access_token_ref), region_name=region_name)
+                except Exception:
+                    pass
 
     conn.execute(
         "UPDATE accounts SET is_active = 0, updated_at = datetime('now') WHERE plaid_item_id = ?",
@@ -2594,6 +3070,14 @@ def create_hosted_link_session(
         include_liabilities=include_liabilities,
     )
     products = [Products(name) for name in requested_product_names]
+    nonce = secrets.token_urlsafe(8)
+    base_redirect_uri = os.getenv("PLAID_COMPLETION_REDIRECT_URI", "https://cashnerd.ai/plaid/complete")
+    parsed_redirect_uri = urlparse(base_redirect_uri)
+    redirect_query = parse_qs(parsed_redirect_uri.query)
+    redirect_query["n"] = [nonce]
+    redirect_with_nonce = urlunparse(
+        parsed_redirect_uri._replace(query=urlencode(redirect_query, doseq=True))
+    )
 
     request_payload: dict[str, Any] = {
         "user": LinkTokenCreateRequestUser(client_user_id=user_id),
@@ -2602,7 +3086,7 @@ def create_hosted_link_session(
         "country_codes": [CountryCode("US")],
         "language": "en",
         "hosted_link": {
-            "completion_redirect_uri": os.getenv("PLAID_COMPLETION_REDIRECT_URI", "https://example.com/plaid/complete"),
+            "completion_redirect_uri": redirect_with_nonce,
             "is_mobile_app": False,
         },
     }
@@ -2618,7 +3102,7 @@ def create_hosted_link_session(
         ).fetchone()
         if not item:
             raise PlaidSyncError(f"Plaid item {update_item_id} not found")
-        request_payload["access_token"] = _get_access_token_for_item(item)
+        request_payload["access_token"] = _get_access_token_for_item(item, conn=conn)
         request_payload["update"] = {"account_selection_enabled": True}
         non_tx_products = [product for product in products if product.value != "transactions"]
         if non_tx_products:
@@ -2626,13 +3110,24 @@ def create_hosted_link_session(
         request_payload["products"] = [Products("transactions")]
 
     request = LinkTokenCreateRequest(**request_payload)
-    response = client.link_token_create(request)
+    call_success = False
+    try:
+        response = client.link_token_create(request)
+        call_success = True
+    finally:
+        _record_plaid_api_call(
+            conn,
+            "link_token_create",
+            success=call_success,
+            item_id=update_item_id,
+        )
     data = response.to_dict() if hasattr(response, "to_dict") else dict(response)
 
     return {
         "link_token": data.get("link_token"),
         "hosted_link_url": data.get("hosted_link_url"),
         "expiration": data.get("expiration"),
+        "nonce": nonce,
         "requested_products": requested_product_names,
         "update_item_id": update_item_id,
     }
@@ -2691,27 +3186,64 @@ def complete_link_session(
 
     public_token = wait_for_public_token(link_token, timeout_seconds=timeout_seconds, poll_seconds=poll_seconds)
 
-    exchange = client.item_public_token_exchange(ItemPublicTokenExchangeRequest(public_token=public_token))
-    exchange_payload = exchange.to_dict() if hasattr(exchange, "to_dict") else dict(exchange)
+    exchange_call_success = False
+    exchange_payload: dict[str, Any] | None = None
+    try:
+        exchange = client.item_public_token_exchange(ItemPublicTokenExchangeRequest(public_token=public_token))
+        exchange_call_success = True
+        exchange_payload = exchange.to_dict() if hasattr(exchange, "to_dict") else dict(exchange)
+    finally:
+        exchange_item_id = None
+        if exchange_payload is not None:
+            exchange_item_id = str(exchange_payload.get("item_id") or "").strip() or None
+        _record_plaid_api_call(
+            conn,
+            "item_public_token_exchange",
+            success=exchange_call_success,
+            item_id=exchange_item_id,
+        )
+    assert exchange_payload is not None
     access_token = str(exchange_payload.get("access_token") or "")
     item_id = str(exchange_payload.get("item_id") or "")
 
     if not access_token or not item_id:
         raise PlaidSyncError("Plaid token exchange returned no access_token/item_id")
 
-    item_resp = client.item_get(ItemGetRequest(access_token=access_token))
-    item_payload = item_resp.to_dict() if hasattr(item_resp, "to_dict") else dict(item_resp)
+    item_call_success = False
+    item_payload: dict[str, Any] | None = None
+    try:
+        item_resp = client.item_get(ItemGetRequest(access_token=access_token))
+        item_call_success = True
+        item_payload = item_resp.to_dict() if hasattr(item_resp, "to_dict") else dict(item_resp)
+    finally:
+        _record_plaid_api_call(
+            conn,
+            "item_get",
+            success=item_call_success,
+            item_id=item_id,
+        )
+    assert item_payload is not None
 
     institution_id = str(((item_payload.get("item") or {}).get("institution_id")) or "").strip() or None
     institution_name = "Unknown Institution"
 
     if institution_id:
-        inst_resp = client.institutions_get_by_id(
-            InstitutionsGetByIdRequest(
-                institution_id=institution_id,
-                country_codes=[CountryCode("US")],
+        institution_call_success = False
+        try:
+            inst_resp = client.institutions_get_by_id(
+                InstitutionsGetByIdRequest(
+                    institution_id=institution_id,
+                    country_codes=[CountryCode("US")],
+                )
             )
-        )
+            institution_call_success = True
+        finally:
+            _record_plaid_api_call(
+                conn,
+                "institutions_get_by_id",
+                success=institution_call_success,
+                item_id=item_id,
+            )
         inst_payload = inst_resp.to_dict() if hasattr(inst_resp, "to_dict") else dict(inst_resp)
         institution_name = (((inst_payload.get("institution") or {}).get("name")) or institution_name)
 
@@ -2721,6 +3253,8 @@ def complete_link_session(
     ).fetchone()
     plaid_item_columns = _plaid_items_column_names(conn)
     has_institution_id_column = "institution_id" in plaid_item_columns
+    has_needs_reauth_column = "needs_reauth" in plaid_item_columns
+    has_consent_expiration_column = "consent_expiration_time" in plaid_item_columns
     normalized_institution_name = institution_name.strip().lower()
     institution_identity_known = normalized_institution_name not in {"", "unknown institution"}
     can_dedupe = institution_identity_known or bool(institution_id and has_institution_id_column)
@@ -2796,72 +3330,131 @@ def complete_link_session(
     if not consented_product_names:
         consented_product_names = ["transactions"]
     consented_products = json.dumps(consented_product_names)
+    consent_expiration_time = _extract_consent_expiration_time_from_item_payload(item_payload)
     if existing:
         local_id = str(existing["id"])
+        assignments: list[str] = []
+        params: list[Any] = []
         if has_institution_id_column:
-            conn.execute(
-                """
-                UPDATE plaid_items
-                   SET institution_id = ?,
-                       institution_name = ?,
-                       access_token_ref = ?,
-                       status = 'active',
-                       error_code = NULL,
-                       consented_products = ?,
-                       updated_at = datetime('now')
-                 WHERE id = ?
-                """,
-                (institution_id, institution_name, secret_name, consented_products, local_id),
-            )
-        else:
-            conn.execute(
-                """
-                UPDATE plaid_items
-                   SET institution_name = ?,
-                       access_token_ref = ?,
-                       status = 'active',
-                       error_code = NULL,
-                       consented_products = ?,
-                       updated_at = datetime('now')
-                 WHERE id = ?
-                """,
-                (institution_name, secret_name, consented_products, local_id),
-            )
+            assignments.append("institution_id = ?")
+            params.append(institution_id)
+        assignments.extend(
+            [
+                "institution_name = ?",
+                "access_token_ref = ?",
+                "status = 'active'",
+                "error_code = NULL",
+                "consented_products = ?",
+            ]
+        )
+        params.extend([institution_name, secret_name, consented_products])
+        if has_needs_reauth_column:
+            assignments.append("needs_reauth = 0")
+        if has_consent_expiration_column:
+            assignments.append("consent_expiration_time = ?")
+            params.append(consent_expiration_time)
+        assignments.append("updated_at = datetime('now')")
+        params.append(local_id)
+        conn.execute(
+            f"UPDATE plaid_items SET {', '.join(assignments)} WHERE id = ?",
+            tuple(params),
+        )
     else:
         local_id = uuid.uuid4().hex
+        columns = [
+            "id",
+            "plaid_item_id",
+        ]
+        placeholders = ["?", "?"]
+        params: list[Any] = [local_id, item_id]
         if has_institution_id_column:
-            conn.execute(
+            columns.append("institution_id")
+            placeholders.append("?")
+            params.append(institution_id)
+        columns.extend(
+            [
+                "institution_name",
+                "access_token_ref",
+                "status",
+                "error_code",
+                "consented_products",
+                "sync_cursor",
+            ]
+        )
+        placeholders.extend(["?", "?", "'active'", "NULL", "?", "NULL"])
+        params.extend([institution_name, secret_name, consented_products])
+        if has_consent_expiration_column:
+            columns.append("consent_expiration_time")
+            placeholders.append("?")
+            params.append(consent_expiration_time)
+        conn.execute(
+            f"""
+            INSERT INTO plaid_items ({', '.join(columns)})
+            VALUES ({', '.join(placeholders)})
+            """,
+            tuple(params),
+        )
+
+    if not existing and institution_identity_known:
+        if institution_id and has_institution_id_column:
+            superseded = conn.execute(
                 """
-                INSERT INTO plaid_items (
-                    id,
-                    plaid_item_id,
-                    institution_id,
-                    institution_name,
-                    access_token_ref,
-                    status,
-                    error_code,
-                    consented_products,
-                    sync_cursor
-                ) VALUES (?, ?, ?, ?, ?, 'active', NULL, ?, NULL)
+                SELECT plaid_item_id, access_token_ref
+                  FROM plaid_items
+                 WHERE plaid_item_id <> ?
+                   AND status = 'disconnected'
+                   AND (
+                        institution_id = ?
+                        OR (institution_id IS NULL AND lower(trim(institution_name)) = lower(trim(?)))
+                   )
                 """,
-                (local_id, item_id, institution_id, institution_name, secret_name, consented_products),
-            )
+                (item_id, institution_id, institution_name),
+            ).fetchall()
         else:
+            superseded = conn.execute(
+                """
+                SELECT plaid_item_id, access_token_ref
+                  FROM plaid_items
+                 WHERE plaid_item_id <> ?
+                   AND status = 'disconnected'
+                   AND lower(trim(institution_name)) = lower(trim(?))
+                """,
+                (item_id, institution_name),
+            ).fetchall()
+
+        for row in superseded:
+            stale_item_id = str(row["plaid_item_id"])
+            stale_token_ref = row["access_token_ref"] if "access_token_ref" in row.keys() else None
+
+            # Preserve historical account-linked data by detaching the stale Plaid
+            # item rather than deleting accounts and triggering FK side effects.
             conn.execute(
                 """
-                INSERT INTO plaid_items (
-                    id,
-                    plaid_item_id,
-                    institution_name,
-                    access_token_ref,
-                    status,
-                    error_code,
-                    consented_products,
-                    sync_cursor
-                ) VALUES (?, ?, ?, ?, 'active', NULL, ?, NULL)
+                UPDATE accounts
+                   SET plaid_item_id = NULL,
+                       updated_at = datetime('now')
+                 WHERE plaid_item_id = ?
                 """,
-                (local_id, item_id, institution_name, secret_name, consented_products),
+                (stale_item_id,),
             )
+            conn.execute("DELETE FROM plaid_items WHERE plaid_item_id = ?", (stale_item_id,))
+
+            if stale_token_ref:
+                shared = conn.execute(
+                    """
+                    SELECT 1
+                      FROM plaid_items
+                     WHERE access_token_ref = ?
+                       AND status IN ('active', 'pending', 'error')
+                     LIMIT 1
+                    """,
+                    (stale_token_ref,),
+                ).fetchone()
+                if not shared:
+                    try:
+                        delete_secret(str(stale_token_ref), region_name=region_name)
+                    except Exception:
+                        pass
 
     conn.commit()
 
@@ -2872,6 +3465,7 @@ def complete_link_session(
         "access_token_ref": secret_name,
         "status": "active",
         "consented_products": consented_product_names,
+        "consent_expiration_time": consent_expiration_time,
     }
 
 
@@ -2927,40 +3521,49 @@ def backfill_item_products(
     }
     plaid_item_columns = _plaid_items_column_names(conn)
     has_institution_id_column = "institution_id" in plaid_item_columns
+    has_consent_expiration_column = "consent_expiration_time" in plaid_item_columns
 
     for item in items:
         plaid_item_id = str(item["plaid_item_id"])
         try:
-            access_token = _get_access_token_for_item(item, region_name=region_name)
-            item_resp = client.item_get(ItemGetRequest(access_token=access_token))
+            access_token = _get_access_token_for_item(item, region_name=region_name, conn=conn)
+            call_success = False
+            try:
+                item_resp = client.item_get(ItemGetRequest(access_token=access_token))
+                call_success = True
+            finally:
+                _record_plaid_api_call(
+                    conn,
+                    "item_get",
+                    success=call_success,
+                    item_id=plaid_item_id,
+                )
             item_payload = item_resp.to_dict() if hasattr(item_resp, "to_dict") else dict(item_resp)
             institution_id = str(((item_payload.get("item") or {}).get("institution_id")) or "").strip() or None
 
             product_names = _extract_products_from_item_payload(item_payload)
             if not product_names:
                 product_names = _parse_stored_products(item["consented_products"])
+            consent_expiration_time = _extract_consent_expiration_time_from_item_payload(item_payload)
 
+            assignments = ["consented_products = ?"]
+            update_params: list[Any] = [json.dumps(product_names)]
             if has_institution_id_column:
-                conn.execute(
-                    """
-                    UPDATE plaid_items
-                       SET consented_products = ?,
-                           institution_id = COALESCE(?, institution_id),
-                           updated_at = datetime('now')
-                     WHERE plaid_item_id = ?
-                    """,
-                    (json.dumps(product_names), institution_id, plaid_item_id),
-                )
-            else:
-                conn.execute(
-                    """
-                    UPDATE plaid_items
-                       SET consented_products = ?,
-                           updated_at = datetime('now')
-                     WHERE plaid_item_id = ?
-                    """,
-                    (json.dumps(product_names), plaid_item_id),
-                )
+                assignments.append("institution_id = COALESCE(?, institution_id)")
+                update_params.append(institution_id)
+            if has_consent_expiration_column:
+                assignments.append("consent_expiration_time = ?")
+                update_params.append(consent_expiration_time)
+            assignments.append("updated_at = datetime('now')")
+            update_params.append(plaid_item_id)
+            conn.execute(
+                f"""
+                UPDATE plaid_items
+                   SET {', '.join(assignments)}
+                 WHERE plaid_item_id = ?
+                """,
+                tuple(update_params),
+            )
             conn.commit()
 
             totals["items_updated"] += 1
@@ -2968,6 +3571,7 @@ def backfill_item_products(
                 {
                     "plaid_item_id": plaid_item_id,
                     "consented_products": product_names,
+                    "consent_expiration_time": consent_expiration_time,
                 }
             )
         except Exception as exc:

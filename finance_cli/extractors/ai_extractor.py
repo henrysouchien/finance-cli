@@ -5,10 +5,10 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Any
 
+from ..ai_client import default_model as _default_model
 from ..ai_statement_parser import (
     DEFAULT_MAX_TEXT_CHARS,
     DEFAULT_MAX_TOKENS,
-    _default_model,
     ai_parse_statement,
     ai_result_to_extract_result,
 )
@@ -62,6 +62,10 @@ class AIExtractor:
             model=self.model,
             max_text_chars=self.max_text_chars,
             max_tokens=self.max_tokens,
+            api_key=options.api_key,
+            ai_egress_mode=options.ai_egress_mode,
+            db_path=options.db_path,
+            import_batch_id=options.import_batch_id,
             confidence_warn=self.confidence_warn,
             confidence_block=self.confidence_block,
         )

@@ -263,6 +263,39 @@ def test_rules_add_keyword_appends_existing_category_and_use_type(tmp_path: Path
     ]
 
 
+def test_rules_add_keyword_uses_explicit_rules_path(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    default_rules_path = tmp_path / "rules.yaml"
+    default_rules_path.write_text("{}\n", encoding="utf-8")
+    explicit_rules_path = tmp_path / "web" / "rules.yaml"
+    explicit_rules_path.parent.mkdir(parents=True, exist_ok=True)
+    explicit_rules_path.write_text("{}\n", encoding="utf-8")
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Dining")
+        result = rules_cmd.handle_add_keyword(
+            SimpleNamespace(keyword="WEBONLY", category="Dining", use_type=None, priority=1),
+            conn,
+            rules_path=explicit_rules_path,
+        )
+
+    default_payload = yaml.safe_load(default_rules_path.read_text(encoding="utf-8"))
+    explicit_payload = yaml.safe_load(explicit_rules_path.read_text(encoding="utf-8"))
+
+    assert result["data"]["action"] == "added"
+    assert default_payload == {}
+    assert explicit_payload["keyword_rules"] == [
+        {
+            "keywords": ["WEBONLY"],
+            "category": "Dining",
+            "priority": 1,
+        }
+    ]
+
+
 def test_rules_add_keyword_rejects_duplicate_case_insensitive(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "finance.db"
     monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
@@ -287,6 +320,212 @@ def test_rules_add_keyword_rejects_duplicate_case_insensitive(tmp_path: Path, mo
         with pytest.raises(ValueError, match="already exists"):
             rules_cmd.handle_add_keyword(
                 SimpleNamespace(keyword="newvendor", category="Dining", use_type=None, priority=0),
+                conn,
+            )
+
+
+def test_rules_add_split_creates_new_split_rule(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+    (tmp_path / "rules.yaml").write_text("{}\n", encoding="utf-8")
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Utilities")
+        result = rules_cmd.handle_add_split(
+            SimpleNamespace(
+                business_pct=80,
+                business_category="Utilities",
+                personal_category="Utilities",
+                match_category=None,
+                match_keywords=["VERIZON"],
+                note="80% business use of internet",
+            ),
+            conn,
+        )
+
+    payload = yaml.safe_load((tmp_path / "rules.yaml").read_text(encoding="utf-8"))
+    assert result["summary"]["split_rule_count"] == 1
+    assert payload["split_rules"] == [
+        {
+            "match": {"keywords": ["VERIZON"]},
+            "business_pct": 80,
+            "business_category": "Utilities",
+            "personal_category": "Utilities",
+            "note": "80% business use of internet",
+        }
+    ]
+
+
+def test_rules_add_split_requires_match_category_or_keywords(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+    (tmp_path / "rules.yaml").write_text("{}\n", encoding="utf-8")
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Rent")
+        with pytest.raises(ValueError, match="match_category or match_keywords"):
+            rules_cmd.handle_add_split(
+                SimpleNamespace(
+                    business_pct=25,
+                    business_category="Rent",
+                    personal_category="Rent",
+                    match_category=None,
+                    match_keywords=[],
+                    note=None,
+                ),
+                conn,
+            )
+
+
+def test_rules_add_split_rejects_exact_duplicate(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        textwrap.dedent(
+            """
+            split_rules:
+              - match:
+                  keywords: ["VERIZON"]
+                business_pct: 80
+                business_category: "Utilities"
+                personal_category: "Utilities"
+                note: "80% business use of internet"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Utilities")
+        with pytest.raises(ValueError, match="Split rule already exists"):
+            rules_cmd.handle_add_split(
+                SimpleNamespace(
+                    business_pct=80,
+                    business_category="Utilities",
+                    personal_category="Utilities",
+                    match_category=None,
+                    match_keywords=["verizon"],
+                    note="80% business use of internet",
+                ),
+                conn,
+            )
+
+
+def test_rules_add_split_rejects_category_conflict(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        textwrap.dedent(
+            """
+            split_rules:
+              - match:
+                  category: "Software & Subscriptions"
+                business_pct: 80
+                business_category: "Professional Fees"
+                personal_category: "Software & Subscriptions"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Software & Subscriptions")
+        _ensure_category(conn, "Professional Fees")
+        with pytest.raises(ValueError, match="category 'Software & Subscriptions' already exists"):
+            rules_cmd.handle_add_split(
+                SimpleNamespace(
+                    business_pct=60,
+                    business_category="Professional Fees",
+                    personal_category="Software & Subscriptions",
+                    match_category="Software & Subscriptions",
+                    match_keywords=[],
+                    note=None,
+                ),
+                conn,
+            )
+
+
+def test_rules_add_split_rejects_keyword_substring_overlap(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        textwrap.dedent(
+            """
+            split_rules:
+              - match:
+                  keywords: ["VERIZON"]
+                business_pct: 80
+                business_category: "Utilities"
+                personal_category: "Utilities"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Utilities")
+        with pytest.raises(ValueError, match="keyword overlap"):
+            rules_cmd.handle_add_split(
+                SimpleNamespace(
+                    business_pct=75,
+                    business_category="Utilities",
+                    personal_category="Utilities",
+                    match_category=None,
+                    match_keywords=["VERIZON WIRELESS"],
+                    note=None,
+                ),
+                conn,
+            )
+
+
+def test_rules_add_split_rejects_case_insensitive_keyword_overlap(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    rules_path = tmp_path / "rules.yaml"
+    rules_path.write_text(
+        textwrap.dedent(
+            """
+            split_rules:
+              - match:
+                  keywords: ["coworking"]
+                business_pct: 90
+                business_category: "Office Expense"
+                personal_category: "Rent"
+            """
+        ).strip()
+        + "\n",
+        encoding="utf-8",
+    )
+
+    with connect(db_path) as conn:
+        _ensure_category(conn, "Office Expense")
+        _ensure_category(conn, "Rent")
+        with pytest.raises(ValueError, match="keyword overlap"):
+            rules_cmd.handle_add_split(
+                SimpleNamespace(
+                    business_pct=85,
+                    business_category="Office Expense",
+                    personal_category="Rent",
+                    match_category=None,
+                    match_keywords=["COWORK"],
+                    note=None,
+                ),
                 conn,
             )
 
@@ -323,6 +562,33 @@ def test_rules_remove_keyword_keeps_rule_when_other_keywords_remain(tmp_path: Pa
             "priority": 0,
         }
     ]
+
+
+def test_rules_remove_keyword_dry_run_does_not_write(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    rules_path = tmp_path / "rules.yaml"
+    original = (
+        textwrap.dedent(
+            """
+            keyword_rules:
+              - keywords: ["A", "B"]
+                category: "Dining"
+                priority: 0
+            """
+        ).strip()
+        + "\n"
+    )
+    rules_path.write_text(original, encoding="utf-8")
+
+    with connect(db_path) as conn:
+        result = rules_cmd.handle_remove_keyword(SimpleNamespace(keyword="A", dry_run=True), conn)
+
+    assert result["data"]["dry_run"] is True
+    assert result["data"]["keyword"] == "A"
+    assert rules_path.read_text(encoding="utf-8") == original
 
 
 def test_rules_remove_keyword_removes_rule_when_last_keyword_removed(tmp_path: Path, monkeypatch) -> None:

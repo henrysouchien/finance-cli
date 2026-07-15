@@ -7,16 +7,17 @@ import hashlib
 import json
 import logging
 import math
-import os
 import re
 import time
-import urllib.error
-import urllib.request
 from dataclasses import dataclass
 from decimal import Decimal
 from pathlib import Path
 from typing import Any
 
+from .ai_egress import assert_raw_financial_ai_allowed
+from .ai_client import default_model as _default_model
+from .ai_client import send_request as _send_ai_request
+from .cost_tracking import estimate_ai_cost_usd6, record_cost
 from .importers.pdf import ExtractResult, extract_pdf_text
 from .institution_names import canonicalize as canonicalize_institution_name
 from .ingest_validation import ValidationReport, validate_ai_parse
@@ -29,9 +30,7 @@ DEFAULT_MAX_TEXT_CHARS = 100_000
 DEFAULT_MAX_TOKENS = 16384
 DEFAULT_TIMEOUT = 120
 
-_CARD_ENDING_OVERRIDES: dict[str, str] = {
-    "Apple Card": "Apple",
-}
+_CARD_ENDING_OVERRIDES: dict[str, str] = {}
 _LAST4_RE = re.compile(r"(\d{4})(?!.*\d)")
 
 
@@ -48,129 +47,6 @@ class AIParseResult:
     output_tokens: int = 0
     elapsed_ms: int = 0
     extracted_text: str = ""
-
-
-def _default_model(provider: str) -> str:
-    if provider == "openai":
-        return "gpt-4o-mini"
-    if provider == "claude":
-        return "claude-sonnet-4-5-20250929"
-    raise ValueError(f"Unsupported AI provider '{provider}'")
-
-
-def _to_usage_int(value: Any) -> int:
-    try:
-        return max(int(value or 0), 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _usage_from_openai(body: dict[str, Any]) -> dict[str, int]:
-    usage = body.get("usage")
-    usage_map = usage if isinstance(usage, dict) else {}
-    return {
-        "input_tokens": _to_usage_int(usage_map.get("prompt_tokens")),
-        "output_tokens": _to_usage_int(usage_map.get("completion_tokens")),
-    }
-
-
-def _usage_from_claude(body: dict[str, Any]) -> dict[str, int]:
-    usage = body.get("usage")
-    usage_map = usage if isinstance(usage, dict) else {}
-    return {
-        "input_tokens": _to_usage_int(usage_map.get("input_tokens")),
-        "output_tokens": _to_usage_int(usage_map.get("output_tokens")),
-    }
-
-
-def _send_parse_request(
-    provider: str,
-    system_prompt: str,
-    user_prompt: str,
-    model: str,
-    max_tokens: int = DEFAULT_MAX_TOKENS,
-) -> tuple[str, dict[str, int]]:
-    if provider == "openai":
-        api_key = os.getenv("OPENAI_API_KEY")
-        if not api_key:
-            raise ValueError("OPENAI_API_KEY is not set")
-        payload = {
-            "model": model,
-            "temperature": 0,
-            "max_tokens": max_tokens,
-            "messages": [
-                {"role": "system", "content": system_prompt},
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        req = urllib.request.Request(
-            "https://api.openai.com/v1/chat/completions",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "Authorization": f"Bearer {api_key}",
-                "Content-Type": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"OpenAI API error: {detail or exc.reason}") from exc
-
-        choices = body.get("choices") or []
-        if not choices:
-            raise RuntimeError("OpenAI API returned no choices")
-        usage = _usage_from_openai(body)
-        message = choices[0].get("message") or {}
-        content = message.get("content")
-        if isinstance(content, str):
-            return content, usage
-        if isinstance(content, list):
-            parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
-            return "".join(parts), usage
-        raise RuntimeError("OpenAI API returned unexpected content format")
-
-    if provider == "claude":
-        api_key = os.getenv("ANTHROPIC_API_KEY")
-        if not api_key:
-            raise ValueError("ANTHROPIC_API_KEY is not set")
-        payload = {
-            "model": model,
-            "max_tokens": max_tokens,
-            "temperature": 0,
-            "system": system_prompt,
-            "messages": [
-                {"role": "user", "content": user_prompt},
-            ],
-        }
-        req = urllib.request.Request(
-            "https://api.anthropic.com/v1/messages",
-            data=json.dumps(payload).encode("utf-8"),
-            method="POST",
-            headers={
-                "x-api-key": api_key,
-                "anthropic-version": "2023-06-01",
-                "content-type": "application/json",
-            },
-        )
-        try:
-            with urllib.request.urlopen(req, timeout=DEFAULT_TIMEOUT) as resp:
-                body = json.loads(resp.read().decode("utf-8"))
-        except urllib.error.HTTPError as exc:
-            detail = exc.read().decode("utf-8", errors="ignore")
-            raise RuntimeError(f"Anthropic API error: {detail or exc.reason}") from exc
-
-        content = body.get("content") or []
-        usage = _usage_from_claude(body)
-        if isinstance(content, list):
-            parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
-            if parts:
-                return "".join(parts), usage
-        raise RuntimeError("Anthropic API returned unexpected content format")
-
-    raise ValueError(f"Unsupported AI provider '{provider}'")
 
 
 def _canonicalize_institution(raw_institution: str) -> tuple[str, str | None]:
@@ -297,6 +173,16 @@ def _extract_json_object(raw_text: str) -> dict[str, Any]:
         raise ValueError("malformed JSON response") from exc
 
 
+def _sha256_file(path: Path) -> str:
+    digest = hashlib.sha256()
+    with Path(path).open("rb") as handle:
+        for chunk in iter(lambda: handle.read(1024 * 1024), b""):
+            if not chunk:
+                break
+            digest.update(chunk)
+    return digest.hexdigest()
+
+
 def _normalize_ai_payload_dates(parsed: dict[str, Any]) -> int:
     """Normalize non-ISO dates in-place. Returns count of dates converted."""
     converted = 0
@@ -334,6 +220,11 @@ def ai_parse_statement(
     model: str | None = None,
     max_text_chars: int = DEFAULT_MAX_TEXT_CHARS,
     max_tokens: int = DEFAULT_MAX_TOKENS,
+    api_key: str | None = None,
+    ai_egress_mode: str | None = None,
+    db_path: str | Path | None = None,
+    import_batch_id: str | None = None,
+    file_hash: str | None = None,
     **validation_kwargs: Any,
 ) -> AIParseResult:
     if max_text_chars <= 0:
@@ -357,6 +248,7 @@ def ai_parse_statement(
         raise ValueError(
             f"extracted PDF text length {len(text)} exceeds max_text_chars={max_text_chars}; increase limit or split statement"
         )
+    assert_raw_financial_ai_allowed(ai_egress_mode, surface="PDF statement parsing")
     logger.info(
         "Sending AI parse request file=%s provider=%s model=%s text_len=%s max_tokens=%s",
         pdf_path,
@@ -375,11 +267,19 @@ def ai_parse_statement(
     total_input_tokens = 0
     total_output_tokens = 0
     for attempt in range(2):
-        response = _send_parse_request(provider_name, system_prompt, user_prompt, model_name, max_tokens)
+        response = _send_ai_request(
+            provider_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model_name,
+            max_tokens=max_tokens,
+            timeout=DEFAULT_TIMEOUT,
+            api_key=api_key,
+        )
         if isinstance(response, tuple) and len(response) == 2:
             raw_response, usage = response
-            total_input_tokens += _to_usage_int(usage.get("input_tokens"))
-            total_output_tokens += _to_usage_int(usage.get("output_tokens"))
+            total_input_tokens += int(usage.get("input_tokens") or 0)
+            total_output_tokens += int(usage.get("output_tokens") or 0)
         else:
             raw_response = str(response)
         try:
@@ -396,6 +296,28 @@ def ai_parse_statement(
                     model_name,
                     parse_error,
                 )
+
+    resolved_file_hash = file_hash or _sha256_file(Path(pdf_path))
+    parse_cost_usd6 = estimate_ai_cost_usd6(
+        provider_name,
+        model=model_name,
+        input_tokens=total_input_tokens,
+        output_tokens=total_output_tokens,
+    )
+    if db_path is not None and (
+        total_input_tokens > 0 or total_output_tokens > 0 or parse_cost_usd6 > 0
+    ):
+        record_cost(
+            db_path,
+            provider_name,
+            "parse_statement",
+            parse_cost_usd6,
+            input_tokens=total_input_tokens,
+            output_tokens=total_output_tokens,
+            model=model_name,
+            is_estimated=True,
+            idempotency_key=f"aiparse_{import_batch_id or resolved_file_hash}",
+        )
 
     if parsed is None:
         # Detect likely output truncation — response ends mid-JSON
@@ -627,5 +549,4 @@ __all__ = [
     "ai_result_to_extract_result",
     "_build_parse_prompt",
     "_extract_json_object",
-    "_send_parse_request",
 ]

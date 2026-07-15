@@ -1,9 +1,13 @@
-"""PDF statement importers.
+"""Deprecated legacy PDF statement importers.
 
-Production PDF imports go through the AI parser (ai_statement_parser.py).
-Legacy regex extractors for chase_credit and apple_card are retained for
-test coverage; all other bank-specific extractors were archived to
-_legacy_pdf_extractors.py during CQ-006 cleanup.
+DEPRECATION NOTICE: PDF statement extraction is now handled by the AI
+extractor stack in ``finance_cli/extractors/``. The regex-based parsers in
+this module are superseded and should not receive new institution logic.
+
+This file remains in the codebase for backward compatibility and test
+coverage. Legacy regex extractors for chase_credit and apple_card are
+retained here, while older bank-specific extractors were previously archived
+to ``_legacy_pdf_extractors.py`` during CQ-006 cleanup.
 """
 
 from __future__ import annotations
@@ -15,7 +19,7 @@ import sqlite3
 import uuid
 from collections import Counter
 from dataclasses import dataclass
-from datetime import datetime
+from datetime import UTC, datetime
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
 
@@ -133,7 +137,7 @@ def _infer_statement_year(text: str) -> int:
             year += 2000
         return year
 
-    return datetime.utcnow().year
+    return datetime.now(UTC).year
 
 
 def _to_iso_date(token: str, default_year: int) -> str | None:
@@ -183,7 +187,13 @@ def _extract_statement_total_cents(text: str) -> int | None:
     return None
 
 
-def _finalize_result(transactions: list[dict[str, object]], statement_total_cents: int | None, warnings: list[str]) -> ExtractResult:
+def _finalize_result(
+    transactions: list[dict[str, object]],
+    statement_total_cents: int | None,
+    warnings: list[str],
+    *,
+    statement_account_type: str | None = None,
+) -> ExtractResult:
     extracted_total = sum(int(row["amount_cents"]) for row in transactions)
     reconciled = statement_total_cents is not None and abs(statement_total_cents - extracted_total) <= 1
     if statement_total_cents is not None and not reconciled:
@@ -196,6 +206,7 @@ def _finalize_result(transactions: list[dict[str, object]], statement_total_cent
         reconciled=reconciled,
         warnings=warnings,
         statement_total_cents=statement_total_cents,
+        statement_account_type=statement_account_type,
     )
 
 
@@ -264,7 +275,7 @@ def _extract_apple_card(pdf_path: Path) -> ExtractResult:
         standard_match = standard_line_re.match(line)
         if standard_match:
             date_token, description, amount_token = standard_match.groups()
-            iso_date = _to_iso_date(date_token, datetime.utcnow().year)
+            iso_date = _to_iso_date(date_token, datetime.now(UTC).year)
             if not iso_date:
                 continue
             carry_date = iso_date
@@ -275,7 +286,7 @@ def _extract_apple_card(pdf_path: Path) -> ExtractResult:
                     "date": iso_date,
                     "description": description.strip(),
                     "amount_cents": amount_cents,
-                    "card_ending": "Apple",
+                    "card_ending": None,
                     "source": "Apple Card",
                 }
             )
@@ -291,12 +302,17 @@ def _extract_apple_card(pdf_path: Path) -> ExtractResult:
                     "date": carry_date,
                     "description": "Monthly Installment Payment",
                     "amount_cents": amount_cents,
-                    "card_ending": "Apple",
+                    "card_ending": None,
                     "source": "Apple Card",
                 }
             )
 
-    return _finalize_result(transactions, _extract_statement_total_cents(text), [])
+    return _finalize_result(
+        transactions,
+        _extract_statement_total_cents(text),
+        [],
+        statement_account_type="credit_card",
+    )
 
 
 def extract_transactions(pdf_path: Path, bank: str) -> ExtractResult:
@@ -321,6 +337,7 @@ def import_pdf_statement(
     bank: str,
     account_id: str | None = None,
     dry_run: bool = False,
+    rules_path: Path | None = None,
 ) -> dict[str, object]:
     pdf_path = Path(pdf_path)
     if not pdf_path.exists():
@@ -359,6 +376,7 @@ def import_pdf_statement(
         bank_parser=bank,
         account_id=account_id,
         dry_run=dry_run,
+        rules_path=rules_path,
     )
 
 
@@ -378,6 +396,7 @@ def import_extracted_statement(
     ai_prompt_version: str | None = None,
     ai_prompt_hash: str | None = None,
     auto_commit: bool = True,
+    rules_path: Path | None = None,
 ) -> dict[str, object]:
     file_path = Path(file_path)
     if not file_path.exists():
@@ -488,18 +507,21 @@ def import_extracted_statement(
         elif statement_card_ending:
             derived_card_ending = statement_card_ending
 
+        from . import _scrub_card_ending
+
         if source_name:
+            scrubbed_ending = _scrub_card_ending(derived_card_ending) or ""
             if dry_run:
                 from . import _account_id_for_source
 
-                effective_account_id = _account_id_for_source(source_name, derived_card_ending or "")
+                effective_account_id = _account_id_for_source(source_name, scrubbed_ending)
             else:
                 from . import _get_or_create_account
 
                 effective_account_id, _ = _get_or_create_account(
                     conn,
                     source_name,
-                    derived_card_ending or "",
+                    scrubbed_ending,
                     cli_source_type="pdf_import",
                     account_type=extracted.statement_account_type,
                 )
@@ -553,11 +575,15 @@ def import_extracted_statement(
             is_payment = 1 if bool(raw_is_payment) else 0
 
         if not dry_run:
+            match_kwargs: dict[str, object] = {}
+            if rules_path is not None:
+                match_kwargs["rules_path"] = rules_path
             result = match_transaction(
                 conn,
                 description,
                 use_type=None,
                 is_payment=bool(is_payment),
+                **match_kwargs,
             )
             if result and result.category_id:
                 category_id = result.category_id

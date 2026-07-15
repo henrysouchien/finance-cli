@@ -8,16 +8,105 @@ import logging
 import os
 import sqlite3
 import time
-import urllib.error
-import urllib.request
 import uuid
 from dataclasses import dataclass
-from typing import Any
+from pathlib import Path
+from types import SimpleNamespace
+from typing import TYPE_CHECKING, Any
 
+from .ai_egress import assert_raw_financial_ai_allowed, normalize_ai_egress_mode
+from .ai_client import default_model as _default_model
+from .ai_client import send_request as _send_ai_request
 from .categorizer import normalize_description
+from .cost_tracking import estimate_ai_cost_usd6, record_and_settle_cost
+from .db import _connected_main_db_path
+from .error_capture import capture_error
+from .user_context import get_user_context
 from .user_rules import CANONICAL_CATEGORIES, load_rules, resolve_category_alias
 
 logger = logging.getLogger(__name__)
+
+if TYPE_CHECKING:
+    from .billing import RequestResolution
+
+
+def _credit_purchase_url() -> str:
+    base = (
+        os.getenv("CASHNERD_PUBLIC_BASE_URL", "").strip()
+        or os.getenv("FRONTEND_ORIGIN", "").strip()
+    ).rstrip("/")
+    return f"{base}/settings/billing" if base else "/settings/billing"
+
+
+def _credit_cta_message(prefix: str = "AI categorization blocked by plan cap.") -> str:
+    return f"{prefix} Buy credits in Billing settings: {_credit_purchase_url()}"
+
+
+def _billing_settings() -> Any:
+    return SimpleNamespace(stripe_price_lite=os.getenv("STRIPE_PRICE_LITE", ""))
+
+
+def _categorizer_user_id_for_billing() -> str | None:
+    ctx = get_user_context()
+    if ctx is None or ctx.local_mode:
+        return None
+    return ctx.expected_user_id
+
+
+def _load_user_billing_snapshot(user_id: str) -> dict[str, Any]:
+    database_url = os.getenv("DATABASE_URL", "").strip()
+    if not database_url:
+        raise RuntimeError("DATABASE_URL required for AI categorizer billing resolution")
+
+    import psycopg2
+    import psycopg2.extras
+
+    with psycopg2.connect(
+        database_url,
+        cursor_factory=psycopg2.extras.RealDictCursor,
+    ) as conn:
+        with conn.cursor() as cursor:
+            cursor.execute(
+                """
+                SELECT id,
+                       tier,
+                       trial_ends_at,
+                       lifetime_deal,
+                       stripe_price_id,
+                       anthropic_api_key_secret_ref,
+                       anthropic_api_key_enc,
+                       ai_egress_mode
+                  FROM users
+                 WHERE id = %s
+                   AND deleted_at IS NULL
+                """,
+                (user_id,),
+            )
+            row = cursor.fetchone()
+    if row is None:
+        raise RuntimeError(f"Billing user not found for AI categorizer user_id={user_id}")
+    return dict(row)
+
+
+def _resolve_categorizer_request(
+    *,
+    db_path: str | Path,
+    provider: str,
+    model: str,
+    user_snapshot: dict[str, Any] | None = None,
+) -> RequestResolution | None:
+    user_id = _categorizer_user_id_for_billing()
+    if not user_id:
+        return None
+    explicit_model = model if provider == "claude" else None
+    from .billing import resolve_request
+
+    return resolve_request(
+        user_snapshot or _load_user_billing_snapshot(user_id),
+        Path(db_path),
+        _billing_settings(),
+        explicit_model=explicit_model,
+    )
 
 
 @dataclass(frozen=True)
@@ -42,14 +131,6 @@ class BatchResult:
 
 def _chunked(items: list[sqlite3.Row], size: int) -> list[list[sqlite3.Row]]:
     return [items[i : i + size] for i in range(0, len(items), size)]
-
-
-def _default_model(provider: str) -> str:
-    if provider == "openai":
-        return "gpt-4o-mini"
-    if provider == "claude":
-        return "claude-sonnet-4-5-20250929"
-    raise ValueError(f"Unsupported AI provider '{provider}'")
 
 
 def _normalize_use_type(value: Any) -> str | None:
@@ -119,135 +200,12 @@ def _extract_json_array(raw_text: str) -> list[dict[str, Any]]:
         raise ValueError("malformed JSON response") from exc
 
 
-def _to_usage_int(value: Any) -> int:
-    try:
-        return max(int(value or 0), 0)
-    except (TypeError, ValueError):
-        return 0
-
-
-def _usage_from_openai(body: dict[str, Any]) -> dict[str, int]:
-    usage = body.get("usage")
-    usage_map = usage if isinstance(usage, dict) else {}
-    return {
-        "input_tokens": _to_usage_int(usage_map.get("prompt_tokens")),
-        "output_tokens": _to_usage_int(usage_map.get("completion_tokens")),
-    }
-
-
-def _usage_from_claude(body: dict[str, Any]) -> dict[str, int]:
-    usage = body.get("usage")
-    usage_map = usage if isinstance(usage, dict) else {}
-    return {
-        "input_tokens": _to_usage_int(usage_map.get("input_tokens")),
-        "output_tokens": _to_usage_int(usage_map.get("output_tokens")),
-    }
-
-
-def _send_openai_request(system_prompt: str, user_prompt: str, model: str) -> tuple[str, dict[str, int]]:
-    api_key = os.getenv("OPENAI_API_KEY")
-    if not api_key:
-        raise ValueError("OPENAI_API_KEY is not set")
-
-    payload = {
-        "model": model,
-        "temperature": 0,
-        "messages": [
-            {"role": "system", "content": system_prompt},
-            {"role": "user", "content": user_prompt},
-        ],
-    }
-
-    req = urllib.request.Request(
-        "https://api.openai.com/v1/chat/completions",
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "Authorization": f"Bearer {api_key}",
-            "Content-Type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"OpenAI API error: {detail or exc.reason}") from exc
-
-    choices = body.get("choices") or []
-    if not choices:
-        raise RuntimeError("OpenAI API returned no choices")
-
-    usage = _usage_from_openai(body)
-    message = choices[0].get("message") or {}
-    content = message.get("content")
-    if isinstance(content, str):
-        return content, usage
-    if isinstance(content, list):
-        parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
-        return "".join(parts), usage
-    raise RuntimeError("OpenAI API returned unexpected content format")
-
-
-def _send_claude_request(system_prompt: str, user_prompt: str, model: str) -> tuple[str, dict[str, int]]:
-    api_key = os.getenv("ANTHROPIC_API_KEY")
-    if not api_key:
-        raise ValueError("ANTHROPIC_API_KEY is not set")
-
-    payload = {
-        "model": model,
-        "max_tokens": 2048,
-        "temperature": 0,
-        "system": system_prompt,
-        "messages": [
-            {
-                "role": "user",
-                "content": user_prompt,
-            }
-        ],
-    }
-
-    req = urllib.request.Request(
-        "https://api.anthropic.com/v1/messages",
-        data=json.dumps(payload).encode("utf-8"),
-        method="POST",
-        headers={
-            "x-api-key": api_key,
-            "anthropic-version": "2023-06-01",
-            "content-type": "application/json",
-        },
-    )
-
-    try:
-        with urllib.request.urlopen(req, timeout=60) as resp:
-            body = json.loads(resp.read().decode("utf-8"))
-    except urllib.error.HTTPError as exc:
-        detail = exc.read().decode("utf-8", errors="ignore")
-        raise RuntimeError(f"Anthropic API error: {detail or exc.reason}") from exc
-
-    content = body.get("content") or []
-    usage = _usage_from_claude(body)
-    if isinstance(content, list):
-        text_parts = [str(item.get("text", "")) for item in content if isinstance(item, dict)]
-        if text_parts:
-            return "".join(text_parts), usage
-    raise RuntimeError("Anthropic API returned unexpected content format")
-
-
-def _request_provider(provider: str, system_prompt: str, user_prompt: str, model: str) -> tuple[str, dict[str, int]]:
-    if provider == "openai":
-        return _send_openai_request(system_prompt, user_prompt, model)
-    if provider == "claude":
-        return _send_claude_request(system_prompt, user_prompt, model)
-    raise ValueError(f"Unsupported AI provider '{provider}'")
-
-
 def categorize_batch(
     transactions: list[dict[str, str]],
     categories: list[str],
     provider: str | None = None,
     model: str | None = None,
+    api_key: str | None = None,
 ) -> BatchResult:
     """Categorize a transaction batch with one retry on malformed JSON."""
     provider_name = str(provider or "").strip().lower()
@@ -271,11 +229,19 @@ def categorize_batch(
     output_tokens = 0
 
     for attempt in range(2):
-        response = _request_provider(provider_name, system_prompt, user_prompt, model_name)
+        response = _send_ai_request(
+            provider_name,
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model=model_name,
+            max_tokens=2048 if provider_name == "claude" else None,
+            timeout=60,
+            api_key=api_key,
+        )
         if isinstance(response, tuple) and len(response) == 2:
             raw, usage = response
-            input_tokens += _to_usage_int(usage.get("input_tokens"))
-            output_tokens += _to_usage_int(usage.get("output_tokens"))
+            input_tokens += int(usage.get("input_tokens") or 0)
+            output_tokens += int(usage.get("output_tokens") or 0)
         else:
             raw = str(response)
         try:
@@ -392,8 +358,12 @@ def _category_id_from_name(conn: sqlite3.Connection, category_name: str) -> str 
     return None
 
 
-def _get_or_create_category_id(conn: sqlite3.Connection, category_name: str) -> str:
-    rules = load_rules()
+def _get_or_create_category_id(
+    conn: sqlite3.Connection,
+    category_name: str,
+    rules_path: Path | None = None,
+) -> str:
+    rules = load_rules(path=rules_path) if rules_path is not None else load_rules()
     resolved = resolve_category_alias(category_name, rules)
     if resolved is None:
         raise ValueError(f"Category '{category_name}' resolves to null and cannot be created")
@@ -482,6 +452,9 @@ def _log_result(
     use_type: str | None,
     confidence: float | None,
     reasoning: str | None,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    elapsed_ms: int = 0,
 ) -> None:
     conn.execute(
         """
@@ -495,8 +468,11 @@ def _log_result(
             use_type,
             confidence,
             reasoning,
-            prompt_hash
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            prompt_hash,
+            input_tokens,
+            output_tokens,
+            elapsed_ms
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
         """,
         (
             uuid.uuid4().hex,
@@ -509,6 +485,9 @@ def _log_result(
             confidence,
             reasoning,
             prompt_hash,
+            input_tokens,
+            output_tokens,
+            elapsed_ms,
         ),
     )
 
@@ -519,10 +498,13 @@ def categorize_uncategorized(
     dry_run: bool = False,
     provider: str | None = None,
     batch_size: int | None = None,
+    api_key: str | None = None,
+    rules_path: Path | None = None,
 ) -> dict[str, Any]:
     """Categorize uncategorized transactions using configured AI provider."""
     started_at = time.perf_counter()
-    rules = load_rules()
+    db_path = _connected_main_db_path(conn)
+    rules = load_rules(path=rules_path) if rules_path is not None else load_rules()
     ai_cfg = dict(rules.ai_categorizer or {})
 
     raw_provider = provider if str(provider or "").strip() else ai_cfg.get("provider")
@@ -570,6 +552,15 @@ def categorize_uncategorized(
             "elapsed_ms": 0,
         }
 
+    user_snapshot: dict[str, Any] | None = None
+    user_id = _categorizer_user_id_for_billing()
+    if user_id:
+        user_snapshot = _load_user_billing_snapshot(user_id)
+        assert_raw_financial_ai_allowed(
+            normalize_ai_egress_mode(user_snapshot.get("ai_egress_mode")),
+            surface="AI categorization",
+        )
+
     categories = _available_categories(conn, ai_cfg.get("available_categories"))
     if not categories:
         raise ValueError("No categories available for AI categorization")
@@ -581,10 +572,57 @@ def categorize_uncategorized(
     batch_count = 0
     total_input_tokens = 0
     total_output_tokens = 0
+    error_message: str | None = None
+    is_blocked = False
     batches = _chunked(list(rows), effective_batch_size)
     total_batches = len(batches)
 
     for batch_index, batch_rows in enumerate(batches, start=1):
+        resolution: RequestResolution | None = None
+        try:
+            resolution = _resolve_categorizer_request(
+                db_path=db_path,
+                provider=provider_name,
+                model=model_name,
+                user_snapshot=user_snapshot,
+            )
+        except Exception as exc:
+            capture_error(
+                exc,
+                source="api",
+                endpoint="cat_auto_categorize_cost_resolve",
+                db_path=db_path,
+                context={"model": model_name, "batch_size": len(batch_rows)},
+            )
+            raise
+
+        if resolution is not None and resolution.action == "block":
+            is_blocked = True
+            error_message = _credit_cta_message()
+            logger.warning(
+                "AI categorize blocked provider=%s model=%s credits_available=%s",
+                provider_name,
+                model_name,
+                resolution.credits_available,
+            )
+            break
+
+        batch_provider_name = provider_name
+        batch_model_name = model_name
+        batch_api_key = api_key
+        if resolution is not None and resolution.action == "downgrade":
+            if resolution.effective_model.startswith("claude-"):
+                batch_provider_name = "claude"
+                batch_model_name = resolution.effective_model
+                if provider_name != batch_provider_name:
+                    batch_api_key = None
+                    logger.warning(
+                        "AI categorize cap downgrade routed provider=%s to provider=%s model=%s",
+                        provider_name,
+                        batch_provider_name,
+                        batch_model_name,
+                    )
+
         tx_payload = [
             {
                 "id": str(row["id"]),
@@ -592,17 +630,39 @@ def categorize_uncategorized(
             }
             for row in batch_rows
         ]
+        batch_start = time.perf_counter()
         batch_result = categorize_batch(
             tx_payload,
             categories,
-            provider=provider_name,
-            model=model_name,
+            provider=batch_provider_name,
+            model=batch_model_name,
+            api_key=batch_api_key,
         )
+        batch_elapsed_ms = int((time.perf_counter() - batch_start) * 1000)
 
         batch_id = uuid.uuid4().hex
         batch_count += 1
         total_input_tokens += int(batch_result.input_tokens)
         total_output_tokens += int(batch_result.output_tokens)
+        batch_cost_usd6 = estimate_ai_cost_usd6(
+            batch_result.provider,
+            model=batch_result.model,
+            input_tokens=batch_result.input_tokens,
+            output_tokens=batch_result.output_tokens,
+        )
+        if batch_result.input_tokens > 0 or batch_result.output_tokens > 0 or batch_cost_usd6 > 0:
+            record_and_settle_cost(
+                db_path,
+                batch_result.provider,
+                "categorize",
+                batch_cost_usd6,
+                idempotency_key=f"aicat_{batch_id}",
+                is_byok=resolution.mode == "byok" if resolution is not None else False,
+                input_tokens=batch_result.input_tokens,
+                output_tokens=batch_result.output_tokens,
+                model=batch_result.model,
+                is_estimated=True,
+            )
         batch_categorized = 0
         batch_failed = 0
 
@@ -636,7 +696,7 @@ def categorize_uncategorized(
                 elif category_name:
                     category_id = _category_id_from_name(conn, category_name)
                     if category_id is None and not dry_run:
-                        category_id = _get_or_create_category_id(conn, category_name)
+                        category_id = _get_or_create_category_id(conn, category_name, rules_path=rules_path)
                     if category_id is not None or dry_run:
                         categorized += 1
                         batch_categorized += 1
@@ -693,6 +753,9 @@ def categorize_uncategorized(
                     use_type=resolved_use_type,
                     confidence=confidence,
                     reasoning=reasoning,
+                    input_tokens=batch_result.input_tokens,
+                    output_tokens=batch_result.output_tokens,
+                    elapsed_ms=batch_elapsed_ms,
                 )
         logger.info(
             "AI categorize batch %s/%s complete categorized=%s failed=%s",
@@ -722,8 +785,10 @@ def categorize_uncategorized(
         "failed": failed,
         "batches": batch_count,
         "cost_estimate": "n/a",
+        "blocked": is_blocked,
+        "error": error_message,
         "provider": provider_name,
-        "model": model_name,
+        "model": batch_model_name if batch_count else model_name,
         "input_tokens": total_input_tokens,
         "output_tokens": total_output_tokens,
         "elapsed_ms": elapsed_ms,

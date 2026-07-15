@@ -15,6 +15,7 @@ Documented workflows for how an AI agent uses the finance CLI to help users mana
 9. [Budget Monitoring & Alerts](#budget-monitoring--alerts) — Proactive run-rate monitoring to enforce budget discipline
 10. [Category Data Quality Cleanup](#category-data-quality-cleanup) — Fix misclassifications
 11. [Post-Import QA](#post-import-qa) — Verify newly imported transactions
+12. [New User Quick Start](#new-user-quick-start) — First-import setup: categories, subscriptions, budgets, first goal
 
 ---
 
@@ -201,9 +202,9 @@ Immediately start the first action items while the analysis is fresh:
 1. **Run [Subscription Audit](#subscription-audit)** — detailed walkthrough of every subscription
 2. **Set expense budgets:**
    ```bash
-   python3 -m finance_cli budget set --category Dining --amount 400
-   python3 -m finance_cli budget set --category Shopping --amount 150
-   python3 -m finance_cli budget set --category Entertainment --amount 100
+   python3 -m finance_cli budget set --category Dining --amount 500
+   python3 -m finance_cli budget set --category Shopping --amount 200
+   python3 -m finance_cli budget set --category Entertainment --amount 150
    ```
 3. **Identify micro-balance cards** from the debt dashboard and pay them off
 4. **Set financial goals:**
@@ -947,6 +948,8 @@ python3 -m finance_cli subs detect
 python3 -m finance_cli subs list --format cli
 ```
 
+The CLI list shows each subscription's ID prefix. `subs update` and `subs cancel` accept an unambiguous prefix, so copy the displayed ID prefix unless the command asks for the full ID.
+
 **What to look for:**
 - Total monthly burn — is it in line with expectations?
 - Any vendors the user doesn't recognize
@@ -975,7 +978,7 @@ python3 -m finance_cli txn search --query "VENDOR_NAME" --limit 20
    - Fix: For each subscription, verify there are recent charges. Cancel stale entries with `subs cancel <id>`
 
 5. **Apple.com/Bill bundles multiple services** — Apple bills all subscriptions (iCloud, Apple TV+, apps) under one merchant name at different amounts on different dates. The detector picks up one pattern and misses the others.
-   - Fix: Look at all distinct recurring amounts. Cancel the auto-detected entry and re-add as a combined total
+   - Fix: Look at all distinct recurring amounts. Update the auto-detected entry to the combined total with `subs update <id> --amount <total>`
 
 ### Step 3: Walk Through With User
 
@@ -987,8 +990,8 @@ Go subscription by subscription and ask:
 
 **Agent decisions per subscription:**
 - If the user says "already cancelled" → `subs cancel <id>`
-- If amount is wrong → cancel and re-add with correct amount
-- If use_type is wrong → cancel and re-add (no update command currently)
+- If amount is wrong → `subs update <id> --amount <correct_amount>`
+- If use_type is wrong → `subs update <id> --use-type Business` or `subs update <id> --use-type Personal`
 - If the user doesn't recognize it → search transactions to identify the vendor
 
 ### Step 4: Identify Missing Subscriptions
@@ -1104,29 +1107,17 @@ python3 -m finance_cli budget list --format cli
 ```
 
 **Watch for:**
-- **Duplicate entries** — `budget set` creates new rows, not upserts. Same category can have multiple budget rows (see FEATURE-003 in BUG_BACKLOG.md)
-- **Missing use_type visibility** — Personal and Business budgets for the same category look identical in the list (see UX-001 in BUG_BACKLOG.md). Query the DB directly if unclear:
-  ```bash
-  python3 -c "
-  import sqlite3
-  conn = sqlite3.connect('finance_cli/data/finance.db')
-  conn.row_factory = sqlite3.Row
-  for r in conn.execute('''
-      SELECT b.id, c.name, b.amount_cents, b.use_type, b.effective_from, b.effective_to
-      FROM budgets b JOIN categories c ON c.id = b.category_id
-      ORDER BY c.name, b.use_type
-  '''):
-      print(f'{r[\"id\"][:12]}  {r[\"name\"]:25s}  \${r[\"amount_cents\"]/100:>8.2f}  {r[\"use_type\"]:10s}  to={r[\"effective_to\"]}')
-  "
-  ```
-- **Expired entries** — budgets with `effective_to` in the past. These are dead rows that should be cleaned up
+- **Use-type split** — `budget list` shows `[Personal]` and `[Business]`; treat same-category rows as distinct if the use type differs
+- **True duplicate entries** — same category + use_type + period with overlapping active dates should be cleaned up
+- **Expired entries** — budgets with `effective_to` in the past. These are dead rows that can be deleted
 
 ### Step 3: Clean Up Stale Budgets
 
-Remove expired or duplicate budget entries. Since there's no `budget delete` CLI command yet (FEATURE-003), use direct SQL:
+Remove expired or duplicate budget entries with the budget delete command:
 
-```python
-conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
+```bash
+python3 -m finance_cli budget delete --id <budget_id>
+python3 -m finance_cli budget delete --category Dining --period monthly --view personal
 ```
 
 Only delete entries that are clearly stale (expired `effective_to`) or true duplicates (same category + use_type + period).
@@ -1158,19 +1149,20 @@ Create a comparison table for the user:
 
 For new budgets:
 ```bash
-python3 -m finance_cli budget set --category Dining --amount 400
-python3 -m finance_cli budget set --category Shopping --amount 150
-python3 -m finance_cli budget set --category Entertainment --amount 100
-python3 -m finance_cli budget set --category Coffee --amount 40
-python3 -m finance_cli budget set --category Travel --amount 200
+python3 -m finance_cli budget set --category Dining --amount 500
+python3 -m finance_cli budget set --category Shopping --amount 200
+python3 -m finance_cli budget set --category Entertainment --amount 150
+python3 -m finance_cli budget set --category Coffee --amount 50
+python3 -m finance_cli budget set --category Travel --amount 300
 ```
 
-For updating existing budgets (no update command yet — use direct SQL until FEATURE-003 is implemented):
-```python
-conn.execute("UPDATE budgets SET amount_cents = ? WHERE id = ?", (new_cents, budget_id))
+For updating existing budgets:
+```bash
+python3 -m finance_cli budget update --category Dining --amount 350 --view personal
+python3 -m finance_cli budget update --id <budget_id> --amount 350
 ```
 
-**Important:** `budget set` creates new rows. If budgets already exist for a category, update the existing row directly rather than creating duplicates.
+**Important:** `budget set` upserts the active row for the same category, period, and view. Use `budget update` when you are intentionally changing an existing target and `budget delete` when removing stale rows.
 
 ### Step 6: Verify and Present
 
@@ -1208,8 +1200,8 @@ python3 -m finance_cli budget forecast --format cli
 ### Lessons from Real Sessions
 
 From the March 2026 budget setting:
-- **Existing budgets had no delete/update path** — forced direct DB queries to clean up and tighten. This is the most common operational gap (FEATURE-003).
-- **Use_type split was invisible** — Professional Fees appeared as a duplicate ($X + $X) but was actually Personal + Business. The agent needs to query the DB directly to see this until UX-001 is fixed.
+- **Budget update/delete now exists** — use `budget update` / `budget delete`; older session notes that recommend raw SQL are stale.
+- **Use_type split is visible** — Personal and Business budgets now show in `budget list`; do not collapse them into one target.
 - **Budget targets came from the action plan** — not arbitrary. Each target was calculated from the gap analysis: "we need $X/mo in discretionary savings, here's how it splits across categories." This linkage is critical — budgets without a reason behind them don't stick.
 - **Averages can be misleading in partial months** — March data was only a few days, dragging down 3-month averages. Use Jan + Feb (full months) for the baseline when setting initial budgets.
 
@@ -1452,3 +1444,62 @@ Provider categories (`source_category`) are a strong signal — Plaid and banks 
 - If AI confidence is below 0.7, flag the transaction for user review.
 - If the same vendor appears uncategorized repeatedly, propose a keyword rule or vendor_memory entry.
 - If a payment was missed by keyword detection, consider adding a new pattern to `payment_keywords` in `rules.yaml`.
+
+---
+
+## 12. New User Quick Start
+
+**When to use:** After a user's first import — whether via Plaid, CSV upload, or the onboarding wizard. Works with as little as 1 week of data.
+
+**Time:** ~30 minutes
+
+**Goal:** Set up basic financial infrastructure (categories, subscriptions, budgets, one goal) so the user gets immediate value and has a foundation for deeper analysis later.
+
+### Phase 1: Verify the Import (5 min)
+
+1. Run `db_status` — confirm transactions landed, check date range and account count
+2. If multi-source import (e.g. Plaid + CSV): run `dedup_cross_format` to catch overlaps
+3. Run `cat_auto_categorize` — let the rules engine do a first pass
+4. Report: "X transactions imported covering [date range]. Y already categorized, Z need attention."
+
+### Phase 2: Quick Category Cleanup (10 min)
+
+1. `txn_list --uncategorized --limit 30` — show what the auto-categorizer missed
+2. Identify the top 5-10 recurring vendors among uncategorized transactions
+3. Bulk categorize each with `txn_categorize --bulk --query "VENDOR" --category "Category" --remember` — this teaches the system for future imports
+4. Re-run `cat_auto_categorize` to pick up newly learned vendor patterns
+5. Report: "Down from Z to W uncategorized. Top vendors now recognized."
+
+### Phase 3: Detect Subscriptions (5 min)
+
+1. Run `subs_detect` — finds recurring charges automatically
+2. Run `subs_list` to show what was found
+3. Run `subs_total` — monthly subscription burn rate
+4. Report: "Found N subscriptions totaling $X/month."
+
+### Phase 4: Set Initial Budgets (5 min)
+
+1. Run `spending_trends --months 1` (or however many months of data exist) to see current spending by category
+2. Suggest budgets at approximately current spending levels for the top 3-5 discretionary categories (Dining, Shopping, Entertainment, Coffee, etc.)
+3. Frame as: "These are baseline budgets based on your current spending. After we have 3 months of data, we'll do a full gap analysis and can tighten them."
+4. Set budgets with `budget_set`
+
+### Phase 5: Set a First Goal (3 min)
+
+1. Run `balance_net_worth` to see current position
+2. Suggest a simple 6-month net worth target (e.g. +5-10% from current)
+3. Set with `goal_set --metric net_worth --target <amount> --direction up --deadline <6mo>`
+4. Frame as: "This gives us something to track. We'll refine after the first gap analysis."
+
+### Phase 6: Show the Dashboard (2 min)
+
+1. Run `financial_summary` — the one-page financial health view
+2. Walk through: net worth, this month's spending, budget status, goal progress
+3. Point to next steps: "Check in weekly with `weekly_summary`. After 3 months of data, we'll run a full gap analysis (#1) for deeper insights."
+
+### Key Differences from Gap Analysis (#1)
+
+- Works with even 1 week of data (Gap Analysis needs 3+ months)
+- Sets up infrastructure (budgets, goals, subscriptions) rather than diagnosing patterns
+- Budgets are set at current levels (maintenance), not reduced
+- No trend analysis or seasonal detection — not enough data yet

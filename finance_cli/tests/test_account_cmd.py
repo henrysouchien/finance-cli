@@ -498,9 +498,9 @@ def test_mcp_account_deactivate_persists(tmp_path: Path, monkeypatch) -> None:
         )
         conn.commit()
 
-    from finance_cli.mcp_server import account_deactivate
+    from finance_cli.mcp_server import bank_account_deactivate
 
-    result = account_deactivate(id=account_id, cascade=True, force=False)
+    result = bank_account_deactivate(id=account_id, cascade=True, force=False)
     assert result["data"]["deactivated"] is True
     assert result["data"]["cascade"]["deactivated_transactions"] == 1
     assert result["data"]["cascade"]["deactivated_subscriptions"] == 1
@@ -526,9 +526,9 @@ def test_mcp_account_activate_persists(tmp_path: Path, monkeypatch) -> None:
         account_id = _seed_account(conn, institution="Test", name="Old Account", is_active=0)
         conn.commit()
 
-    from finance_cli.mcp_server import account_activate
+    from finance_cli.mcp_server import bank_account_activate
 
-    result = account_activate(id=account_id)
+    result = bank_account_activate(id=account_id)
     assert result["data"]["activated"] is True
 
     with connect(db_path) as conn:

@@ -6,7 +6,10 @@ import calendar
 import sqlite3
 import uuid
 from dataclasses import dataclass
+from decimal import Decimal
 from datetime import date
+
+from finance_cli.exceptions import NotFoundError, ValidationError
 
 from .commands.common import use_type_filter
 from .models import dollars_to_cents
@@ -70,33 +73,125 @@ def update_budget(
     conn: sqlite3.Connection,
     budget_id: str,
     amount_dollars: str,
+    dry_run: bool = False,
 ) -> str:
     existing = conn.execute(
         "SELECT id FROM budgets WHERE id = ?",
         (budget_id,),
     ).fetchone()
     if not existing:
-        raise ValueError(f"Budget '{budget_id}' not found")
+        raise NotFoundError(f"Budget '{budget_id}' not found")
 
+    if Decimal(str(amount_dollars)) < 0:
+        raise ValidationError("Budget amount cannot be negative")
     cents = dollars_to_cents(amount_dollars)
     conn.execute(
         "UPDATE budgets SET amount_cents = ? WHERE id = ?",
         (cents, budget_id),
     )
-    conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
     return budget_id
 
 
-def delete_budget(conn: sqlite3.Connection, budget_id: str) -> str:
+def reallocate_budget(
+    conn: sqlite3.Connection,
+    *,
+    from_budget_id: str,
+    to_budget_id: str,
+    amount_dollars: str,
+    dry_run: bool = False,
+) -> dict[str, int | str]:
+    if from_budget_id == to_budget_id:
+        raise ValidationError("Cannot reallocate within the same budget")
+    amount = Decimal(str(amount_dollars))
+    if amount <= 0:
+        raise ValidationError("Reallocation amount must be positive")
+    transfer_cents = dollars_to_cents(amount_dollars)
+    if transfer_cents <= 0:
+        raise ValidationError("Reallocation amount must be at least $0.01")
+
+    savepoint = f"budget_reallocate_{uuid.uuid4().hex}"
+    conn.execute(f"SAVEPOINT {savepoint}")
+
+    try:
+        source_update = conn.execute(
+            """
+            UPDATE budgets
+               SET amount_cents = amount_cents - ?
+             WHERE id = ?
+               AND amount_cents >= ?
+            """,
+            (transfer_cents, from_budget_id, transfer_cents),
+        )
+        if source_update.rowcount != 1:
+            source = conn.execute(
+                "SELECT amount_cents FROM budgets WHERE id = ?",
+                (from_budget_id,),
+            ).fetchone()
+            if source is None:
+                raise NotFoundError(f"Budget '{from_budget_id}' not found")
+            raise ValidationError("Reallocation would make source budget negative")
+
+        target_update = conn.execute(
+            """
+            UPDATE budgets
+               SET amount_cents = amount_cents + ?
+             WHERE id = ?
+            """,
+            (transfer_cents, to_budget_id),
+        )
+        if target_update.rowcount != 1:
+            raise NotFoundError(f"Budget '{to_budget_id}' not found")
+
+        rows = conn.execute(
+            """
+            SELECT id, amount_cents
+              FROM budgets
+             WHERE id IN (?, ?)
+            """,
+            (from_budget_id, to_budget_id),
+        ).fetchall()
+        by_id = {str(row["id"]): int(row["amount_cents"] or 0) for row in rows}
+        from_after_cents = by_id[from_budget_id]
+        to_after_cents = by_id[to_budget_id]
+        from_before_cents = from_after_cents + transfer_cents
+        to_before_cents = to_after_cents - transfer_cents
+
+        if dry_run:
+            conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+    except Exception:
+        conn.execute(f"ROLLBACK TO SAVEPOINT {savepoint}")
+        conn.execute(f"RELEASE SAVEPOINT {savepoint}")
+        raise
+
+    return {
+        "from_budget_id": from_budget_id,
+        "to_budget_id": to_budget_id,
+        "transfer_cents": transfer_cents,
+        "from_before_cents": from_before_cents,
+        "from_after_cents": from_after_cents,
+        "to_before_cents": to_before_cents,
+        "to_after_cents": to_after_cents,
+    }
+
+
+def delete_budget(conn: sqlite3.Connection, budget_id: str, dry_run: bool = False) -> str:
     existing = conn.execute(
         "SELECT id FROM budgets WHERE id = ?",
         (budget_id,),
     ).fetchone()
     if not existing:
-        raise ValueError(f"Budget '{budget_id}' not found")
+        raise NotFoundError(f"Budget '{budget_id}' not found")
 
     conn.execute("DELETE FROM budgets WHERE id = ?", (budget_id,))
-    conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
     return budget_id
 
 
@@ -107,7 +202,10 @@ def set_budget(
     period: str,
     use_type: str = "Personal",
     effective_from: str | None = None,
+    dry_run: bool = False,
 ) -> str:
+    if Decimal(str(amount_dollars)) < 0:
+        raise ValidationError("Budget amount cannot be negative")
     cents = dollars_to_cents(amount_dollars)
     effective_from = effective_from or date.today().replace(day=1).isoformat()
 
@@ -120,7 +218,7 @@ def set_budget(
         (category_id,),
     ).fetchone()
     if category_row and int(child_count["child_count"]) > 0:
-        raise ValueError(
+        raise ValidationError(
             f"Cannot set budget on parent category '{category_row['name']}' - "
             "set budgets on leaf categories instead."
         )
@@ -136,7 +234,10 @@ def set_budget(
             "UPDATE budgets SET amount_cents = ? WHERE id = ?",
             (cents, existing["id"]),
         )
-        conn.commit()
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
         return str(existing["id"])
 
     budget_id = uuid.uuid4().hex
@@ -147,7 +248,10 @@ def set_budget(
         """,
         (budget_id, category_id, period, cents, effective_from, use_type),
     )
-    conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
     return budget_id
 
 
@@ -288,7 +392,7 @@ def budget_alerts(
     alert_pct: float = 1.00,
 ) -> dict:
     if not (0 < warn_pct < alert_pct):
-        raise ValueError("warn_pct and alert_pct must satisfy 0 < warn_pct < alert_pct")
+        raise ValidationError("warn_pct and alert_pct must satisfy 0 < warn_pct < alert_pct")
 
     month = month or _today_month()
     year, month_num = [int(v) for v in month.split("-")]

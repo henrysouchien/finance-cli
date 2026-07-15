@@ -1,0 +1,2 @@
+-- Special migration handled in finance_cli.db.
+-- Creates the synced savings_automations table and its _sync_changelog triggers.

@@ -6,6 +6,8 @@ import textwrap
 
 import pytest
 
+from finance_cli import storage_files
+from finance_cli.storage_lease import LeaseScope, LocalLease, RemoteLease
 import finance_cli.user_rules as user_rules_module
 from finance_cli.categorizer import MatchResult, apply_match, match_transaction
 from finance_cli.db import connect, initialize_database
@@ -52,6 +54,62 @@ def _seed_transaction(conn, txn_id: str, description: str, amount_cents: int, ca
         (txn_id, description, amount_cents, category_id, use_type),
     )
     conn.commit()
+
+
+def test_load_rules_remote_lease_reads_rules_via_storage_files(monkeypatch, tmp_path: Path) -> None:
+    user_rules_module.invalidate_rules_cache()
+    local_path = _write_rules(
+        tmp_path / "rules.yaml",
+        """
+        keyword_rules:
+          - keywords: ["LOCALONLY"]
+            category: "Rent"
+        """,
+    )
+    reads: list[tuple[str, str, str]] = []
+
+    def fake_read_file(target: str, *, user_id: str, product: str, relative_path: str, **_kwargs) -> bytes:
+        reads.append((target, user_id, relative_path))
+        assert product == "finance_cli"
+        return b'keyword_rules:\n  - keywords: ["REMOTEONLY"]\n    category: "Shopping"\n'
+
+    monkeypatch.setattr(user_rules_module.storage_dispatch, "storage_server_target", lambda: "storage:50051")
+    monkeypatch.setattr(user_rules_module.storage_dispatch, "storage_client_enabled", lambda: True)
+    monkeypatch.setattr(storage_files, "read_file", fake_read_file)
+
+    with LeaseScope(user_id="42", lease=RemoteLease("lease-remote"), session_manager=object(), owns_lease=False):
+        rules = load_rules(local_path)
+
+    remote = match_keyword_rule("paid REMOTEONLY vendor", rules)
+    local = match_keyword_rule("paid LOCALONLY vendor", rules)
+    assert remote is not None
+    assert remote.category == "Shopping"
+    assert local is None
+    assert reads == [("storage:50051", "42", "rules.yaml")]
+
+
+def test_load_rules_local_lease_reads_rules_from_disk(monkeypatch, tmp_path: Path) -> None:
+    user_rules_module.invalidate_rules_cache()
+    local_path = _write_rules(
+        tmp_path / "rules.yaml",
+        """
+        keyword_rules:
+          - keywords: ["LOCALONLY"]
+            category: "Rent"
+        """,
+    )
+
+    def fail_read_file(*_args, **_kwargs) -> bytes:
+        raise AssertionError("local rules load should not call storage_files.read_file")
+
+    monkeypatch.setattr(storage_files, "read_file", fail_read_file)
+
+    with LeaseScope(user_id="42", lease=LocalLease("lease-local"), session_manager=object(), owns_lease=False):
+        rules = load_rules(local_path)
+
+    local = match_keyword_rule("paid LOCALONLY vendor", rules)
+    assert local is not None
+    assert local.category == "Rent"
 
 
 def test_keyword_rule_precedence_longest_then_priority_then_file_order(tmp_path: Path) -> None:
@@ -450,6 +508,48 @@ def test_load_rules_uses_mtime_cache(tmp_path: Path, monkeypatch) -> None:
 
     assert calls["count"] == 1
     assert first is second
+
+
+def test_load_rules_caches_each_rules_path_independently(tmp_path: Path, monkeypatch) -> None:
+    rules_path_a = _write_rules(
+        tmp_path / "rules_a.yaml",
+        """
+        keyword_rules:
+          - keywords: ["ALPHA"]
+            category: "Dining"
+            priority: 0
+        """,
+    )
+    rules_path_b = _write_rules(
+        tmp_path / "rules_b.yaml",
+        """
+        keyword_rules:
+          - keywords: ["BRAVO"]
+            category: "Shopping"
+            priority: 0
+        """,
+    )
+
+    calls = {"count": 0}
+    original_safe_load = user_rules_module.yaml.safe_load
+
+    def _counting_safe_load(payload: str):
+        calls["count"] += 1
+        return original_safe_load(payload)
+
+    monkeypatch.setattr(user_rules_module.yaml, "safe_load", _counting_safe_load)
+
+    first_a = load_rules(rules_path_a)
+    first_b = load_rules(rules_path_b)
+    second_a = load_rules(rules_path_a)
+    second_b = load_rules(rules_path_b)
+
+    assert calls["count"] == 2
+    assert first_a is second_a
+    assert first_b is second_b
+    assert first_a is not first_b
+    assert first_a.keyword_rules[0].keywords == ["ALPHA"]
+    assert first_b.keyword_rules[0].keywords == ["BRAVO"]
 
 
 def test_load_rules_returns_empty_when_file_removed(tmp_path: Path) -> None:

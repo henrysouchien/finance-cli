@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import json
 import uuid
+from datetime import date
 from pathlib import Path
 
 from finance_cli.__main__ import main
@@ -346,5 +347,13 @@ class TestPaymentExclusion:
         with connect(db_path) as conn:
             _seed_payment_exclusion_dataset(conn)
 
+        import finance_cli.liquidity as liquidity_module
+
+        class FixedDate(date):
+            @classmethod
+            def today(cls):
+                return cls(2026, 2, 20)
+
+        monkeypatch.setattr(liquidity_module, "date", FixedDate)
         payload = _run_cli(["liquidity"], capsys)
         assert payload["data"]["expense_90d_cents"] == 3200

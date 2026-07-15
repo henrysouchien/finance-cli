@@ -375,7 +375,11 @@ def test_unknown_apr_baseline(db_path: Path) -> None:
 
     baseline = result["data"]["baseline"]
     assert baseline["apr_unknown_count"] > 0
+    assert "unknown APR" in result["data"]["caveat"]
+    assert "lower-bound" in result["data"]["caveat"]
     assert "Avg APR: N/A" in result["cli_report"]
+    assert "Note: 1 debt card(s) totaling $200.00 have unknown APR" in result["cli_report"]
+    assert "lower-bound" in result["cli_report"]
 
 
 def test_cli_report_sections(db_path: Path) -> None:

@@ -56,6 +56,7 @@ def _migrated_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.create_function("current_session_id", 0, lambda: "", deterministic=True)
     migration_dir = Path(__file__).resolve().parents[1] / "migrations"
     for path in sorted(migration_dir.glob("*.sql")):
         conn.executescript(path.read_text(encoding="utf-8"))

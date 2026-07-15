@@ -18,14 +18,18 @@ from .commands import (
     export,
     goal_cmd,
     ingest,
+    intervention_cmd,
     liability_cmd,
     liquidity_cmd,
+    loan_cmd,
     monthly_cmd,
     notify_cmd,
+    ops_cmd,
     plaid_cmd,
     plan,
     projection_cmd,
     provider_cmd,
+    reminder_cmd,
     rules,
     setup_cmd,
     stripe_cmd,
@@ -33,14 +37,21 @@ from .commands import (
     spending_cmd,
     subs,
     summary_cmd,
+    triage_cmd,
     txn,
     weekly,
 )
 from .commands.common import error_envelope, print_envelope, success_envelope
-from .config import load_dotenv
+from .config import auto_migrate_data, get_db_path, load_dotenv
 from .db import connect, initialize_database
+from .error_capture import capture_error
+from .exceptions import FinanceCLIError
 from .logging_config import setup_logging
 from .migrate_legacy import migrate_legacy_source
+from .sync.cli_proxy import local_sync_proxy_spec, run_local_sync_proxy
+
+
+_COMMAND_DEFAULT_DB_ATTR = "uses_default_db"
 
 
 class CLIParseError(Exception):
@@ -86,8 +97,19 @@ def handle_migrate(args, conn):
     }
 
 
+def should_capture_cli_error(exc: Exception) -> bool:
+    if getattr(exc, "_b3_captured", False):
+        return False
+    if isinstance(exc, FinanceCLIError):
+        return int(getattr(exc, "http_status", 500) or 500) >= 500
+    return True
+
+
 def build_parser() -> argparse.ArgumentParser:
-    parser = SafeArgumentParser(prog="finance_cli")
+    parser = SafeArgumentParser(
+        prog="finance_cli",
+        description="CashNerd: personal finance tools that build understanding over time.",
+    )
     format_parent = SafeArgumentParser(add_help=False)
     format_parent.add_argument("--format", choices=["json", "cli"], default="json")
 
@@ -106,6 +128,7 @@ def build_parser() -> argparse.ArgumentParser:
     liquidity_cmd.register(subparsers, format_parent)
     balance_cmd.register(subparsers, format_parent)
     liability_cmd.register(subparsers, format_parent)
+    loan_cmd.register(subparsers, format_parent)
     plan.register(subparsers, format_parent)
     plaid_cmd.register(subparsers, format_parent)
     stripe_cmd.register(subparsers, format_parent)
@@ -121,6 +144,10 @@ def build_parser() -> argparse.ArgumentParser:
     spending_cmd.register(subparsers, format_parent)
     projection_cmd.register(subparsers, format_parent)
     goal_cmd.register(subparsers, format_parent)
+    intervention_cmd.register(subparsers, format_parent)
+    reminder_cmd.register(subparsers, format_parent)
+    triage_cmd.register(subparsers, format_parent)
+    ops_cmd.register(subparsers, format_parent)
     register_migrate_command(subparsers, format_parent)
 
     return parser
@@ -128,6 +155,7 @@ def build_parser() -> argparse.ArgumentParser:
 
 def main(argv: list[str] | None = None) -> int:
     load_dotenv()
+    auto_migrate_data()
     setup_logging()
     parser = build_parser()
     try:
@@ -143,9 +171,36 @@ def main(argv: list[str] | None = None) -> int:
         return exc.exit_code
 
     try:
-        initialize_database()
-        with connect() as conn:
-            result = args.func(args, conn)
+        proxy_spec = local_sync_proxy_spec(args)
+        if proxy_spec is not None:
+            result = run_local_sync_proxy(proxy_spec, args)
+            envelope = success_envelope(
+                command=args.command_name,
+                data=result.get("data", {}),
+                summary=result.get("summary"),
+                cli_report=result.get("cli_report"),
+            )
+            print_envelope(envelope, args.format)
+            return 0
+
+        uses_default_db = bool(getattr(args, _COMMAND_DEFAULT_DB_ATTR, True))
+        if uses_default_db:
+            initialize_database()
+        command_name = getattr(args, "command_name", "")
+        if not uses_default_db:
+            result = args.func(args, None)
+        elif command_name == "db.restore":
+            conn = connect()
+            try:
+                result = args.func(args, conn)
+            finally:
+                try:
+                    conn.close()
+                except Exception:
+                    pass
+        else:
+            with connect() as conn:
+                result = args.func(args, conn)
         envelope = success_envelope(
             command=args.command_name,
             data=result.get("data", {}),
@@ -156,6 +211,13 @@ def main(argv: list[str] | None = None) -> int:
         return 0
     except Exception as exc:
         command_name = getattr(args, "command_name", "unknown")
+        if should_capture_cli_error(exc):
+            capture_error(
+                exc,
+                source="cli",
+                endpoint=command_name or "unknown",
+                db_path=get_db_path(),
+            )
         envelope = error_envelope(command_name, str(exc))
         output_format = getattr(args, "format", "json")
         print_envelope(envelope, output_format)

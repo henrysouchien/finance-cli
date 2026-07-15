@@ -2,20 +2,29 @@
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import datetime
+from pathlib import Path
 from typing import Any
 
 try:
-    import notify
+    import alerts
 
-    _HAS_NOTIFY = True
+    _HAS_ALERTS = True
 except ImportError:
-    notify = None  # type: ignore[assignment]
-    _HAS_NOTIFY = False
+    alerts = None  # type: ignore[assignment]
+    _HAS_ALERTS = False
 
 from ..budget_engine import budget_alerts
 from ..models import cents_to_dollars
+from ..notification_utils import resolve_notification_creds
+
+_VALID_CHANNELS = {"telegram", "imessage"}
+_REQUIRED_CONFIG_KEYS = {
+    "telegram": "chat_id",
+    "imessage": "target",
+}
 
 
 def register(subparsers, format_parent) -> None:
@@ -33,6 +42,31 @@ def register(subparsers, format_parent) -> None:
     p_test.add_argument("--channel", choices=["telegram", "imessage"], default="telegram")
     p_test.add_argument("--dry-run", action="store_true")
     p_test.set_defaults(func=handle_test, command_name="notify.test")
+
+    p_channel_set = notify_sub.add_parser(
+        "channel-set",
+        parents=[format_parent],
+        help="Create or update a notification channel config",
+    )
+    p_channel_set.add_argument("channel", choices=["telegram", "imessage"])
+    p_channel_set.add_argument("config")
+    p_channel_set.add_argument("--label", default="")
+    p_channel_set.set_defaults(func=handle_channel_set, command_name="notify.channel_set")
+
+    p_channel_list = notify_sub.add_parser(
+        "channel-list",
+        parents=[format_parent],
+        help="List notification channel configs",
+    )
+    p_channel_list.set_defaults(func=handle_channel_list, command_name="notify.channel_list")
+
+    p_channel_remove = notify_sub.add_parser(
+        "channel-remove",
+        parents=[format_parent],
+        help="Remove a notification channel config",
+    )
+    p_channel_remove.add_argument("channel", choices=["telegram", "imessage"])
+    p_channel_remove.set_defaults(func=handle_channel_remove, command_name="notify.channel_remove")
 
 
 def _fmt_currency(cents: int) -> str:
@@ -93,20 +127,43 @@ def format_budget_alert(alert_data: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def handle_budget_alerts(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def _validate_channel(channel: str) -> str:
+    normalized = str(channel or "").strip().lower()
+    if normalized not in _VALID_CHANNELS:
+        raise ValueError(f"Unsupported notification channel: {channel}")
+    return normalized
+
+
+def _parse_channel_config(channel: str, raw_config: str) -> dict[str, Any]:
+    parsed = json.loads(raw_config)
+    if not isinstance(parsed, dict):
+        raise ValueError("Notification channel config must be a JSON object")
+    required_key = _REQUIRED_CONFIG_KEYS[channel]
+    if required_key not in parsed or parsed[required_key] in (None, ""):
+        raise ValueError(f"Notification channel config must include '{required_key}'")
+    return parsed
+
+
+def handle_budget_alerts(
+    args,
+    conn: sqlite3.Connection,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
     alert_data = budget_alerts(conn, month=getattr(args, "month", None), view=getattr(args, "view", "all"))
     message = format_budget_alert(alert_data)
 
     dry_run = bool(getattr(args, "dry_run", False))
-    channel = str(getattr(args, "channel", "telegram"))
+    channel = _validate_channel(str(getattr(args, "channel", "telegram")))
+    require_config = data_dir is not None
+    creds = resolve_notification_creds(conn, channel, require=require_config)
     if dry_run:
-        delivery = {"ok": True, "channel": channel, "dry_run": True}
+        delivery = {"ok": True, "channel": channel, "dry_run": True, "resolved_creds": creds}
     else:
-        if not _HAS_NOTIFY:
+        if not _HAS_ALERTS:
             raise ValueError(
-                "notify module not installed. Run: pip install -e notify"
+                "alerts module not installed. Run: pip install -e alerts"
             )
-        delivery = notify.send(message, channel=channel)
+        delivery = alerts.send(message, channel=channel, **creds)
 
     cli_lines = [
         f"channel={channel}",
@@ -135,19 +192,25 @@ def handle_budget_alerts(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_test(args, _conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_test(
+    args,
+    conn: sqlite3.Connection,
+    data_dir: Path | None = None,
+) -> dict[str, Any]:
     message = "finance_cli notification test - connection OK"
     dry_run = bool(getattr(args, "dry_run", False))
-    channel = str(getattr(args, "channel", "telegram"))
+    channel = _validate_channel(str(getattr(args, "channel", "telegram")))
+    require_config = data_dir is not None
+    creds = resolve_notification_creds(conn, channel, require=require_config)
 
     if dry_run:
-        delivery = {"ok": True, "channel": channel, "dry_run": True}
+        delivery = {"ok": True, "channel": channel, "dry_run": True, "resolved_creds": creds}
     else:
-        if not _HAS_NOTIFY:
+        if not _HAS_ALERTS:
             raise ValueError(
-                "notify module not installed. Run: pip install -e notify"
+                "alerts module not installed. Run: pip install -e alerts"
             )
-        delivery = notify.send(message, channel=channel)
+        delivery = alerts.send(message, channel=channel, **creds)
 
     return {
         "data": {
@@ -163,4 +226,115 @@ def handle_test(args, _conn: sqlite3.Connection) -> dict[str, Any]:
             f"sent={not dry_run}\n\n"
             f"{message}"
         ),
+    }
+
+
+def handle_channel_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    channel = _validate_channel(str(getattr(args, "channel", "")))
+    raw_config = str(getattr(args, "config", ""))
+    label = str(getattr(args, "label", "") or "")
+    parsed = _parse_channel_config(channel, raw_config)
+    stored_config = json.dumps(parsed, sort_keys=True)
+
+    conn.execute(
+        """
+        INSERT INTO notification_channels (channel, config, label)
+        VALUES (?, ?, ?)
+        ON CONFLICT(channel) DO UPDATE SET
+            config = excluded.config,
+            label = excluded.label
+        """,
+        (channel, stored_config, label),
+    )
+    conn.commit()
+
+    return {
+        "data": {
+            "channel": channel,
+            "config": parsed,
+            "label": label,
+            "updated": True,
+        },
+        "summary": {"channel": channel, "updated": True},
+        "cli_report": f"channel={channel}\nlabel={label}\nupdated=True",
+    }
+
+
+def handle_channel_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    del args
+    rows = conn.execute(
+        """
+        SELECT channel, config, label, created_at, updated_at
+        FROM notification_channels
+        ORDER BY channel
+        """
+    ).fetchall()
+    channels = [
+        {
+            "channel": str(row["channel"] if isinstance(row, sqlite3.Row) else row[0]),
+            "config": json.loads(str(row["config"] if isinstance(row, sqlite3.Row) else row[1])),
+            "label": str(
+                (row["label"] if isinstance(row, sqlite3.Row) else row[2]) or ""
+            ),
+            "created_at": str(row["created_at"] if isinstance(row, sqlite3.Row) else row[3]),
+            "updated_at": str(row["updated_at"] if isinstance(row, sqlite3.Row) else row[4]),
+        }
+        for row in rows
+    ]
+
+    telegram_chat_id: str | None = None
+    try:
+        tg_row = conn.execute(
+            "SELECT chat_id FROM telegram_config WHERE id = 1 AND chat_id IS NOT NULL"
+        ).fetchone()
+        if tg_row and tg_row[0]:
+            telegram_chat_id = str(tg_row[0])
+    except sqlite3.OperationalError:
+        telegram_chat_id = None
+
+    cli_lines = [f"channels={len(channels)}", f"telegram_fallback={bool(telegram_chat_id)}"]
+    for item in channels:
+        cli_lines.append(
+            f"{item['channel']}: label={item['label'] or '-'} config={json.dumps(item['config'], sort_keys=True)}"
+        )
+
+    return {
+        "data": {
+            "channels": channels,
+            "telegram_fallback_configured": bool(telegram_chat_id),
+            "telegram_fallback_chat_id": telegram_chat_id,
+        },
+        "summary": {
+            "count": len(channels),
+            "telegram_fallback_configured": bool(telegram_chat_id),
+        },
+        "cli_report": "\n".join(cli_lines),
+    }
+
+
+def handle_channel_remove(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    channel = _validate_channel(str(getattr(args, "channel", "")))
+    dry_run = bool(getattr(args, "dry_run", False))
+    row = conn.execute(
+        "SELECT channel, label, updated_at FROM notification_channels WHERE channel = ?",
+        (channel,),
+    ).fetchone()
+    if dry_run:
+        return {
+            "data": {
+                "dry_run": True,
+                "channel": channel,
+                "would_delete": row is not None,
+                "current_channel": dict(row) if row else None,
+            },
+            "summary": {"dry_run": True, "would_delete": row is not None},
+            "cli_report": f"channel={channel}\ndry_run=True\nwould_delete={row is not None}",
+        }
+    cursor = conn.execute("DELETE FROM notification_channels WHERE channel = ?", (channel,))
+    conn.commit()
+    deleted = bool(cursor.rowcount)
+    return {
+        "data": {"channel": channel, "deleted": deleted},
+        "summary": {"deleted": deleted},
+        "cli_report": f"channel={channel}\ndeleted={deleted}",
     }

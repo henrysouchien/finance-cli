@@ -6,7 +6,24 @@ import sqlite3
 from typing import Any
 
 from ..models import cents_to_dollars
-from ..schwab_client import check_token_health, config_status, sync_schwab_balances
+
+
+def _schwab_client_attr(name: str):
+    from .. import schwab_client
+
+    return getattr(schwab_client, name)
+
+
+def check_token_health(*args, **kwargs):
+    return _schwab_client_attr("check_token_health")(*args, **kwargs)
+
+
+def config_status(*args, **kwargs):
+    return _schwab_client_attr("config_status")(*args, **kwargs)
+
+
+def sync_schwab_balances(*args, **kwargs):
+    return _schwab_client_attr("sync_schwab_balances")(*args, **kwargs)
 
 
 def _sync_cli_report(result: dict[str, Any]) -> str:
@@ -122,4 +139,3 @@ def handle_status(args, conn: sqlite3.Connection) -> dict[str, Any]:
         },
         "cli_report": _status_cli_report(data),
     }
-

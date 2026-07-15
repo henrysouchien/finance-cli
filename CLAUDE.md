@@ -1,5 +1,3 @@
-NEVER run `git checkout -- <files>`, `git checkout .`, `git checkout HEAD`, `git restore .`, `git reset --hard`, `git clean -f`, or ANY command that discards uncommitted changes. NO EXCEPTIONS. Multiple sessions may be running in parallel. If Codex or any tool modifies unexpected files, TELL the user which files and ASK what to do — do NOT revert them.
-
 # finance_cli
 
 Personal finance CLI: imports bank statements (Plaid, CSV, PDF), categorizes transactions via rules + AI, tracks budgets/subscriptions/net worth. SQLite backend, all amounts in integer cents.
@@ -99,10 +97,24 @@ All commands accept `--format json` (structured envelope) or `--format cli` (hum
 - `notify test --channel telegram` — Test notification channel
 - `notify budget-alerts` — Send budget alerts via configured channel (`--channel`, `--month`, `--view`)
 
+### Telegram Bot
+- `python3 -m finance_cli.telegram_bot` — Run bot (requires `TELEGRAM_BOT_TOKEN`, `GATEWAY_USER_KEY` in env)
+- Routes through HTTP gateway (port 8002) via SSE streaming — bot no longer runs Claude in-process
+- Env vars: `GATEWAY_USER_KEY` (required, must be the bot user's telegram key), `TELEGRAM_GATEWAY_URL` (optional, default `http://127.0.0.1:8002`), `ANTHROPIC_API_KEY` no longer needed by bot
+- Commands: `/start`, `/stop` (cancel running request), `/reset` (clear history), `/status`, `/model <name>`, `/history`, `/compact` (force conversation compaction)
+- Three-bucket tool access: 69 read-only (auto-approved), 53 write tools (Telegram inline keyboard approval), 11 excluded (Telegram-incompatible)
+- Single-instance guard via `fcntl.flock` PID file (`~/.finance_cli/telegram_bot_<token_hash>.pid`)
+- Responses stream incrementally via `DraftStream` (throttled Telegram message edits)
+- Approvals go through gateway HTTP POST instead of in-process asyncio.Future
+- Chat history + request metrics + tool call detail persisted to SQLite (`bot_chat_messages`, `bot_requests`, `bot_tool_calls`)
+- **Conversation compaction**: routes through gateway with restricted runtime. Two-phase: (1) flush — writes session note via `agent_session_write`, (2) summary — compressed summary replacing older messages. Old messages marked `compacted_at` in DB (preserved for audit).
+- **Agent memory**: long-term memory (injected into system prompt, 12KB/120 line limit, compaction warning at 80%) + session notes (searchable via MCP tools, written by compaction flush or deliberate `agent_session_write`)
+
 ### Setup & System
 - `setup check/init/connect/status` — Environment readiness, category seeding, Plaid linking, health dashboard
 - `db status/backup/reset` — Database maintenance
 - `export csv/summary/wave` — Data export
+- `export sheets` — Google Sheets dashboard (9 tabs, formatted: bold headers, currency, conditional colors, tab colors, frozen rows)
 - `migrate --source <dir>` — Legacy migration
 
 ## Categorization Pipeline
@@ -151,6 +163,9 @@ All monetary values: integer cents. IDs: hex UUIDs (TEXT). Backend: SQLite.
 | `mileage_rates` | IRS standard mileage rates by tax year (cents per mile) |
 | `contractors` | 1099-NEC contractors: name, tin_last4, entity_type |
 | `contractor_payments` | Links transactions to contractors with paid_via_card flag |
+| `bot_chat_messages` | Telegram bot chat history: role, content, request_id, compacted_at (NULL=active, set on compaction) |
+| `bot_requests` | Telegram bot request metrics: tokens, cost, latency, errors |
+| `bot_tool_calls` | Telegram bot per-tool-call detail: tool_name, duration_ms, result_bytes |
 
 FTS5 virtual table `txn_fts` mirrors transaction descriptions for full-text search.
 
@@ -204,12 +219,19 @@ Hot-reloaded (mtime-cached). Sections:
 | `finance_cli/commands/spending_cmd.py` | Spending trends (month-over-month pivot) |
 | `finance_cli/commands/projection_cmd.py` | Net worth projection |
 | `finance_cli/commands/goal_cmd.py` | Goal tracking: set, list, status with progress bars |
+| `finance_cli/sheets_export.py` | Google Sheets export: 9-tab dashboard with formatting (currency, conditionals, tab colors) |
 | `finance_cli/notify.py` | Notification dispatch: Telegram + iMessage channels |
-| `finance_cli/mcp_server.py` | FastMCP server exposing 130 tools for Claude Code |
-| `finance_cli/migrations/` | 29 numbered SQL migrations (001–029) |
+| `finance_cli/mcp_server.py` | FastMCP server exposing 151 tools for Claude Code |
+| `finance_cli/telegram_bot/` | Telegram bot: gateway client with SSE streaming, chat history, request metrics |
+| `finance_cli/telegram_bot/gateway_client.py` | HTTP client for gateway: session management, SSE streaming, approval submission |
+| `finance_cli/telegram_bot/streaming.py` | `DraftStream`: throttled incremental Telegram message editing |
+| `finance_cli/telegram_bot/compaction.py` | Pure compaction functions: token estimation, flush/summary message building |
+| `finance_cli/telegram_bot/store.py` | Bot DB layer: message persistence, compaction save, history reload |
+| `finance_cli/commands/memory_cmd.py` | Agent memory + session note handlers (write/search/read) |
+| `finance_cli/migrations/` | 34 numbered SQL migrations (001–034) |
 | `finance_cli/data/rules.yaml` | User-editable categorization rules + essential_categories |
 | `finance_cli/data/finance.db` | SQLite database (override: `$FINANCE_CLI_DB`) |
-| `finance_cli/tests/` | ~70 pytest modules, 1155 tests |
+| `finance_cli/tests/` | ~90 pytest modules, 1579 tests |
 
 ## Testing
 
@@ -264,25 +286,23 @@ python3 -m finance_cli debt impact --cut-pct 50 --format cli  # spending cut imp
 
 ## MCP Server
 
-`finance_cli/mcp_server.py` exposes 130 tools via FastMCP for Claude Code integration. Registered globally:
+`finance_cli/mcp_server.py` exposes 151 tools via FastMCP. For local Claude Code use the local synced entrypoint:
 
 ```bash
 # Already registered in ~/.claude.json as "finance-cli"
 # To re-register:
-claude mcp add --scope user finance-cli -- python3 -m finance_cli.mcp_server
+claude mcp add --scope user finance-cli -- python3 -m finance_cli.mcp_local
 # Then fix cwd in ~/.claude.json (move from args to cwd field)
 ```
 
-Tool categories: status (3), accounts (6), reports (17), transactions (9), categorization (10), setup/import (6), pipeline (1), database (1), business (7), stripe (5), debt (4), forecasting (3), budget (9), mileage (3), contractors (4), subscriptions (7), dedup (7), plan (3), goals (3), rules (8), notify (2), export (4), provider (2), schwab (2), sheets (1), liability (3). Each tool wraps existing CLI handlers and returns `{data, summary}` dicts. Large outputs use `summary_only` param (default True) to cap response size for agent consumption.
+Tool categories: status (8), accounts (6), reports (6), transactions (11), categorization (13), setup/import (7), normalizer (9), pipeline (1), database (2), agent (5), business (9), stripe (5), plaid (5), debt (4), forecasting (3), budget (8), mileage (3), contractors (4), subscriptions (7), dedup (9), plan (3), goals (3), rules (7), notify (2), export (3), sheets (1), provider (2), schwab (2), liability (3). Each tool wraps existing CLI handlers and returns `{data, summary}` dicts. Large outputs use `summary_only` param (default True) to cap response size for agent consumption.
 
 ## Documentation
 
 See `docs/` for deep dives:
 - `docs/overview/HOW_IT_WORKS.md` — Architecture with sequence diagrams
 - `docs/overview/PROJECT_GUIDE.md` — Detailed project guide
-- `docs/AGENT_WORKFLOWS.md` — AI agent operational playbooks (8 workflows)
+- `docs/AGENT_WORKFLOWS.md` — AI agent operational playbooks (12 workflows)
 - `docs/ingest/INGEST_WORKFLOW.md` — Monthly import runbook
 - `docs/developer/ADD_INSTITUTION_RUNBOOK.md` — Adding new CSV normalizers
 - `docs/developer/AI_STATEMENT_PARSE_SPEC.md` — AI PDF parser contract
-- `docs/planning/TODO.md` — Forward-looking tasks
-- `docs/planning/BUG_BACKLOG.md` — Known issues

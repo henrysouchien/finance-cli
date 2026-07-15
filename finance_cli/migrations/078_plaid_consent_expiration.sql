@@ -1,0 +1,2 @@
+-- Implemented in finance_cli.db so synced plaid_items triggers can be
+-- recreated from the live table schema after adding consent_expiration_time.

@@ -1,248 +1,187 @@
-# finance_cli — Project Guide
+# Project Guide
 
-Last updated: 2026-03-04
+Last audited: 2026-06-27
 
-Personal finance CLI tool (Mint replacement). Agent-first design — all commands return structured JSON. SQLite storage, integer cents for all money.
+This repo has four active runtime areas:
 
-If you want a plain-English runtime walkthrough, read `docs/overview/HOW_IT_WORKS.md`.
+- `finance_cli/` — shared Python engine, CLI, MCP tools, gateway helpers, Telegram modules, sync/storage dispatch, migrations, tests.
+- `finance-web/` — FastAPI backend, React/Vite frontend, auth, billing, web chat, Plaid/Telegram webhooks, per-user data.
+- `services/storage_server/` — dedicated gRPC proxy for remote per-user SQLite/SQLCipher storage.
+- `packages/cashnerd-mcp/` — npm package that installs the local MCP binary and skills.
+
+The CLI/engine remains the source of truth for finance behavior. The web app and agents should call into it instead of duplicating ledger logic.
 
 ## Quick Start
 
+CLI / engine:
+
 ```bash
 cd .
-python3 -m finance_cli <command> [subcommand] [--format json|cli]
-python3 -m pytest
+python3 -m pip install -e '.[dev]'
+python3 -m finance_cli --help
+python3 -m pytest -q
 ```
 
-## CLI Surface
+Web stack:
 
-Top-level commands:
-- `txn`, `cat`, `daily`, `weekly`, `budget`, `export`, `ingest`, `db`
-- `dedup`, `subs`, `liquidity`, `balance`, `liability`, `plan`, `plaid`, `rules`, `migrate`
-- `debt`, `account`, `biz`, `stripe`, `provider`, `setup`, `monthly`
-- `summary`, `spending`, `projection`, `goal`
-
-Key command groups:
-- `db`: `backup`, `reset`
-- `dedup`: `cross-format`, `backfill-aliases`, `review-key-only`, `audit-names`, `suggest-aliases`, `create-alias`, `detect-equivalences`
-- `plaid`: `link`, `sync`, `balance-refresh`, `liabilities-sync`, `status`, `unlink`, `products-backfill`
-- `debt`: `dashboard`, `interest`, `simulate` (with `--lump-sum`), `impact`
-- `account`: `list`, `show`, `set-type`, `set-business`, `deactivate`, `activate`
-- `biz`: `pl`, `cashflow`, `tax`, `estimated-tax`, `forecast`, `runway`, `seasonal`, `budget set/status`, `health-check`
-- `stripe`: `link`, `sync`, `status`, `revenue`, `unlink`
-- `goal`: `set`, `list`, `status`
-- `subs`: `list`, `detect`, `recurring`, `add`, `cancel`, `total`, `audit`
-
-## Project Status
-
-**Fully implemented:**
-- Transaction CRUD, search (FTS5), CSV import, categorization with vendor memory
-- Budget engine with forecasting, weekly summaries, daily rundown
-- Subscription detection + audit (essential vs discretionary), liquidity calculator, monthly planning
-- Plaid client: link/sync/status/unlink + products backfill + balance refresh + liabilities sync
-- Stripe integration: balance transaction sync, revenue reporting, payout dedup
-- User rules system (keyword rules, split rules, category overrides, aliases)
-- AI categorizer (Claude + OpenAI providers, batch processing, auto-remember)
-- PDF statement ingest: multi-backend extractors (AI primary, Azure and BSC available)
-- CSV normalizers with institution auto-detection (Apple Card, Barclays, Chase Credit, Amex, BofA Checking)
-- 5-gate validation framework (schema/field/semantic/reconciliation/confidence)
-- Cross-format dedup engine (CSV vs PDF vs Plaid) with account alias resolution
-- Account unification: `account_aliases` table links hash-based CSV/PDF accounts to Plaid accounts
-- Business accounting: P&L, cash flow, Schedule C, estimated tax, forecasting, runway, seasonal patterns
-- Debt tools: dashboard, interest projection, paydown simulation (avalanche/snowball), lump sum modeling, spending cut impact
-- Financial visibility: summary dashboard, spending trends, net worth projection, goal tracking with progress bars
-- Account management: list/show/set-type/deactivate/activate with business flags
-- Provider routing: institution-level provider switching (Plaid vs direct API)
-- Monthly runner: orchestrates sync → dedup → categorize → detect → export
-- MCP server: 131 tools exposing all CLI handlers to Claude Code
-- Telegram bot: Claude agent with MCP tools, chat persistence, workflow loading
-- Income CSV import, Wave accounting export
-- **Dump-and-go batch import**: `ingest batch --dir ./inbox/ --commit`
-
-## Architecture
-
+```bash
+python3 -m pip install -e './finance-web[dev]'
+cd finance-web/frontend
+npm install
 ```
+
+Then use `finance-web/README.md` for `.env`, gateway, backend/frontend, and Docker Compose commands.
+
+Storage server:
+
+```bash
+cd services/storage_server
+python3 -m pip install -e '.[test]'
+python3 -m pytest -q
+```
+
+## Command Surface
+
+Top-level groups from `python3 -m finance_cli --help`:
+
+```text
+txn account cat daily weekly budget export ingest db dedup subs liquidity
+balance liability loan plan plaid stripe schwab provider rules setup monthly
+notify debt biz summary spending projection goal interventions reminders error issue
+ops migrate
+```
+
+Command families:
+
+- Ledger/data quality: `txn`, `account`, `cat`, `rules`, `dedup`, `db`
+- Planning/reporting: `daily`, `weekly`, `summary`, `spending`, `projection`, `liquidity`, `balance`, `liability`, `debt`, `budget`, `goal`, `plan`, `biz`
+- Ingest/integrations: `ingest`, `plaid`, `stripe`, `schwab`, `provider`, `export`, `monthly`
+- Coaching/ops: `interventions`, `reminders`, `notify`, `setup`, `error`, `issue`, `ops`, `migrate`
+
+JSON is the default output. Use `--format cli` for reports intended for people.
+
+## Common Workflows
+
+Health check:
+
+```bash
+python3 -m finance_cli setup check --format cli
+python3 -m finance_cli db status --format cli
+python3 -m finance_cli summary --format cli
+```
+
+Provider refresh:
+
+```bash
+python3 -m finance_cli plaid status --format cli
+python3 -m finance_cli plaid sync --format cli
+python3 -m finance_cli plaid balance-refresh --format cli
+python3 -m finance_cli plaid liabilities-sync --format cli
+python3 -m finance_cli stripe status --format cli
+python3 -m finance_cli schwab status --format cli
+```
+
+Local file ingest:
+
+```bash
+python3 -m finance_cli ingest batch --dir ./inbox --commit --format cli
+python3 -m finance_cli dedup cross-format --commit --format cli
+python3 -m finance_cli dedup backfill-aliases --commit --format cli
+```
+
+Monthly cycle:
+
+```bash
+python3 -m finance_cli monthly run --sync --ai --format cli
+python3 -m finance_cli notify budget-alerts --channel telegram --format cli
+python3 -m finance_cli interventions list --format cli
+```
+
+Backup/export:
+
+```bash
+python3 -m finance_cli db backup --format cli
+python3 -m finance_cli db export-preferences --format cli
+python3 -m finance_cli export sheets --new --format cli
+```
+
+## Repo Map
+
+```text
 finance_cli/
-├── __main__.py              # CLI entry point + arg parser
-├── config.py                # Settings, env vars, paths
-├── db.py                    # SQLite connection, migration runner (WAL, FK enforcement)
-├── models.py                # Pydantic v2 domain models
-├── mcp_server.py            # FastMCP server exposing 131 tools for Claude Code
-├── telegram_bot/            # Telegram bot: Claude agent with MCP tools + persistence
-├── categorizer.py           # Vendor memory: exact → prefix → keyword rule → Plaid
-├── ai_categorizer.py        # AI categorization (Claude/OpenAI, batch, auto-remember)
-├── ai_statement_parser.py   # AI PDF parsing: PDF → LLM → JSON → validation → ExtractResult (v8 prompt)
-├── debt_calculator.py       # Debt dashboard, interest projection, paydown simulation, lump sum modeling
-├── spending_analysis.py     # Shared essential category logic, N-month category spending averages
-├── forecasting.py           # Revenue streams, trend regression, burn rate, runway, seasonal patterns
-├── extractors/
-│   ├── __init__.py          # StatementExtractor Protocol, ExtractorMeta/Output, shared helpers
-│   ├── ai_extractor.py      # AI backend (wraps ai_statement_parser)
-│   ├── azure_extractor.py   # Azure Document Intelligence backend
-│   └── bsc_extractor.py     # BankStatementConverter API backend
-├── ingest_validation.py     # 5-gate validation + universal validate_extract_result()
-├── dedup.py                 # Cross-format dedup engine (CSV vs PDF vs Plaid)
-├── institution_names.py     # Shared institution name canonicalization (single source of truth)
-├── user_rules.py            # Keyword rules, splits, overrides, aliases, extractor config from rules.yaml
-├── budget_engine.py         # Budget calculation + forecasting
-├── liquidity.py             # Liquidity calculator
-├── subscriptions.py         # Subscription detection + audit (essential vs discretionary)
-├── plaid_client.py          # Plaid API (sync/balances/liabilities + cooldown)
-├── stripe_client.py         # Stripe API (balance transaction sync, payout dedup)
-├── provider_routing.py      # Institution-level provider routing guards
-├── exporters.py             # CSV export, monthly summary, Wave export
-├── sheets_export.py         # Google Sheets net worth export
-├── importers/
-│   ├── __init__.py          # CSV import + import_normalized_rows + income CSV
-│   ├── csv_normalizers.py   # Institution CSV adapters + auto-detection
-│   └── pdf.py               # AI ingest write path + legacy regex parser compatibility
-├── commands/
-│   ├── txn.py               # txn list|show|search|categorize|edit|tag|review|add|coverage|import
-│   ├── ingest.py            # ingest statement|csv|batch (AI PDF + CSV normalizer + dump-and-go)
-│   ├── db_cmd.py            # db backup|reset
-│   ├── dedup_cmd.py         # cross-format dedup + alias workflows + key_only review
-│   ├── cat.py               # cat list|add|auto-categorize|normalize|memory
-│   ├── budget.py            # budget set|list|status|forecast|suggest
-│   ├── daily.py             # daily [--date] [--pending] [--view]
-│   ├── weekly.py            # weekly [--week] [--compare] [--view]
-│   ├── plan.py              # plan create|show|review
-│   ├── subs.py              # subs list|detect|recurring|add|cancel|total|audit
-│   ├── liquidity_cmd.py     # liquidity [--forecast N] [--view]
-│   ├── balance_cmd.py       # balance show|net-worth|history [--view]
-│   ├── liability_cmd.py     # liability show|upcoming|obligations
-│   ├── export.py            # export csv|summary|wave
-│   ├── plaid_cmd.py         # plaid link|sync|balance-refresh|liabilities-sync|status|unlink
-│   ├── rules.py             # rules show|edit|validate|test
-│   ├── debt_cmd.py          # debt dashboard|interest|simulate|impact
-│   ├── account_cmd.py       # account list|show|set-type|set-business|deactivate|activate
-│   ├── biz_cmd.py           # biz pl|cashflow|tax|estimated-tax|forecast|runway|seasonal|budget|health-check
-│   ├── stripe_cmd.py        # stripe link|sync|status|revenue|unlink
-│   ├── provider_cmd.py      # provider status|switch
-│   ├── setup_cmd.py         # setup check|init|connect|status
-│   ├── monthly_cmd.py       # monthly run [--sync] [--ai] [--dry-run] [--skip]
-│   ├── summary_cmd.py       # summary — one-page financial health dashboard
-│   ├── spending_cmd.py      # spending trends — category-by-month pivot with trend arrows
-│   ├── projection_cmd.py    # projection — net worth projection over N months
-│   └── goal_cmd.py          # goal set|list|status — financial goal tracking
-├── data/
-│   ├── finance.db           # SQLite database
-│   └── rules.yaml           # User rules + AI parser config + essential_categories + revenue_streams
-├── migrations/              # 001-030 SQL migrations
-└── tests/                   # 1193 tests across 70 modules
+  __main__.py              CLI entrypoint and command dispatch
+  commands/                One module per command group
+  migrations/              SQLite/SQLCipher migrations, current schema version 79
+  mcp_server.py            FastMCP tool library
+  tool_registry.py         MCP metadata/classification registry
+  gateway/                 Chat gateway service, tools, code execution
+  storage_client/          gRPC client for remote storage users
+  sync/                    local/web sync auth, middleware, subscribers
+  telegram_bot/            local Telegram bot helpers and BotStore
+  tests/                   CLI/engine pytest suite
+
+finance-web/
+  server/app.py            FastAPI app factory
+  server/routers/          API route modules
+  server/migrations/       PostgreSQL migrations
+  frontend/src/            React app
+
+services/storage_server/
+  src/storage_server/      gRPC proxy implementation
+  proto/                   protobuf contract
+  scripts/                 build, install, smoke, proto helpers
+  tests/                   unit/integration/load tests
+
+docs/
+  architecture/            Current architecture and legacy rationale
+  overview/                Start-here guides
+  operations/              Ops runbooks
+  runbooks/                Storage/Stripe runbooks
+  developer/               Implementation guides
+  planning/, completed/    Point-in-time planning/archive docs
 ```
 
-## Import Workflow
+## Runtime Notes
 
-The primary way to get transactions into the system:
+- `.env` at the repo root is auto-loaded by the CLI unless `FINANCE_CLI_DISABLE_DOTENV=1`.
+- `FINANCE_CLI_DB` overrides the local DB path.
+- Money is integer cents throughout the engine.
+- File ingest is dry-run by default; use `--commit` to write.
+- Provider sync cooldowns can be bypassed with `--force`.
+- `GATEWAY_USER_KEYS` is required for gateway identity; the old shared gateway key envs are rejected.
+- Web per-user routes should use `dependencies.get_user_conn()` so storage leases and remote dispatch are honored.
+- Remote-storage users must not be forced back to local reads by toggling `FINANCE_CLI_STORAGE_CLIENT_ENABLED=false` without rollback.
 
-### Dump-and-Go (Recommended)
+## Verification
+
+Last audit results from 2026-06-27:
 
 ```bash
-# Drop PDFs and CSVs into inbox/, run one command
-cp ~/Downloads/*.pdf ~/Downloads/*.csv inbox/
-finance_cli ingest batch --dir ./inbox/ --commit --format cli
-# Files auto-move to inbox/processed/ on success
+.venv/bin/python -m pytest --collect-only -q finance_cli/tests
+# 4245 tests collected
+
+.venv/bin/python -m pytest --collect-only -q finance-web/server/tests
+# 740 tests collected
+
+cd finance-web/frontend
+npm test -- --reporter=dot --passWithNoTests
+# 545 tests passed in 48 files
+
+cd services/storage_server
+../../.venv/bin/python -m pytest --collect-only -q
+# 157 tests collected
 ```
 
-### Individual Commands
+Prefer collect/test commands over copying these counts into new docs.
 
-```bash
-# CSV with explicit institution
-finance_cli ingest csv --file export.csv --institution apple_card --commit
+## Related Docs
 
-# PDF via AI parser (default backend)
-finance_cli ingest statement --file statement.pdf --provider openai --model gpt-4o --commit
-
-# PDF via Azure Document Intelligence
-finance_cli ingest statement --file statement.pdf --backend azure --institution "Chase" --commit
-
-# PDF via BankStatementConverter
-finance_cli ingest statement --file statement.pdf --backend bsc --institution "Chase" --card-ending XXXX --commit
-
-# Plaid sync (automated)
-finance_cli plaid sync --format cli
-```
-
-### Post-Import Dedup
-
-```bash
-# Discover available dedup subcommands and flags
-finance_cli dedup --help
-
-# Find and resolve cross-format duplicates
-finance_cli dedup cross-format --commit --format cli
-
-# Backfill account aliases (dry-run, then commit)
-finance_cli dedup backfill-aliases --format cli
-finance_cli dedup backfill-aliases --commit --format cli
-```
-
-See `docs/ingest/INGEST_WORKFLOW.md` for the full operational playbook.
-
-## Key Design Decisions
-
-- **All money is integer cents** — no floats anywhere in storage or logic
-- **JSON envelope output** — `{"status": "success", "command": "...", "data": {...}}`
-- **Dry-run by default** — all ingest commands require explicit `--commit` to write
-- **AI output is untrusted** — must pass 5 validation gates before touching DB
-- **Cross-format dedup is post-import** — soft-delete preserves audit trail
-- **Institution auto-detection** — CSV institution detected from file content (batch mode)
-- **Categorization priority:** exact vendor_memory → prefix match → keyword rule → Plaid → uncategorized
-- **PDF dedupe:** SHA-256 file hash in `import_batches`; same file can be imported by different backends but not twice by the same backend
-- **CSV dedupe:** row-level `dedupe_key` (SHA256 of source, account, date, description, amount)
-- **Config cascade:** CLI flags > rules.yaml > hardcoded defaults (prevents cross-provider model mismatch)
-
-## Database Tables
-
-`transactions`, `categories`, `vendor_memory`, `budgets`, `projects`, `subscriptions`, `recurring_flows`, `accounts`, `account_aliases`, `balance_snapshots`, `liabilities`, `monthly_plans`, `plaid_items`, `import_batches`, `ai_categorization_log`, `category_mappings`, `pl_section_map`, `schedule_c_map`, `provider_routing`, `stripe_connections`, `goals`, `schema_version`, `txn_fts` (FTS5)
-
-## Environment
-
-- **DB location:** `FINANCE_CLI_DB` env var, or default `finance_cli/data/finance.db`
-- **Plaid:** `PLAID_CLIENT_ID`, `PLAID_SECRET`, `PLAID_ENV` in `.env`
-- **Stripe:** `STRIPE_API_KEY` in `.env`
-- **AI:** `OPENAI_API_KEY` or `ANTHROPIC_API_KEY` in `.env` (for AI parser + AI categorizer)
-- **Rules:** `finance_cli/data/rules.yaml` — keyword rules, aliases, split rules, AI parser config, essential_categories, revenue_streams
-
-## Testing
-
-```bash
-python3 -m pytest -q                       # 1193 tests across 70 modules
-python3 -m pytest -k "test_ingest"         # ingest command tests
-python3 -m pytest -k "test_csv_normal"     # CSV normalizer + detection tests
-python3 -m pytest -k "test_dedup"          # cross-format dedup tests
-python3 -m pytest -k "test_ai"             # AI categorizer tests
-python3 -m pytest -k "test_pdf"            # PDF importer tests
-python3 -m pytest -k "balance or liabil"   # balances/liabilities tests
-python3 -m pytest -k "test_debt"           # debt calculator + command tests
-python3 -m pytest -k "test_biz"            # business accounting tests
-python3 -m pytest -k "test_summary"        # financial summary tests
-python3 -m pytest -k "test_goal"           # goal tracking tests
-```
-
-Tests use `tmp_path` fixtures with fresh SQLite databases. External APIs (Plaid, OpenAI, Claude, Stripe) are monkeypatched — no network calls in tests.
-
-## Common Tasks
-
-1. **Monthly close:** `finance_cli monthly run --sync --ai --format cli`
-2. **Import transactions:** `finance_cli ingest batch --dir ./inbox/ --commit`
-3. **Financial health check:** `finance_cli summary --format cli`
-4. **Show net worth:** `finance_cli balance net-worth --format cli`
-5. **Debt strategy:** `finance_cli debt simulate --extra 500 --strategy compare --format cli`
-6. **Spending trends:** `finance_cli spending trends --months 6 --format cli`
-7. **Net worth projection:** `finance_cli projection --months 12 --format cli`
-8. **Goal tracking:** `finance_cli goal status --format cli`
-9. **Business P&L:** `finance_cli biz pl --format cli`
-10. **Run AI categorization:** `finance_cli cat auto-categorize --ai --format cli`
-11. **Check Plaid status:** `finance_cli plaid status`
-12. **Find cross-format dupes:** `finance_cli dedup cross-format --format cli`
-13. **Add a new CLI command:** follow pattern in `commands/summary_cmd.py`, register in `__main__.py`
-14. **Add a new CSV normalizer:** see `docs/developer/ADD_INSTITUTION_RUNBOOK.md`
-
-## MCP Server
-
-131 tools registered globally as `finance-cli` in `~/.claude.json`. Wraps all CLI handlers via Python imports. See `finance_cli/mcp_server.py`.
-
-## Agent Workflows
-
-11 operational playbooks in `docs/AGENT_WORKFLOWS.md` covering gap analysis, monthly review, debt planning, goal tracking, business tax, category design, subscription audit, budget setting/monitoring, category cleanup, and post-import QA. Available programmatically via `get_workflow(name)` MCP tool.
+- `../architecture/CURRENT_STATE.md` — current architecture.
+- `HOW_IT_WORKS.md` — runtime walkthrough.
+- `../../finance_cli/README.md` — core package guide.
+- `../../finance-web/README.md` — web setup and verification.
+- `../../services/storage_server/README.md` — storage proxy package guide.
+- `../../scripts/README.md` — operator/package script guide.
+- `../runbooks/STORAGE_SERVER_ARCHITECTURE.md` — storage-server on-call guide.
+- `../operations/SECRET_ROTATION.md` — secret/key rotation.
+- `../developer/ADD_INSTITUTION_RUNBOOK.md` — CSV normalizer workflow.

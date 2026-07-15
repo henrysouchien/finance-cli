@@ -6,6 +6,10 @@ import sqlite3
 import uuid
 from typing import Any
 
+from finance_cli.exceptions import ValidationError
+
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..debt_calculator import load_debt_cards, project_interest
 from ..models import cents_to_dollars, dollars_to_cents
 from .common import fmt_dollars
@@ -36,6 +40,28 @@ def register(subparsers, format_parent) -> None:
     p_status = goal_sub.add_parser("status", parents=[format_parent], help="Goal progress report")
     p_status.set_defaults(func=handle_status, command_name="goal.status")
 
+    p_find = goal_sub.add_parser(
+        "find",
+        parents=[format_parent],
+        help="Find a goal by exact name (active by default; --include-inactive to see soft-deleted)",
+    )
+    p_find.add_argument("name", help="Exact goal name to look up")
+    p_find.add_argument(
+        "--include-inactive",
+        action="store_true",
+        dest="include_inactive",
+        help="Also return rows where is_active = 0 (used for collision detection against soft-deleted goals)",
+    )
+    p_find.set_defaults(func=handle_find, command_name="goal.find")
+
+    p_abandon = goal_sub.add_parser(
+        "abandon",
+        parents=[format_parent],
+        help="Mark a goal inactive and record an abandoned-goal signal",
+    )
+    p_abandon.add_argument("name", help="Exact active goal name to abandon")
+    p_abandon.set_defaults(func=handle_abandon, command_name="goal.abandon")
+
 
 def _get_metric_value(conn: sqlite3.Connection, metric: str) -> int | float:
     """Return the current value for a metric (cents for dollar metrics, float for pct)."""
@@ -43,7 +69,7 @@ def _get_metric_value(conn: sqlite3.Connection, metric: str) -> int | float:
         return _get_balance_metric(conn, metric)
     if metric == "savings_rate":
         return _get_savings_rate(conn)
-    raise ValueError(f"Unknown metric: {metric}")
+    raise ValidationError(f"Unknown metric: {metric}")
 
 
 def _get_balance_metric(conn: sqlite3.Connection, metric: str) -> int:
@@ -109,6 +135,7 @@ def _get_savings_rate(conn: sqlite3.Connection) -> float:
 
 def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
     """Set or update a financial goal."""
+    dry_run = bool(getattr(args, "dry_run", False))
     name = str(args.name).strip()
     target = float(args.target)
     metric = str(args.metric)
@@ -116,9 +143,9 @@ def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
     deadline = getattr(args, "deadline", None)
 
     if metric not in VALID_METRICS:
-        raise ValueError(f"metric must be one of: {', '.join(sorted(VALID_METRICS))}")
+        raise ValidationError(f"metric must be one of: {', '.join(sorted(VALID_METRICS))}")
     if direction not in {"up", "down"}:
-        raise ValueError("direction must be 'up' or 'down'")
+        raise ValidationError("direction must be 'up' or 'down'")
 
     goal_id = uuid.uuid4().hex
 
@@ -148,7 +175,6 @@ def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
         (name, goal_id, name, metric, target_cents, target_pct, starting_cents, starting_pct,
          direction, deadline, name),
     )
-    conn.commit()
 
     goal = {
         "name": name,
@@ -165,11 +191,21 @@ def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
         goal["target_pct"] = target_pct
         goal["starting_pct"] = starting_pct
 
-    return {
-        "data": {"goal": goal},
+    result = {
+        "data": {"goal": goal, **({"dry_run": True} if dry_run else {})},
         "summary": {"name": name, "metric": metric},
-        "cli_report": f"Goal '{name}' set: {metric} -> {target} ({direction})",
+        "cli_report": (
+            f"[DRY RUN] Would set goal '{name}': {metric} -> {target} ({direction})"
+            if dry_run
+            else f"Goal '{name}' set: {metric} -> {target} ({direction})"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+        log_event(_connected_main_db_path(conn), "feature.goal_set")
+    return result
 
 
 def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -199,8 +235,8 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
             g["current"] = cents_to_dollars(current)
             g["current_cents"] = current
         else:
-            g["target_pct"] = row["target_pct"]
-            g["starting_pct"] = row["starting_pct"]
+            g["target_pct"] = row["target_pct"] or 0
+            g["starting_pct"] = row["starting_pct"] or 0
             current = _get_savings_rate(conn)
             g["current_pct"] = current
         goals.append(g)
@@ -378,3 +414,131 @@ def handle_status(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "summary": {"count": len(goals)},
         "cli_report": "\n".join(lines),
     }
+
+
+def handle_find(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    """Find a goal by exact name. Returns the row whether active or inactive
+    when include_inactive=True; otherwise filters to is_active=1 like handle_list.
+
+    Existence of an inactive row matters for collision handling because
+    `goal_set` uses INSERT OR REPLACE keyed on `name` and silently reactivates
+    inactive rows. Callers need to detect that case before invoking goal_set.
+    """
+    name = str(args.name).strip()
+    include_inactive = bool(getattr(args, "include_inactive", False))
+
+    if include_inactive:
+        row = conn.execute(
+            """SELECT id, name, metric, target_cents, target_pct, starting_cents, starting_pct,
+                     direction, deadline, is_active, created_at, updated_at
+                FROM goals WHERE name = ?""",
+            (name,),
+        ).fetchone()
+    else:
+        row = conn.execute(
+            """SELECT id, name, metric, target_cents, target_pct, starting_cents, starting_pct,
+                     direction, deadline, is_active, created_at, updated_at
+                FROM goals WHERE name = ? AND is_active = 1""",
+            (name,),
+        ).fetchone()
+
+    if row is None:
+        return {
+            "data": {"goal": None},
+            "summary": {"found": False, "name": name, "is_active": None},
+            "cli_report": f"No goal found with name '{name}'.",
+        }
+
+    metric = str(row["metric"])
+    is_active = bool(row["is_active"])
+    goal: dict[str, Any] = {
+        "id": row["id"],
+        "name": row["name"],
+        "metric": metric,
+        "direction": row["direction"],
+        "deadline": row["deadline"],
+        "is_active": is_active,
+        "created_at": row["created_at"],
+        "updated_at": row["updated_at"],
+    }
+    if metric in DOLLAR_METRICS:
+        target_cents = int(row["target_cents"] or 0)
+        starting_cents = int(row["starting_cents"] or 0)
+        goal["target"] = cents_to_dollars(target_cents)
+        goal["target_cents"] = target_cents
+        goal["starting"] = cents_to_dollars(starting_cents)
+        goal["starting_cents"] = starting_cents
+    else:
+        goal["target_pct"] = row["target_pct"] or 0
+        goal["starting_pct"] = row["starting_pct"] or 0
+
+    cli_report = (
+        f"Goal '{name}': metric={metric}, is_active={is_active}, "
+        f"deadline={row['deadline'] or 'none'}, updated_at={row['updated_at']}"
+    )
+
+    return {
+        "data": {"goal": goal},
+        "summary": {"found": True, "name": name, "is_active": is_active},
+        "cli_report": cli_report,
+    }
+
+
+def handle_abandon(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    """Soft-deactivate an active goal and log an explicit abandonment signal."""
+    dry_run = bool(getattr(args, "dry_run", False))
+    name = str(args.name).strip()
+    if not name:
+        raise ValidationError("name is required")
+
+    row = conn.execute(
+        """
+        SELECT id, name
+          FROM goals
+         WHERE name = ?
+           AND is_active = 1
+        """,
+        (name,),
+    ).fetchone()
+    if row is None:
+        raise ValidationError(f"Active goal not found: {name}")
+
+    goal_id = str(row["id"])
+    goal_name = str(row["name"])
+    conn.execute(
+        """
+        UPDATE goals
+           SET is_active = 0,
+               updated_at = datetime('now')
+         WHERE id = ?
+        """,
+        (goal_id,),
+    )
+
+    result = {
+        "data": {
+            "goal": {
+                "id": goal_id,
+                "name": goal_name,
+                "is_active": False,
+            },
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {"name": goal_name, "abandoned": True},
+        "cli_report": (
+            f"[DRY RUN] Would abandon goal '{goal_name}'"
+            if dry_run
+            else f"Goal '{goal_name}' marked abandoned"
+        ),
+    }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+        log_event(
+            _connected_main_db_path(conn),
+            "feature.goal_abandoned",
+            outcome="abandoned",
+            properties={"goal_id": goal_id, "goal_name": goal_name},
+        )
+    return result

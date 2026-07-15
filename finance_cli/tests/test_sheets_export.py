@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import argparse
+from datetime import date, datetime, timedelta, timezone
 import importlib
 import json
 import os
@@ -13,6 +14,27 @@ from pathlib import Path
 import pytest
 
 from finance_cli.db import connect, initialize_database
+
+_GOOGLE_SCOPES = [
+    "https://www.googleapis.com/auth/spreadsheets",
+    "https://www.googleapis.com/auth/drive.file",
+]
+
+_EXPECTED_TAB_ORDER = [
+    "Dashboard",
+    "Transactions",
+    "Business Financials",
+    "Monthly Spending",
+    "Net Worth",
+    "Budget Status",
+    "Debt Tracker",
+    "Subscriptions",
+    "Goals",
+]
+
+
+def _sqlite_today() -> date:
+    return datetime.now(timezone.utc).date()
 
 
 class WorksheetNotFound(Exception):
@@ -45,6 +67,10 @@ class FakeWorksheet:
     def resize(self, rows: int, cols: int):
         self.resize_calls.append((rows, cols))
 
+    @property
+    def id(self):
+        return hash(self.title) & 0x7FFFFFFF
+
     def update(self, range_name: str, values: list[list[object]], value_input_option: str | None = None):
         exc = self.spreadsheet.fail_update_by_title.get(self.title)
         if exc is not None:
@@ -56,6 +82,21 @@ class FakeWorksheet:
                 "value_input_option": value_input_option,
             }
         )
+
+    def format(self, range_name: str, cell_format: dict):
+        pass
+
+    def batch_format(self, formats: list):
+        pass
+
+    def freeze(self, rows: int = 0, cols: int = 0):
+        pass
+
+    def columns_auto_resize(self, start: int, end: int):
+        pass
+
+    def update_tab_color(self, color: dict):
+        pass
 
 
 class FakeSpreadsheet:
@@ -78,6 +119,9 @@ class FakeSpreadsheet:
         self._worksheets[title] = ws
         self.add_calls.append((title, rows, cols))
         return ws
+
+    def batch_update(self, body: dict):
+        pass
 
     def ensure_worksheet(self, title: str) -> FakeWorksheet:
         if title not in self._worksheets:
@@ -254,6 +298,18 @@ def _install_google_stubs(monkeypatch, *, client: FakeClient, state: dict[str, o
     monkeypatch.setitem(sys.modules, "google_auth_oauthlib.flow", google_auth_oauthlib_flow_mod)
 
 
+def _install_sheets_client(fake_home: Path, monkeypatch) -> FakeClient:
+    _write_credentials_file(fake_home, monkeypatch)
+    state: dict[str, object] = {"flow_creds": FakeCredentials(scopes=list(_GOOGLE_SCOPES))}
+    client = FakeClient()
+    _install_google_stubs(monkeypatch, client=client, state=state)
+    return client
+
+
+def _worksheet_values(ws: FakeWorksheet) -> list[list[object]]:
+    return [row for call in ws.update_calls for row in call["values"]]
+
+
 def _seed_category(conn, name: str, *, is_income: int = 0, level: int = 1) -> str:
     cid = uuid.uuid4().hex
     conn.execute(
@@ -272,19 +328,22 @@ def _seed_account(
     institution: str = "Bank",
     name: str = "Checking",
     account_type: str = "checking",
+    card_ending: str | None = None,
     balance_cents: int | None = 100_000,
     available_cents: int | None = None,
     limit_cents: int | None = None,
+    balance_updated_at: str | None = None,
 ) -> str:
     aid = uuid.uuid4().hex
     conn.execute(
         """
         INSERT INTO accounts (
             id, institution_name, account_name, account_type,
-            source, is_active, balance_current_cents, balance_available_cents, balance_limit_cents
-        ) VALUES (?, ?, ?, ?, 'manual', 1, ?, ?, ?)
+            card_ending, source, is_active, balance_current_cents, balance_available_cents,
+            balance_limit_cents, balance_updated_at
+        ) VALUES (?, ?, ?, ?, ?, 'manual', 1, ?, ?, ?, ?)
         """,
-        (aid, institution, name, account_type, balance_cents, available_cents, limit_cents),
+        (aid, institution, name, account_type, card_ending, balance_cents, available_cents, limit_cents, balance_updated_at),
     )
     return aid
 
@@ -364,6 +423,121 @@ def _seed_business_data(conn, *, tax_year: int = 2025) -> None:
         description="Ad spend",
         use_type="Business",
     )
+
+
+def _seed_budget(
+    conn,
+    *,
+    category_id: str,
+    amount_cents: int,
+    use_type: str = "Personal",
+    effective_from: str | None = None,
+) -> str:
+    budget_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO budgets (id, category_id, period, amount_cents, effective_from, effective_to, use_type)
+        VALUES (?, ?, 'monthly', ?, ?, NULL, ?)
+        """,
+        (
+            budget_id,
+            category_id,
+            amount_cents,
+            effective_from or date.today().replace(day=1).isoformat(),
+            use_type,
+        ),
+    )
+    return budget_id
+
+
+def _seed_subscription(
+    conn,
+    *,
+    vendor_name: str,
+    category_id: str | None = None,
+    amount_cents: int,
+    frequency: str = "monthly",
+    is_active: int = 1,
+    use_type: str = "Personal",
+    sub_type: str = "fixed",
+) -> str:
+    subscription_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO subscriptions (
+            id, vendor_name, category_id, amount_cents, frequency,
+            next_expected, account_id, is_active, use_type, sub_type
+        ) VALUES (?, ?, ?, ?, ?, NULL, NULL, ?, ?, ?)
+        """,
+        (subscription_id, vendor_name, category_id, amount_cents, frequency, is_active, use_type, sub_type),
+    )
+    return subscription_id
+
+
+def _seed_goal(
+    conn,
+    *,
+    name: str,
+    metric: str = "net_worth",
+    direction: str = "up",
+    target_cents: int | None = None,
+    target_pct: float | None = None,
+    starting_cents: int | None = None,
+    starting_pct: float | None = None,
+    is_active: int = 1,
+) -> str:
+    goal_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO goals (
+            id, name, metric, target_cents, target_pct, starting_cents, starting_pct,
+            direction, deadline, is_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, NULL, ?)
+        """,
+        (
+            goal_id,
+            name,
+            metric,
+            target_cents,
+            target_pct,
+            starting_cents,
+            starting_pct,
+            direction,
+            is_active,
+        ),
+    )
+    return goal_id
+
+
+def _seed_liability(
+    conn,
+    *,
+    account_id: str,
+    liability_type: str = "credit",
+    apr_purchase: float | None = None,
+    minimum_payment_cents: int | None = None,
+    next_monthly_payment_cents: int | None = None,
+    is_active: int = 1,
+) -> str:
+    liability_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO liabilities (
+            id, account_id, liability_type, is_active,
+            apr_purchase, minimum_payment_cents, next_monthly_payment_cents
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            liability_id,
+            account_id,
+            liability_type,
+            is_active,
+            apr_purchase,
+            minimum_payment_cents,
+            next_monthly_payment_cents,
+        ),
+    )
+    return liability_id
 
 
 # ---------------------------------------------------------------------------
@@ -757,6 +931,248 @@ def test_all_three_flags_use_date_window_and_explicit_year(fake_home, monkeypatc
 # ---------------------------------------------------------------------------
 
 
+def test_dashboard_tab_sections(fake_home, monkeypatch, conn):
+    client = _install_sheets_client(fake_home, monkeypatch)
+
+    today = _sqlite_today()
+    salary_id = _seed_category(conn, "Salary", is_income=1)
+    groceries_id = _seed_category(conn, "Groceries")
+    _seed_account(
+        conn,
+        institution="Bank",
+        name="Checking",
+        account_type="checking",
+        balance_cents=200_000,
+        balance_updated_at=f"{today.isoformat()} 09:15:00",
+    )
+    _seed_account(conn, institution="Broker", name="Investments", account_type="investment", balance_cents=300_000)
+    card_id = _seed_account(
+        conn,
+        institution="Chase",
+        name="Freedom",
+        account_type="credit_card",
+        card_ending="1234",
+        balance_cents=-40_000,
+        limit_cents=100_000,
+    )
+    _seed_liability(conn, account_id=card_id, apr_purchase=19.99, minimum_payment_cents=5_000)
+    _seed_txn(
+        conn,
+        amount_cents=100_000,
+        txn_date=today.isoformat(),
+        category_id=salary_id,
+        description="Salary",
+        use_type="Personal",
+        is_reviewed=1,
+    )
+    _seed_txn(
+        conn,
+        amount_cents=-25_000,
+        txn_date=(today - timedelta(days=1)).isoformat(),
+        category_id=groceries_id,
+        description="Groceries",
+        use_type="Personal",
+        is_reviewed=0,
+    )
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    ss = client.spreadsheets[result["spreadsheet_id"]]
+    rows = _worksheet_values(ss._worksheets["Dashboard"])
+    labels = [row[0] for row in rows if row]
+    row_map = {row[0]: row[1] for row in rows if len(row) >= 2}
+
+    assert labels[:3] == ["BALANCE SHEET", "Net Worth", "Assets"]
+    assert "DATA HEALTH" in labels
+    assert row_map["Net Worth"] == 4600.0
+    assert row_map["Savings Rate (%)"] == 75.0
+    assert row_map["Latest Transaction"] == today.isoformat()
+    assert row_map["Last Balance Refresh"] == f"{today.isoformat()} 09:15:00"
+
+
+def test_budget_status_tab_with_data(fake_home, monkeypatch, conn):
+    client = _install_sheets_client(fake_home, monkeypatch)
+
+    today = _sqlite_today()
+    dining_id = _seed_category(conn, "Dining")
+    account_id = _seed_account(conn)
+    _seed_budget(conn, category_id=dining_id, amount_cents=50_000)
+    _seed_txn(
+        conn,
+        amount_cents=-12_500,
+        txn_date=today.isoformat(),
+        category_id=dining_id,
+        account_id=account_id,
+        description="Dinner",
+        use_type="Personal",
+    )
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    ss = client.spreadsheets[result["spreadsheet_id"]]
+    rows = _worksheet_values(ss._worksheets["Budget Status"])
+    dining_row = next(row for row in rows if row and row[0] == "Dining" and row[1] == "Dining")
+    total_row = next(row for row in rows if row and row[0] == "TOTAL")
+
+    assert rows[0] == ["Group", "Category", "Use Type", "Budget", "Spent", "Remaining", "Utilization %"]
+    assert dining_row[2:] == ["Personal", 500.0, 125.0, 375.0, 25.0]
+    assert total_row[3:6] == [500.0, 125.0, 375.0]
+
+
+def test_budget_status_tab_skipped_when_empty(fake_home, monkeypatch, conn):
+    _install_sheets_client(fake_home, monkeypatch)
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    assert "Budget Status" in result["skipped_tabs"]
+
+
+def test_debt_tracker_tab_with_data(fake_home, monkeypatch, conn):
+    client = _install_sheets_client(fake_home, monkeypatch)
+
+    card_id = _seed_account(
+        conn,
+        institution="Chase",
+        name="Freedom",
+        account_type="credit_card",
+        card_ending="1234",
+        balance_cents=-50_000,
+        limit_cents=100_000,
+    )
+    _seed_liability(conn, account_id=card_id, apr_purchase=19.99, minimum_payment_cents=2_000)
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    ss = client.spreadsheets[result["spreadsheet_id"]]
+    rows = _worksheet_values(ss._worksheets["Debt Tracker"])
+    card_row = next(row for row in rows if row and row[0] == "Chase 1234")
+    total_row = next(row for row in rows if row and row[0] == "TOTAL")
+
+    assert rows[0] == ["Card", "Balance", "APR", "Min Payment", "Monthly Interest", "Credit Limit", "Utilization %"]
+    assert card_row[1] == 500.0
+    assert card_row[2] == pytest.approx(19.99)
+    assert card_row[3:] == [20.0, 8.33, 1000.0, 50.0]
+    assert total_row[1] == 500.0
+    assert total_row[2] == "19.99% avg"
+
+
+def test_debt_tracker_tab_skipped_when_empty(fake_home, monkeypatch, conn):
+    _install_sheets_client(fake_home, monkeypatch)
+
+    card_id = _seed_account(
+        conn,
+        institution="Chase",
+        name="Freedom",
+        account_type="credit_card",
+        card_ending="1234",
+        balance_cents=0,
+        limit_cents=100_000,
+    )
+    _seed_liability(conn, account_id=card_id, apr_purchase=19.99, minimum_payment_cents=2_000)
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    assert "Debt Tracker" in result["skipped_tabs"]
+
+
+def test_subscriptions_tab_active_only(fake_home, monkeypatch, conn):
+    client = _install_sheets_client(fake_home, monkeypatch)
+
+    streaming_id = _seed_category(conn, "Streaming")
+    _seed_subscription(
+        conn,
+        vendor_name="Netflix",
+        category_id=streaming_id,
+        amount_cents=12_000,
+        frequency="yearly",
+        is_active=1,
+    )
+    _seed_subscription(
+        conn,
+        vendor_name="Hulu",
+        category_id=streaming_id,
+        amount_cents=1_500,
+        frequency="monthly",
+        is_active=0,
+    )
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    ss = client.spreadsheets[result["spreadsheet_id"]]
+    rows = _worksheet_values(ss._worksheets["Subscriptions"])
+    vendors = [row[0] for row in rows if row]
+    netflix_row = next(row for row in rows if row and row[0] == "Netflix")
+    total_row = next(row for row in rows if row and row[0] == "TOTAL")
+
+    assert rows[0] == ["Vendor", "Category", "Frequency", "Amount", "Monthly Cost", "Use Type"]
+    assert "Netflix" in vendors
+    assert "Hulu" not in vendors
+    assert netflix_row[1:] == ["Streaming", "yearly", 120.0, 10.0, "Personal"]
+    assert total_row[4] == 10.0
+
+
+def test_subscriptions_tab_skipped_when_empty(fake_home, monkeypatch, conn):
+    _install_sheets_client(fake_home, monkeypatch)
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    assert "Subscriptions" in result["skipped_tabs"]
+
+
+def test_goals_tab_with_data(fake_home, monkeypatch, conn):
+    client = _install_sheets_client(fake_home, monkeypatch)
+
+    _seed_account(conn, institution="Bank", name="Checking", account_type="checking", balance_cents=100_000)
+    _seed_goal(
+        conn,
+        name="Emergency Fund",
+        metric="liquid_cash",
+        target_cents=300_000,
+        starting_cents=50_000,
+    )
+    conn.commit()
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    ss = client.spreadsheets[result["spreadsheet_id"]]
+    rows = _worksheet_values(ss._worksheets["Goals"])
+    goal_row = next(row for row in rows if row and row[0] == "Emergency Fund")
+
+    assert rows[0] == ["Name", "Metric", "Direction", "Starting", "Current", "Target", "Progress %", "Est. Months"]
+    assert goal_row[:7] == ["Emergency Fund", "liquid_cash", "up", 500.0, 1000.0, 3000.0, 20.0]
+
+
+def test_goals_tab_skipped_when_empty(fake_home, monkeypatch, conn):
+    _install_sheets_client(fake_home, monkeypatch)
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    assert "Goals" in result["skipped_tabs"]
+
+
+def test_dashboard_is_first_tab(fake_home, monkeypatch, conn):
+    _install_sheets_client(fake_home, monkeypatch)
+
+    sheets_export = _reload_sheets_export()
+    result = sheets_export.export_to_sheets(conn)
+
+    assert result["tabs"][0] == "Dashboard"
+
+
 def test_export_creates_spreadsheet_and_persists_settings(fake_home, monkeypatch, conn):
     _write_credentials_file(fake_home, monkeypatch)
     state = {
@@ -833,7 +1249,7 @@ def test_tab_creation_and_clear_logic(fake_home, monkeypatch, conn):
     }
     client = FakeClient()
     spreadsheet = FakeSpreadsheet("existing")
-    for tab_name in ("Transactions", "Business Financials", "Monthly Spending", "Net Worth"):
+    for tab_name in _EXPECTED_TAB_ORDER:
         spreadsheet.ensure_worksheet(tab_name)
     client.spreadsheets["existing"] = spreadsheet
     _install_google_stubs(monkeypatch, client=client, state=state)
@@ -847,7 +1263,7 @@ def test_tab_creation_and_clear_logic(fake_home, monkeypatch, conn):
     sheets_export = _reload_sheets_export()
     sheets_export.export_to_sheets(conn, year="2025")
 
-    for tab_name in ("Transactions", "Business Financials", "Monthly Spending", "Net Worth"):
+    for tab_name in _EXPECTED_TAB_ORDER:
         ws = spreadsheet._worksheets[tab_name]
         assert ws.clear_calls == 1
 
@@ -970,7 +1386,8 @@ def test_empty_data_tabs_still_written(fake_home, monkeypatch, conn):
     result = sheets_export.export_to_sheets(conn)
 
     assert "Business Financials" in result["skipped_tabs"]
-    assert set(result["tabs"]) == {"Transactions", "Business Financials", "Monthly Spending", "Net Worth"}
+    assert set(result["tabs"]) == set(_EXPECTED_TAB_ORDER)
+    assert {"Budget Status", "Debt Tracker", "Subscriptions", "Goals"}.issubset(set(result["skipped_tabs"]))
 
 
 def test_stale_spreadsheet_id_error_messages(fake_home, monkeypatch, conn):
@@ -1224,7 +1641,7 @@ def test_partial_failure_reports_successful_and_failed_tabs(fake_home, monkeypat
 
     second = sheets_export.export_to_sheets(conn, year="2025")
 
-    assert second["tabs"] == ["Transactions"]
+    assert second["tabs"] == ["Dashboard", "Transactions"]
     assert second["failed_tabs"][0]["tab"] == "Business Financials"
 
 
@@ -1378,7 +1795,7 @@ def test_cli_handler_returns_envelope_structure(monkeypatch):
     fake_payload = {
         "spreadsheet_id": "sheet_1",
         "spreadsheet_url": "https://docs.google.com/spreadsheets/d/sheet_1",
-        "tabs": ["Transactions", "Business Financials", "Monthly Spending", "Net Worth"],
+        "tabs": list(_EXPECTED_TAB_ORDER),
         "row_counts": {},
         "skipped_tabs": [],
         "truncated_tabs": {},
@@ -1405,7 +1822,7 @@ def test_cli_handler_returns_envelope_structure(monkeypatch):
     assert "data" in result
     assert "summary" in result
     assert "cli_report" in result
-    assert result["summary"]["total_tabs"] == 4
+    assert result["summary"]["total_tabs"] == 9
 
 
 def test_mcp_tool_wrapper_sets_interactive_false(monkeypatch):

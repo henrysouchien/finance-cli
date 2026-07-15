@@ -12,7 +12,11 @@ from typing import Any
 
 import yaml
 
+from .. import storage_files
+from ..storage_client import _dispatch as storage_dispatch
+from ..storage_lease import optional_lease_scope
 from ..user_rules import (
+    CANONICAL_CATEGORIES,
     get_category_override,
     get_split_rule,
     load_rules,
@@ -38,6 +42,19 @@ def register(subparsers, format_parent) -> None:
     p_add_keyword.add_argument("--priority", type=int, default=0)
     p_add_keyword.set_defaults(func=handle_add_keyword, command_name="rules.add-keyword")
 
+    p_add_split = rules_sub.add_parser(
+        "add-split",
+        parents=[format_parent],
+        help="Add a business/personal split rule",
+    )
+    p_add_split.add_argument("--business-pct", type=float, required=True)
+    p_add_split.add_argument("--business-category", required=True)
+    p_add_split.add_argument("--personal-category", required=True)
+    p_add_split.add_argument("--match-category")
+    p_add_split.add_argument("--match-keywords", nargs="+")
+    p_add_split.add_argument("--note")
+    p_add_split.set_defaults(func=handle_add_split, command_name="rules.add-split")
+
     p_remove_keyword = rules_sub.add_parser(
         "remove-keyword",
         parents=[format_parent],
@@ -62,13 +79,14 @@ def register(subparsers, format_parent) -> None:
     p_test.set_defaults(func=handle_test, command_name="rules.test")
 
 
-def _ensure_rules_file() -> Path:
-    target = resolve_rules_path()
+def _ensure_rules_file(rules_path: Path | None = None) -> Path:
+    target = resolve_rules_path(rules_path)
     if target.exists():
         return target
 
     target.parent.mkdir(parents=True, exist_ok=True)
-    package_default = Path(__file__).resolve().parents[1] / "data" / "rules.yaml"
+    from ..config import PACKAGE_TEMPLATE_DIR
+    package_default = PACKAGE_TEMPLATE_DIR / "rules_template.yaml"
     if package_default.exists():
         shutil.copyfile(package_default, target)
     else:
@@ -90,19 +108,83 @@ def _load_raw_rules_yaml(path: Path) -> dict[str, Any]:
         payload["keyword_rules"] = []
     elif not isinstance(keyword_rules, list):
         raise ValueError("keyword_rules must be a list")
+    split_rules = payload.get("split_rules")
+    if split_rules is None:
+        payload["split_rules"] = []
+    elif not isinstance(split_rules, list):
+        raise ValueError("split_rules must be a list")
     return payload
 
 
 def _write_raw_rules_yaml(path: Path, payload: dict[str, Any]) -> None:
-    path.write_text(yaml.safe_dump(payload, sort_keys=False), encoding="utf-8")
+    rendered = yaml.safe_dump(payload, sort_keys=False)
+    user_id = storage_dispatch.user_id_from_user_file_path(path)
+    with optional_lease_scope(
+        user_id,
+        operation="request",
+        metadata={"source": "rules._write_raw_rules_yaml"},
+    ):
+        remote_target = (
+            storage_dispatch.remote_file_target_for_user(user_id)
+            if user_id is not None
+            else None
+        )
+        if remote_target and user_id is not None:
+            storage_files.write_file(
+                remote_target,
+                user_id=user_id,
+                product="finance_cli",
+                relative_path="rules.yaml",
+                content=rendered.encode("utf-8"),
+            )
+        else:
+            path.write_text(rendered, encoding="utf-8")
     # Invalidate mtime cache so load_rules() re-reads immediately
     from ..user_rules import invalidate_rules_cache
 
     invalidate_rules_cache()
 
 
-def _validate_rules_against_categories(conn: sqlite3.Connection) -> list[str]:
-    rules = load_rules()
+def _normalize_rule_text(value: str | None) -> str | None:
+    if value is None:
+        return None
+    normalized = str(value).strip().lower()
+    return normalized or None
+
+
+def _normalize_rule_keywords(values: list[str]) -> tuple[str, ...]:
+    normalized = {
+        keyword
+        for keyword in (_normalize_rule_text(value) for value in values)
+        if keyword is not None
+    }
+    return tuple(sorted(normalized))
+
+
+def _split_rule_signature(
+    *,
+    match_category: str | None,
+    match_keywords: list[str],
+    business_pct: float,
+    business_category: str,
+    personal_category: str,
+    note: str | None,
+) -> tuple[Any, ...]:
+    return (
+        _normalize_rule_text(match_category),
+        _normalize_rule_keywords(match_keywords),
+        float(business_pct),
+        _normalize_rule_text(business_category),
+        _normalize_rule_text(personal_category),
+        _normalize_rule_text(note),
+    )
+
+
+def _validate_rules_against_categories(
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> list[str]:
+    rules = load_rules(path=rules_path)
     known = _known_categories(conn)
 
     unknown: set[str] = set()
@@ -147,7 +229,36 @@ def _validate_rules_against_categories(conn: sqlite3.Connection) -> list[str]:
     return sorted(unknown)
 
 
-def handle_add_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def _validate_category_name(
+    conn: sqlite3.Connection,
+    category: Any,
+    *,
+    field_name: str,
+) -> str:
+    normalized = str(category or "").strip()
+    if not normalized:
+        raise ValueError(f"{field_name} is required")
+    if normalized not in CANONICAL_CATEGORIES:
+        raise ValueError(f"{field_name} must be a canonical category")
+    if normalized.lower() not in _known_categories(conn):
+        raise ValueError(f"Category '{normalized}' not found")
+    return normalized
+
+
+def _normalize_business_pct(value: Any) -> int | float:
+    pct = float(value)
+    if pct <= 0 or pct >= 100:
+        raise ValueError("business_pct must be > 0 and < 100")
+    if pct.is_integer():
+        return int(pct)
+    return pct
+
+
+def handle_add_keyword(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     keyword = str(args.keyword or "").strip()
     if not keyword:
         raise ValueError("--keyword is required")
@@ -165,7 +276,7 @@ def handle_add_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if category.lower() not in _known_categories(conn):
         raise ValueError(f"Category '{category}' not found")
 
-    path = _ensure_rules_file()
+    path = _ensure_rules_file(rules_path=rules_path)
     payload = _load_raw_rules_yaml(path)
     keyword_rules = payload["keyword_rules"]
     if not isinstance(keyword_rules, list):  # pragma: no cover (guarded by loader)
@@ -226,12 +337,129 @@ def handle_add_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_remove_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_add_split(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    match_category_raw = getattr(args, "match_category", None)
+    match_category = str(match_category_raw).strip() if match_category_raw is not None else ""
+    match_category = match_category or None
+
+    raw_keywords = getattr(args, "match_keywords", None) or []
+    if isinstance(raw_keywords, str):
+        raw_keywords = [raw_keywords]
+    match_keywords = [str(value).strip() for value in raw_keywords if str(value).strip()]
+    if not match_category and not match_keywords:
+        raise ValueError("At least one of match_category or match_keywords is required")
+
+    business_category = _validate_category_name(
+        conn,
+        getattr(args, "business_category", None),
+        field_name="business_category",
+    )
+    personal_category = _validate_category_name(
+        conn,
+        getattr(args, "personal_category", None),
+        field_name="personal_category",
+    )
+    if match_category is not None:
+        match_category = _validate_category_name(
+            conn,
+            match_category,
+            field_name="match_category",
+        )
+
+    business_pct = _normalize_business_pct(getattr(args, "business_pct", 0))
+    note_raw = getattr(args, "note", None)
+    note = str(note_raw).strip() if note_raw is not None else ""
+    note = note or None
+
+    path = _ensure_rules_file(rules_path=rules_path)
+    payload = _load_raw_rules_yaml(path)
+    split_rules = payload["split_rules"]
+    if not isinstance(split_rules, list):  # pragma: no cover (guarded by loader)
+        raise ValueError("split_rules must be a list")
+    existing_split_rules = load_rules(path=path).split_rules
+
+    new_signature = _split_rule_signature(
+        match_category=match_category,
+        match_keywords=match_keywords,
+        business_pct=business_pct,
+        business_category=business_category,
+        personal_category=personal_category,
+        note=note,
+    )
+    for split_rule in existing_split_rules:
+        existing_signature = _split_rule_signature(
+            match_category=split_rule.match_category,
+            match_keywords=split_rule.match_keywords,
+            business_pct=split_rule.business_pct,
+            business_category=split_rule.business_category,
+            personal_category=split_rule.personal_category,
+            note=split_rule.note,
+        )
+        if existing_signature == new_signature:
+            raise ValueError("Split rule already exists")
+
+    normalized_match_category = _normalize_rule_text(match_category)
+    normalized_match_keywords = _normalize_rule_keywords(match_keywords)
+    for split_rule in existing_split_rules:
+        existing_match_category = _normalize_rule_text(split_rule.match_category)
+        if normalized_match_category and existing_match_category == normalized_match_category:
+            raise ValueError(f"Split rule for category '{match_category}' already exists")
+
+        existing_keywords = _normalize_rule_keywords(split_rule.match_keywords)
+        for new_keyword in normalized_match_keywords:
+            for existing_keyword in existing_keywords:
+                if new_keyword in existing_keyword or existing_keyword in new_keyword:
+                    raise ValueError(
+                        "Split rule keyword overlap: "
+                        f"'{new_keyword}' overlaps existing keyword '{existing_keyword}'"
+                    )
+
+    match_payload: dict[str, Any] = {}
+    if match_category is not None:
+        match_payload["category"] = match_category
+    if match_keywords:
+        match_payload["keywords"] = match_keywords
+
+    rule_entry: dict[str, Any] = {
+        "match": match_payload,
+        "business_pct": business_pct,
+        "business_category": business_category,
+        "personal_category": personal_category,
+    }
+    if note is not None:
+        rule_entry["note"] = note
+
+    split_rules.append(rule_entry)
+    _write_raw_rules_yaml(path, payload)
+
+    return {
+        "data": {
+            "rule": rule_entry,
+            "split_rule_count": len(split_rules),
+        },
+        "summary": {"updated": 1, "split_rule_count": len(split_rules)},
+        "cli_report": (
+            f"Added split rule ({business_pct}% business) for "
+            f"{match_category or ', '.join(match_keywords)}"
+        ),
+    }
+
+
+def handle_remove_keyword(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     keyword = str(args.keyword or "").strip()
+    dry_run = bool(getattr(args, "dry_run", False))
     if not keyword:
         raise ValueError("--keyword is required")
 
-    path = _ensure_rules_file()
+    path = _ensure_rules_file(rules_path=rules_path)
     payload = _load_raw_rules_yaml(path)
     keyword_rules = payload["keyword_rules"]
     if not isinstance(keyword_rules, list):  # pragma: no cover (guarded by loader)
@@ -259,6 +487,19 @@ def handle_remove_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
                 del keyword_rules[rule_index]
                 removed_rule = True
 
+            if dry_run:
+                return {
+                    "data": {
+                        "dry_run": True,
+                        "keyword": removed_keyword,
+                        "category": category,
+                        "removed_rule": removed_rule,
+                        "remaining_keywords": cleaned_keywords,
+                    },
+                    "summary": {"dry_run": True, "would_update": 1},
+                    "cli_report": f"[DRY RUN] Would remove keyword '{removed_keyword}'",
+                }
+
             _write_raw_rules_yaml(path, payload)
             return {
                 "data": {
@@ -273,9 +514,20 @@ def handle_remove_keyword(args, conn: sqlite3.Connection) -> dict[str, Any]:
     raise ValueError(f"Keyword '{keyword}' not found")
 
 
-def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_list(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     """Return structured keyword_rules list."""
-    rules = load_rules()
+    limit = int(getattr(args, "limit", 200))
+    offset = int(getattr(args, "offset", 0))
+    if limit < 1:
+        raise ValueError("limit must be >= 1")
+    if offset < 0:
+        raise ValueError("offset must be >= 0")
+
+    rules = load_rules(path=rules_path)
     items = []
     for rule in rules.keyword_rules:
         items.append(
@@ -287,6 +539,8 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
                 "priority": rule.priority,
             }
         )
+    total_count = len(items)
+    items = items[offset:offset + limit]
     cli_lines = []
     for item in items:
         ut = f" [{item['use_type']}]" if item["use_type"] else ""
@@ -296,17 +550,27 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
             kws += f" (+{len(item['keywords']) - 5} more)"
         cli_lines.append(f"  [{item['rule_index']}] {item['category']}{ut}{pri}: {kws}")
     return {
-        "data": {"rules": items, "count": len(items)},
-        "summary": {"count": len(items)},
+        "data": {
+            "rules": items,
+            "count": len(items),
+            "total_count": total_count,
+            "limit": limit,
+            "offset": offset,
+        },
+        "summary": {"count": total_count, "total_rules": total_count},
         "cli_report": f"Keyword rules ({len(items)}):\n" + "\n".join(cli_lines),
     }
 
 
-def handle_update_priority(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_update_priority(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     rule_index = int(args.rule_index)
     priority = int(args.priority)
 
-    path = _ensure_rules_file()
+    path = _ensure_rules_file(rules_path=rules_path)
     payload = _load_raw_rules_yaml(path)
     keyword_rules = payload["keyword_rules"]
 
@@ -339,9 +603,13 @@ def handle_update_priority(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    path = _ensure_rules_file()
-    rules = load_rules(path)
+def handle_show(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    path = _ensure_rules_file(rules_path=rules_path)
+    rules = load_rules(path=path)
     rendered = yaml.safe_dump(rules.raw or {}, sort_keys=False, allow_unicode=False)
     keyword_rules = [
         {
@@ -387,8 +655,12 @@ def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_edit(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    path = _ensure_rules_file()
+def handle_edit(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    path = _ensure_rules_file(rules_path=rules_path)
     editor = os.getenv("EDITOR") or "vi"
     editor_cmd = shlex.split(editor)
     if not editor_cmd:
@@ -403,9 +675,13 @@ def handle_edit(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_validate(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    rules = load_rules()
-    unknown_categories = _validate_rules_against_categories(conn)
+def handle_validate(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    rules = load_rules(path=rules_path)
+    unknown_categories = _validate_rules_against_categories(conn, rules_path=rules_path)
     valid = len(unknown_categories) == 0
 
     if valid:
@@ -426,8 +702,12 @@ def handle_validate(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_test(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    rules = load_rules()
+def handle_test(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    rules = load_rules(path=rules_path)
 
     payment_match = match_payment_keyword(args.description, rules)
     keyword = match_keyword_rule(args.description, rules)

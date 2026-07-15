@@ -1,20 +1,26 @@
 from __future__ import annotations
 
 import json
+import logging
 import sqlite3
 import uuid
 from datetime import date, datetime
 from pathlib import Path
+from types import SimpleNamespace
+from urllib.parse import parse_qs, urlparse
 
 import pytest
 
+from finance_cli.commands import plaid_cmd
 from finance_cli.db import connect, initialize_database
 from finance_cli.plaid_client import (
     PlaidConfigStatus,
     PlaidSyncError,
+    _get_revocation_failure_handler,
     _INVESTMENT_SUBTYPE_MAP,
     _apr_percentage,
     _apply_investment_transaction,
+    _apply_upsert_transaction,
     _get_access_token_for_item,
     _extract_products_from_item_payload,
     _fetch_investment_transactions,
@@ -24,11 +30,13 @@ from finance_cli.plaid_client import (
     _sync_investment_transactions,
     _touch_item_cooldown,
     apply_sync_updates,
+    clear_revocation_failure_handler,
     collect_transactions_sync_pages,
     complete_link_session,
     create_hosted_link_session,
     delete_secret,
     fetch_liabilities,
+    register_revocation_failure_handler,
     refresh_balances,
     resolve_requested_products,
     run_sync,
@@ -94,6 +102,22 @@ def _seed_plaid_item(
     return conn.execute("SELECT * FROM plaid_items WHERE plaid_item_id = ?", (plaid_item_id,)).fetchone()
 
 
+def _category_id_for_name(conn, name: str) -> str:
+    row = conn.execute(
+        "SELECT id FROM categories WHERE lower(name) = lower(?) ORDER BY rowid ASC LIMIT 1",
+        (name,),
+    ).fetchone()
+    if row:
+        return str(row["id"])
+    category_id = uuid.uuid4().hex
+    conn.execute(
+        "INSERT INTO categories (id, name, is_system) VALUES (?, ?, 1)",
+        (category_id, name),
+    )
+    conn.commit()
+    return category_id
+
+
 def _set_item_timestamp(conn, plaid_item_id: str, column: str, offset_expr: str) -> None:
     conn.execute(
         f"UPDATE plaid_items SET {column} = datetime('now', ?) WHERE plaid_item_id = ?",
@@ -110,7 +134,147 @@ def _mock_plaid_ready(monkeypatch) -> None:
 
 
 def _mock_access_token(monkeypatch) -> None:
-    monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+    monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
+
+
+class _DictResponse:
+    def __init__(self, payload):
+        self._payload = payload
+
+    def to_dict(self):
+        return self._payload
+
+
+def _install_complete_link_session_mocks(
+    monkeypatch,
+    *,
+    item_id: str,
+    access_token: str = "access-token-1",
+    institution_id: str | None = "ins_123",
+    institution_name: str = "Link Bank",
+    billed_products: list[str] | None = None,
+    consented_products: list[str] | None = None,
+) -> None:
+    billed_products = billed_products if billed_products is not None else ["transactions"]
+
+    class _Client:
+        def item_public_token_exchange(self, request):
+            return _DictResponse({"access_token": access_token, "item_id": item_id})
+
+        def item_get(self, request):
+            item_payload = {"item_id": item_id}
+            if institution_id is not None:
+                item_payload["institution_id"] = institution_id
+            if billed_products is not None:
+                item_payload["billed_products"] = billed_products
+            if consented_products is not None:
+                item_payload["consented_products"] = consented_products
+            return _DictResponse({"item": item_payload})
+
+        def institutions_get_by_id(self, request):
+            return _DictResponse({"institution": {"name": institution_name}})
+
+    monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
+    monkeypatch.setattr("finance_cli.plaid_client.wait_for_public_token", lambda *args, **kwargs: "public-token-1")
+
+
+def _install_secret_store(monkeypatch):
+    secret_payloads: dict[str, dict[str, str]] = {}
+
+    def _fake_store_plaid_token(**kwargs):
+        item_id = str(kwargs["item_id"])
+        secret_name = f"secret/{item_id}"
+        secret_payloads[secret_name] = {
+            "access_token": str(kwargs["access_token"]),
+            "item_id": item_id,
+        }
+        return secret_name
+
+    monkeypatch.setattr("finance_cli.plaid_client.store_plaid_token", _fake_store_plaid_token)
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.get_secret_payload",
+        lambda secret_name, region_name=None, **kwargs: secret_payloads[str(secret_name)],
+    )
+    return secret_payloads
+
+
+def _insert_plaid_item_row(
+    conn,
+    *,
+    plaid_item_id: str,
+    institution_name: str = "Link Bank",
+    institution_id: str | None = "ins_123",
+    access_token_ref: str = "secret/ref",
+    status: str = "active",
+    consented_products: str = '["transactions"]',
+    sync_cursor: str | None = None,
+    needs_reauth: int = 0,
+):
+    local_id = uuid.uuid4().hex
+    conn.execute(
+        """
+        INSERT INTO plaid_items (
+            id,
+            plaid_item_id,
+            institution_id,
+            institution_name,
+            access_token_ref,
+            status,
+            error_code,
+            consented_products,
+            sync_cursor,
+            needs_reauth
+        ) VALUES (?, ?, ?, ?, ?, ?, NULL, ?, ?, ?)
+        """,
+        (
+            local_id,
+            plaid_item_id,
+            institution_id,
+            institution_name,
+            access_token_ref,
+            status,
+            consented_products,
+            sync_cursor,
+            needs_reauth,
+        ),
+    )
+    conn.commit()
+    return local_id
+
+
+def _insert_account_row(
+    conn,
+    *,
+    account_id: str,
+    plaid_account_id: str,
+    plaid_item_id: str | None,
+    institution_name: str = "Link Bank",
+    account_name: str = "Checking",
+    account_type: str = "checking",
+    is_active: int = 0,
+):
+    conn.execute(
+        """
+        INSERT INTO accounts (
+            id,
+            plaid_account_id,
+            plaid_item_id,
+            institution_name,
+            account_name,
+            account_type,
+            is_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            account_id,
+            plaid_account_id,
+            plaid_item_id,
+            institution_name,
+            account_name,
+            account_type,
+            is_active,
+        ),
+    )
 
 
 def test_collect_sync_pages_restarts_on_mutation_error() -> None:
@@ -208,7 +372,7 @@ def test_create_link_session_update_mode_uses_additional_consented_products(tmp_
     monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
     monkeypatch.setattr(
         "finance_cli.plaid_client._get_access_token_for_item",
-        lambda item, region_name=None: "access-token-1",
+        lambda item, region_name=None, **kwargs: "access-token-1",
     )
 
     with connect(db_path) as conn:
@@ -234,6 +398,44 @@ def test_extract_products_prefers_billed_products_from_item_payload() -> None:
         }
     }
     assert _extract_products_from_item_payload(payload) == ["transactions", "liabilities"]
+
+
+def test_create_hosted_link_session_includes_nonce_in_redirect_uri(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    class _Resp:
+        def __init__(self, payload):
+            self._payload = payload
+
+        def to_dict(self):
+            return self._payload
+
+    captured: dict[str, dict[str, object]] = {}
+
+    class _Client:
+        def link_token_create(self, request):
+            captured["request"] = request.to_dict()
+            return _Resp(
+                {
+                    "link_token": "link-token-1",
+                    "hosted_link_url": "https://plaid.test/link",
+                    "expiration": "2030-01-01T00:00:00Z",
+                }
+            )
+
+    monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
+    monkeypatch.setattr("finance_cli.plaid_client.secrets.token_urlsafe", lambda length: "nonce-abc123")
+
+    with connect(db_path) as conn:
+        session = create_hosted_link_session(conn, user_id="user-1")
+
+    assert session["nonce"] == "nonce-abc123"
+
+    redirect_uri = str(captured["request"]["hosted_link"]["completion_redirect_uri"])
+    parsed_redirect = urlparse(redirect_uri)
+    assert f"{parsed_redirect.scheme}://{parsed_redirect.netloc}{parsed_redirect.path}" == "https://cashnerd.ai/plaid/complete"
+    assert parse_qs(parsed_redirect.query)["n"] == ["nonce-abc123"]
 
 
 def test_apply_sync_updates_add_modify_remove(tmp_path: Path) -> None:
@@ -319,18 +521,26 @@ def test_apply_sync_updates_add_modify_remove(tmp_path: Path) -> None:
         assert item_row["sync_cursor"] == "cursor_3"
 
 
-def test_apply_sync_updates_prefers_keyword_pipeline_over_pfc(tmp_path: Path) -> None:
+def test_apply_sync_updates_prefers_keyword_pipeline_over_pfc(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    (tmp_path / "rules.yaml").write_text(
+        "keyword_rules:\n"
+        "- keywords:\n"
+        "  - OPENAI\n"
+        "  category: Software & Subscriptions\n"
+        "  use_type: Business\n"
+        "  priority: 0\n",
+        encoding="utf-8",
+    )
     initialize_database(db_path)
 
     with connect(db_path) as conn:
         item = _seed_plaid_item(conn)
-        software_category_id = uuid.uuid4().hex
-        conn.execute(
-            "INSERT INTO categories (id, name, is_system) VALUES (?, 'Software & Subscriptions', 1)",
-            (software_category_id,),
-        )
-        conn.commit()
+        software_category_id = _category_id_for_name(conn, "Software & Subscriptions")
 
         added = [
             {
@@ -376,6 +586,75 @@ def test_apply_sync_updates_prefers_keyword_pipeline_over_pfc(tmp_path: Path) ->
         assert txn["category_source"] == "keyword_rule"
         assert txn["category_confidence"] == pytest.approx(0.9)
         assert txn["source_category"] == "FOOD_AND_DRINK_RESTAURANT"
+
+
+def test_apply_upsert_transaction_redacts_description_on_match_failure(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("categorizer boom")
+
+    monkeypatch.setattr("finance_cli.plaid_client.match_transaction", _boom)
+    logger = logging.getLogger("finance_cli.plaid_client")
+    original_level = logger.level
+    original_propagate = logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+
+    try:
+        with connect(db_path) as conn:
+            item = _seed_plaid_item(conn)
+            status = _apply_upsert_transaction(
+                conn,
+                item,
+                {
+                    "transaction_id": "plaid_txn_private_1",
+                    "account_id": "plaid_account_1234567890",
+                    "date": "2025-02-10",
+                    "amount": 12.34,
+                    "name": "PLAID RAW NAME",
+                    "merchant_name": "VERY PRIVATE CAFE",
+                    "payment_channel": "in store",
+                    "pending": False,
+                    "personal_finance_category": {
+                        "primary": "FOOD_AND_DRINK",
+                        "detailed": "FOOD_AND_DRINK_COFFEE",
+                        "confidence_level": "HIGH",
+                        "version": "v2",
+                    },
+                },
+                account_map={
+                    "plaid_account_1234567890": {
+                        "account_id": "plaid_account_1234567890",
+                        "name": "Checking",
+                        "type": "depository",
+                        "subtype": "checking",
+                        "mask": "1234",
+                    }
+                },
+                local_account_ids={},
+                mode="added",
+            )
+    finally:
+        logger.propagate = original_propagate
+        logger.setLevel(original_level)
+        logger.removeHandler(caplog.handler)
+
+    messages = [record.getMessage() for record in caplog.records]
+
+    assert status == "added"
+    assert any(
+        "match_transaction() failed for Test Bank acct plaid_ac: categorizer boom" in message
+        for message in messages
+    )
+    assert all("VERY PRIVATE CAFE" not in message for message in messages)
+    assert all("PLAID RAW NAME" not in message for message in messages)
 
 
 def test_investment_dividend_transfer_in_categorized_as_income(tmp_path: Path) -> None:
@@ -828,6 +1107,74 @@ def test_apply_investment_transaction_dividend(tmp_path: Path) -> None:
         assert row["is_payment"] == 0
 
 
+def test_apply_investment_transaction_redacts_description_on_match_failure(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("categorizer boom")
+
+    monkeypatch.setattr("finance_cli.plaid_client.match_transaction", _boom)
+    logger = logging.getLogger("finance_cli.plaid_client")
+    original_level = logger.level
+    original_propagate = logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+
+    try:
+        with connect(db_path) as conn:
+            item = _seed_plaid_item(conn, consented_products='["transactions", "investments"]')
+            status = _apply_investment_transaction(
+                conn,
+                item,
+                {
+                    "investment_transaction_id": "inv_private_1",
+                    "account_id": "inv_acct_1234567890",
+                    "date": "2025-03-02",
+                    "amount": -5.00,
+                    "type": "cash",
+                    "subtype": "dividend",
+                    "security_id": "sec_private_1",
+                    "name": "TOP SECRET DIVIDEND",
+                },
+                securities_map={
+                    "sec_private_1": {
+                        "security_id": "sec_private_1",
+                        "ticker_symbol": "VOO",
+                        "name": "Vanguard S&P 500 ETF",
+                    }
+                },
+                account_map={
+                    "inv_acct_1234567890": {
+                        "account_id": "inv_acct_1234567890",
+                        "name": "Brokerage",
+                        "type": "investment",
+                        "subtype": "brokerage",
+                    }
+                },
+                local_account_ids={},
+                consumed_crossfeed_ids=set(),
+            )
+    finally:
+        logger.propagate = original_propagate
+        logger.setLevel(original_level)
+        logger.removeHandler(caplog.handler)
+
+    messages = [record.getMessage() for record in caplog.records]
+
+    assert status == "added"
+    assert any(
+        "match_transaction() failed for investment Test Bank acct inv_acct: categorizer boom" in message
+        for message in messages
+    )
+    assert all("TOP SECRET DIVIDEND" not in message for message in messages)
+
+
 def test_apply_investment_transaction_update_preserves_user_category(tmp_path: Path) -> None:
     db_path = tmp_path / "finance.db"
     initialize_database(db_path)
@@ -1265,7 +1612,7 @@ def test_sync_investment_transactions_failure_nonfatal(tmp_path: Path, monkeypat
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
         monkeypatch.setattr(
             "finance_cli.plaid_client._fetch_sync_page",
-            lambda client, access_token, cursor, days_requested: {
+            lambda client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None: {
                 "added": [
                     {
                         "transaction_id": "sync_regular_1",
@@ -1321,18 +1668,22 @@ def test_sync_investment_transactions_failure_nonfatal(tmp_path: Path, monkeypat
         assert txn is not None
 
 
-def test_apply_sync_updates_sets_payment_flag_from_keyword_detection(tmp_path: Path) -> None:
+def test_apply_sync_updates_sets_payment_flag_from_keyword_detection(
+    tmp_path: Path,
+    monkeypatch: pytest.MonkeyPatch,
+) -> None:
     db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    (tmp_path / "rules.yaml").write_text(
+        "payment_keywords:\n"
+        "- CREDIT CARD BILL PAYMENT\n",
+        encoding="utf-8",
+    )
     initialize_database(db_path)
 
     with connect(db_path) as conn:
         item = _seed_plaid_item(conn)
-        payments_category_id = uuid.uuid4().hex
-        conn.execute(
-            "INSERT INTO categories (id, name, is_system) VALUES (?, 'Payments & Transfers', 1)",
-            (payments_category_id,),
-        )
-        conn.commit()
+        payments_category_id = _category_id_for_name(conn, "Payments & Transfers")
 
         added = [
             {
@@ -1616,11 +1967,18 @@ def test_run_sync_uses_pagination_and_updates_db(tmp_path: Path, monkeypatch) ->
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         state = {"n": 0}
 
-        def fake_fetch_page(client, access_token, cursor, days_requested):
+        def fake_fetch_page(
+            client,
+            access_token,
+            cursor,
+            days_requested,
+            db_path_or_conn=None,
+            item_id=None,
+        ):
             state["n"] += 1
             if state["n"] == 1:
                 return {
@@ -1694,9 +2052,16 @@ def test_run_sync_updates_dormant_accounts_from_accounts_payload(tmp_path: Path,
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
-        def fake_fetch_page(client, access_token, cursor, days_requested):
+        def fake_fetch_page(
+            client,
+            access_token,
+            cursor,
+            days_requested,
+            db_path_or_conn=None,
+            item_id=None,
+        ):
             return {
                 "added": [],
                 "modified": [],
@@ -1753,9 +2118,16 @@ def test_run_sync_mutation_retry_exhaustion_marks_item_error(tmp_path: Path, mon
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
-        def always_mutation(client, access_token, cursor, days_requested):
+        def always_mutation(
+            client,
+            access_token,
+            cursor,
+            days_requested,
+            db_path_or_conn=None,
+            item_id=None,
+        ):
             raise _ApiLikeError("TRANSACTIONS_SYNC_MUTATION_DURING_PAGINATION", "mutation loop")
 
         monkeypatch.setattr("finance_cli.plaid_client._fetch_sync_page", always_mutation)
@@ -1797,7 +2169,7 @@ def test_run_sync_without_cooldown_columns_does_not_error(tmp_path: Path, monkey
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_legacy", "has_more": False}
 
@@ -1822,7 +2194,7 @@ def test_sync_cooldown_skips_fresh_item(tmp_path: Path, monkeypatch) -> None:
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1852,7 +2224,7 @@ def test_sync_cooldown_allows_stale_item(tmp_path: Path, monkeypatch) -> None:
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1877,7 +2249,7 @@ def test_sync_cooldown_allows_null_timestamp(tmp_path: Path, monkeypatch) -> Non
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1895,13 +2267,48 @@ def test_sync_cooldown_allows_null_timestamp(tmp_path: Path, monkeypatch) -> Non
         assert calls["n"] == 1
 
 
+def test_run_sync_defaults_new_cursorless_items_to_full_history_window(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    calls: list[tuple[str | None, int | None]] = []
+
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
+        del client, access_token, db_path_or_conn, item_id
+        calls.append((cursor, days_requested))
+        return {
+            "added": [],
+            "modified": [],
+            "removed": [],
+            "accounts": [],
+            "next_cursor": "cursor_full_history",
+            "has_more": False,
+        }
+
+    with connect(db_path) as conn:
+        _seed_plaid_item(conn, plaid_item_id="item_sync_full_history")
+
+        _mock_plaid_ready(monkeypatch)
+        _mock_access_token(monkeypatch)
+        monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
+        monkeypatch.setattr("finance_cli.plaid_client._fetch_sync_page", _fetch_page)
+
+        out = run_sync(conn, item_id="item_sync_full_history")
+        assert out["items_synced"] == 1
+        assert out["items"][0]["days_requested"] == 730
+        assert calls == [(None, 730)]
+
+
 def test_sync_force_refresh_bypasses_cooldown(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "finance.db"
     initialize_database(db_path)
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1920,6 +2327,53 @@ def test_sync_force_refresh_bypasses_cooldown(tmp_path: Path, monkeypatch) -> No
         assert calls["n"] == 1
 
 
+def test_sync_backfill_ignores_stored_cursor_and_bypasses_cooldown(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    calls: list[tuple[str | None, int | None]] = []
+
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
+        del client, access_token, db_path_or_conn, item_id
+        calls.append((cursor, days_requested))
+        return {
+            "added": [],
+            "modified": [],
+            "removed": [],
+            "accounts": [],
+            "next_cursor": "cursor_after_backfill",
+            "has_more": False,
+        }
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_sync_backfill",
+            sync_cursor="cursor_existing",
+        )
+        _set_item_timestamp(conn, "item_sync_backfill", "last_sync_at", "-60 seconds")
+
+        _mock_plaid_ready(monkeypatch)
+        _mock_access_token(monkeypatch)
+        monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
+        monkeypatch.setattr("finance_cli.plaid_client._fetch_sync_page", _fetch_page)
+
+        out = run_sync(conn, item_id="item_sync_backfill", backfill=True)
+        assert out["items_synced"] == 1
+        assert out["items_skipped"] == 0
+        assert out["items"][0]["backfill"] is True
+        assert out["items"][0]["days_requested"] == 730
+        assert calls == [(None, 730)]
+
+        row = conn.execute(
+            "SELECT sync_cursor FROM plaid_items WHERE plaid_item_id = 'item_sync_backfill'"
+        ).fetchone()
+        assert row["sync_cursor"] == "cursor_after_backfill"
+
+
 def test_cooldown_env_var_override(tmp_path: Path, monkeypatch) -> None:
     db_path = tmp_path / "finance.db"
     initialize_database(db_path)
@@ -1927,7 +2381,7 @@ def test_cooldown_env_var_override(tmp_path: Path, monkeypatch) -> None:
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1953,7 +2407,7 @@ def test_cooldown_env_var_invalid_fallback(tmp_path: Path, monkeypatch) -> None:
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -1978,7 +2432,7 @@ def test_error_status_item_bypasses_cooldown(tmp_path: Path, monkeypatch) -> Non
 
     calls = {"n": 0}
 
-    def _fetch_page(client, access_token, cursor, days_requested):
+    def _fetch_page(client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None):
         calls["n"] += 1
         return {"added": [], "modified": [], "removed": [], "accounts": [], "next_cursor": "cursor_1", "has_more": False}
 
@@ -2023,7 +2477,7 @@ def test_sync_total_elapsed_is_sum(tmp_path: Path, monkeypatch) -> None:
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: object())
         monkeypatch.setattr(
             "finance_cli.plaid_client._fetch_sync_page",
-            lambda client, access_token, cursor, days_requested: {
+            lambda client, access_token, cursor, days_requested, db_path_or_conn=None, item_id=None: {
                 "added": [],
                 "modified": [],
                 "removed": [],
@@ -2080,7 +2534,7 @@ def test_refresh_balances_updates_accounts_and_snapshots(tmp_path: Path, monkeyp
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = refresh_balances(conn, item_id="item_refresh")
         assert out["items_refreshed"] == 1
@@ -2339,7 +2793,7 @@ def test_fetch_liabilities_upserts_and_deactivates_missing_rows(tmp_path: Path, 
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = fetch_liabilities(conn, item_id="item_liab")
         assert out["items_synced"] == 1
@@ -2412,7 +2866,7 @@ def test_fetch_liabilities_idempotent_upsert(tmp_path: Path, monkeypatch) -> Non
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         first = fetch_liabilities(conn, item_id="item_idem")
         second = fetch_liabilities(conn, item_id="item_idem", force_refresh=True)
@@ -2495,7 +2949,7 @@ def test_fetch_liabilities_null_apr_does_not_wipe_existing_apr(tmp_path: Path, m
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = fetch_liabilities(conn, item_id="item_null_apr", force_refresh=True)
         assert out["items_synced"] == 1
@@ -2561,7 +3015,7 @@ def test_fetch_liabilities_deactivates_when_account_and_liability_disappear(tmp_
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = fetch_liabilities(conn, item_id="item_disappear")
         assert out["items_synced"] == 1
@@ -2623,7 +3077,7 @@ def test_fetch_liabilities_deactivation_skips_pdf_created_rows(tmp_path: Path, m
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = fetch_liabilities(conn, item_id="item_pdf_guard", force_refresh=True)
         assert out["items_synced"] == 1
@@ -2687,7 +3141,7 @@ def test_fetch_liabilities_serializes_date_and_datetime_in_raw_payload(tmp_path:
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         out = fetch_liabilities(conn, item_id="item_dates")
         assert out["items_synced"] == 1
@@ -2901,8 +3355,8 @@ def test_complete_link_session_stores_products_from_item_payload(tmp_path: Path,
         assert json.loads(row["consented_products"]) == ["transactions", "liabilities"]
         assert row["institution_name"] == "Link Bank"
         assert row["access_token_ref"] == "secret/link-bank"
+        assert len(captured["secret_names"]) == 1
         assert captured["secret_names"][0] == "plaid_token_user-1_item_item-link-1"
-        assert captured["secret_names"][1] == "plaid/access_token/user-1/item/item-link-1"
 
 
 def test_complete_link_session_fallback_logs_warning(tmp_path: Path, monkeypatch) -> None:
@@ -3117,22 +3571,503 @@ def test_complete_link_session_does_not_block_duplicates_for_unknown_institution
         assert inserted["institution_name"] == "Unknown Institution"
 
 
-def test_secret_name_candidates_include_both_formats() -> None:
+def test_complete_link_session_cleans_up_superseded_disconnected_item(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_new",
+        access_token="access-token-new",
+        institution_id="ins_123",
+        institution_name="Link Bank",
+        billed_products=["transactions", "liabilities"],
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: None)
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_old",
+            institution_name="Link Bank",
+            institution_id="ins_123",
+            access_token_ref="secret/item_link_old",
+            status="disconnected",
+        )
+        _insert_account_row(
+            conn,
+            account_id="acct_old",
+            plaid_account_id="plaid_acct_old",
+            plaid_item_id="item_link_old",
+            is_active=0,
+        )
+
+        out = complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions", "liabilities"],
+        )
+
+        rows = conn.execute(
+            """
+            SELECT plaid_item_id, status, sync_cursor, consented_products
+              FROM plaid_items
+             WHERE institution_name = 'Link Bank'
+            """
+        ).fetchall()
+        account_row = conn.execute(
+            "SELECT plaid_item_id, is_active FROM accounts WHERE id = 'acct_old'"
+        ).fetchone()
+        new_item_row = conn.execute(
+            "SELECT * FROM plaid_items WHERE plaid_item_id = 'item_link_new'"
+        ).fetchone()
+        old_item_row = conn.execute(
+            "SELECT 1 FROM plaid_items WHERE plaid_item_id = 'item_link_old'"
+        ).fetchone()
+        webhook_lookup = conn.execute(
+            "SELECT plaid_item_id FROM plaid_items WHERE plaid_item_id = 'item_link_new'"
+        ).fetchone()
+
+    assert out["plaid_item_id"] == "item_link_new"
+    assert len(rows) == 1
+    assert rows[0]["plaid_item_id"] == "item_link_new"
+    assert rows[0]["status"] == "active"
+    assert rows[0]["sync_cursor"] is None
+    assert json.loads(rows[0]["consented_products"]) == ["transactions", "liabilities"]
+    assert old_item_row is None
+    assert account_row["plaid_item_id"] is None
+    assert account_row["is_active"] == 0
+    assert webhook_lookup["plaid_item_id"] == "item_link_new"
+    assert _get_access_token_for_item(new_item_row) == "access-token-new"
+
+
+def test_complete_link_session_cleans_up_multiple_disconnected_rows_for_same_institution(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_new",
+        institution_id="ins_123",
+        institution_name="Link Bank",
+        billed_products=["transactions", "liabilities"],
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: None)
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_old_1",
+            institution_name="Link Bank",
+            institution_id="ins_123",
+            access_token_ref="secret/item_link_old_1",
+            status="disconnected",
+        )
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_old_2",
+            institution_name="Link Bank",
+            institution_id="ins_123",
+            access_token_ref="secret/item_link_old_2",
+            status="disconnected",
+        )
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions", "liabilities"],
+        )
+
+        rows = conn.execute(
+            """
+            SELECT plaid_item_id, status
+              FROM plaid_items
+             WHERE institution_name = 'Link Bank'
+             ORDER BY plaid_item_id
+            """
+        ).fetchall()
+
+    assert [row["plaid_item_id"] for row in rows] == ["item_link_new"]
+    assert rows[0]["status"] == "active"
+
+
+def test_complete_link_session_still_blocks_active_duplicate_institution_after_cleanup_changes(
+    tmp_path: Path, monkeypatch
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    removed: list[str] = []
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_new",
+        access_token="access-token-new",
+        institution_id="ins_123",
+        institution_name="Link Bank",
+    )
+    monkeypatch.setattr("finance_cli.plaid_client.store_plaid_token", lambda **kwargs: "secret/item_link_new")
+    monkeypatch.setattr("finance_cli.plaid_client._remove_remote_item", lambda access_token: removed.append(access_token))
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_existing",
+            institution_name="Link Bank",
+            institution_id="ins_123",
+            access_token_ref="secret/item_link_existing",
+            status="active",
+        )
+
+        with pytest.raises(PlaidSyncError) as exc:
+            complete_link_session(
+                conn,
+                user_id="user-1",
+                link_token="link-token-1",
+                requested_products=["transactions"],
+            )
+
+        inserted = conn.execute(
+            "SELECT 1 FROM plaid_items WHERE plaid_item_id = 'item_link_new'"
+        ).fetchone()
+
+    assert "Duplicate institution link blocked" in str(exc.value)
+    assert "item_link_existing" in str(exc.value)
+    assert removed == ["access-token-new"]
+    assert inserted is None
+
+
+def test_complete_link_session_updates_same_item_in_place_for_error_relinks(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_same",
+        access_token="access-token-new",
+        institution_id="ins_123",
+        institution_name="Link Bank",
+        billed_products=["transactions", "liabilities"],
+    )
+    _install_secret_store(monkeypatch)
+
+    with connect(db_path) as conn:
+        local_id = _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_same",
+            institution_name="Link Bank",
+            institution_id="ins_123",
+            access_token_ref="secret/item_link_same_old",
+            status="error",
+            consented_products='["transactions"]',
+            sync_cursor="cursor-old",
+            needs_reauth=1,
+        )
+
+        out = complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions"],
+        )
+
+        row = conn.execute(
+            """
+            SELECT id, status, needs_reauth, sync_cursor, consented_products, access_token_ref
+              FROM plaid_items
+             WHERE plaid_item_id = 'item_link_same'
+            """
+        ).fetchone()
+        count = conn.execute(
+            "SELECT COUNT(*) AS n FROM plaid_items WHERE plaid_item_id = 'item_link_same'"
+        ).fetchone()["n"]
+
+    assert out["id"] == local_id
+    assert row["id"] == local_id
+    assert row["status"] == "active"
+    assert row["needs_reauth"] == 0
+    assert row["sync_cursor"] == "cursor-old"
+    assert json.loads(row["consented_products"]) == ["transactions", "liabilities"]
+    assert row["access_token_ref"] == "secret/item_link_same"
+    assert count == 1
+
+
+def test_complete_link_session_skips_cleanup_when_institution_identity_is_unknown(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_unknown_new",
+        access_token="access-token-new",
+        institution_id=None,
+        billed_products=["transactions"],
+    )
+    _install_secret_store(monkeypatch)
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_unknown_old",
+            institution_name="Unknown Institution",
+            institution_id=None,
+            access_token_ref="secret/item_link_unknown_old",
+            status="disconnected",
+        )
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions"],
+        )
+
+        rows = conn.execute(
+            """
+            SELECT plaid_item_id, status
+              FROM plaid_items
+             WHERE institution_name = 'Unknown Institution'
+             ORDER BY plaid_item_id
+            """
+        ).fetchall()
+
+    assert [row["plaid_item_id"] for row in rows] == ["item_link_unknown_new", "item_link_unknown_old"]
+    assert [row["status"] for row in rows] == ["active", "disconnected"]
+
+
+def test_complete_link_session_preserves_detached_accounts_and_history_on_cleanup(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_preserve_new",
+        institution_id="ins_preserve",
+        institution_name="Preserve Bank",
+        billed_products=["transactions", "liabilities"],
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: None)
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_preserve_old",
+            institution_name="Preserve Bank",
+            institution_id="ins_preserve",
+            access_token_ref="secret/item_link_preserve_old",
+            status="disconnected",
+        )
+        _insert_account_row(
+            conn,
+            account_id="acct_history",
+            plaid_account_id="plaid_acct_history",
+            plaid_item_id="item_link_preserve_old",
+            institution_name="Preserve Bank",
+            is_active=0,
+        )
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                id, account_id, date, description, amount_cents, source, is_active
+            ) VALUES ('txn_history', 'acct_history', '2026-04-01', 'Coffee', -420, 'plaid', 0)
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO account_aliases (hash_account_id, canonical_id)
+            VALUES ('acct_history', 'acct_history')
+            """
+        )
+        conn.execute(
+            """
+            INSERT INTO balance_snapshots (
+                id, account_id, balance_current_cents, source, snapshot_date
+            ) VALUES (?, 'acct_history', 12345, 'sync', '2026-04-01')
+            """,
+            (uuid.uuid4().hex,),
+        )
+        conn.execute(
+            """
+            INSERT INTO liabilities (
+                id, account_id, liability_type, is_active
+            ) VALUES (?, 'acct_history', 'credit', 1)
+            """,
+            (uuid.uuid4().hex,),
+        )
+        conn.commit()
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions", "liabilities"],
+        )
+
+        old_item_row = conn.execute(
+            "SELECT 1 FROM plaid_items WHERE plaid_item_id = 'item_link_preserve_old'"
+        ).fetchone()
+        account_row = conn.execute(
+            "SELECT plaid_item_id FROM accounts WHERE id = 'acct_history'"
+        ).fetchone()
+        txn_row = conn.execute(
+            "SELECT account_id FROM transactions WHERE id = 'txn_history'"
+        ).fetchone()
+        alias_row = conn.execute(
+            """
+            SELECT hash_account_id, canonical_id
+              FROM account_aliases
+             WHERE hash_account_id = 'acct_history'
+            """
+        ).fetchone()
+        snapshot_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM balance_snapshots WHERE account_id = 'acct_history'"
+        ).fetchone()["n"]
+        liability_count = conn.execute(
+            "SELECT COUNT(*) AS n FROM liabilities WHERE account_id = 'acct_history'"
+        ).fetchone()["n"]
+
+    assert old_item_row is None
+    assert account_row["plaid_item_id"] is None
+    assert txn_row["account_id"] == "acct_history"
+    assert alias_row["hash_account_id"] == "acct_history"
+    assert alias_row["canonical_id"] == "acct_history"
+    assert snapshot_count == 1
+    assert liability_count == 1
+
+
+def test_complete_link_session_skips_secret_delete_when_disconnected_ref_is_shared(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    deleted: list[str] = []
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_shared_new",
+        institution_id="ins_target",
+        institution_name="Target Bank",
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: deleted.append(name))
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_shared_old",
+            institution_name="Target Bank",
+            institution_id="ins_target",
+            access_token_ref="secret/shared",
+            status="disconnected",
+        )
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_other_active",
+            institution_name="Other Bank",
+            institution_id="ins_other",
+            access_token_ref="secret/shared",
+            status="active",
+        )
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions"],
+        )
+
+    assert deleted == []
+
+
+def test_complete_link_session_deletes_non_shared_disconnected_secret_ref(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    deleted: list[str] = []
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_solo_new",
+        institution_id="ins_solo",
+        institution_name="Solo Bank",
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: deleted.append(name))
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_solo_old",
+            institution_name="Solo Bank",
+            institution_id="ins_solo",
+            access_token_ref="secret/solo",
+            status="disconnected",
+        )
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions"],
+        )
+
+    assert deleted == ["secret/solo"]
+
+
+def test_fast_relink_skips_queued_secret(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    deleted: list[str] = []
+    _install_complete_link_session_mocks(
+        monkeypatch,
+        item_id="item_link_new_queue",
+        institution_id="ins_queue",
+        institution_name="Queue Bank",
+    )
+    _install_secret_store(monkeypatch)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: deleted.append(name))
+
+    with connect(db_path) as conn:
+        _insert_plaid_item_row(
+            conn,
+            plaid_item_id="item_link_old_queue",
+            institution_name="Queue Bank",
+            institution_id="ins_queue",
+            access_token_ref=None,
+            status="disconnected",
+        )
+
+        complete_link_session(
+            conn,
+            user_id="user-1",
+            link_token="link-token-1",
+            requested_products=["transactions"],
+        )
+
+        old_item_row = conn.execute(
+            "SELECT 1 FROM plaid_items WHERE plaid_item_id = 'item_link_old_queue'"
+        ).fetchone()
+
+    assert old_item_row is None
+    assert deleted == []
+
+
+def test_secret_name_candidates_returns_flat_format() -> None:
     names = secret_name_candidates("user@example.com", "Chase Credit")
-    assert names[0].startswith("plaid_token_user@example.com_")
-    assert names[1] == "plaid/access_token/user@example.com/chase-credit"
+    assert names == ["plaid_token_user@example.com_chase-credit"]
 
 
-def test_secret_name_candidates_for_item_include_item_scoped_formats() -> None:
+def test_secret_name_candidates_for_item_returns_flat_format() -> None:
     names = secret_name_candidates_for_item("user@example.com", "item_abc123")
-    assert names[0] == "plaid_token_user@example.com_item_item-abc123"
-    assert names[1] == "plaid/access_token/user@example.com/item/item-abc123"
+    assert names == ["plaid_token_user@example.com_item_item-abc123"]
 
 
 def test_get_access_token_for_item_rejects_secret_item_mismatch(monkeypatch) -> None:
     monkeypatch.setattr(
         "finance_cli.plaid_client.get_secret_payload",
-        lambda secret_name, region_name=None: {
+        lambda secret_name, region_name=None, **kwargs: {
             "access_token": "access-token",
             "item_id": "item_other",
         },
@@ -3159,6 +4094,228 @@ def test_delete_secret_raises_on_invalid_request(monkeypatch) -> None:
 
     with pytest.raises(Exception):
         delete_secret("secret-name")
+
+
+def test_register_revocation_failure_handler_sets_module_global() -> None:
+    clear_revocation_failure_handler()
+
+    calls: list[dict[str, object]] = []
+
+    def _handler(payload: dict[str, object]) -> None:
+        calls.append(payload)
+
+    register_revocation_failure_handler(_handler)
+
+    try:
+        assert _get_revocation_failure_handler() is _handler
+    finally:
+        clear_revocation_failure_handler()
+
+
+def test_clear_revocation_failure_handler_resets_module_global() -> None:
+    register_revocation_failure_handler(lambda payload: None)
+
+    clear_revocation_failure_handler()
+
+    assert _get_revocation_failure_handler() is None
+
+
+def test_unlink_item_failed_revoke_with_handler(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    cleaned: list[str] = []
+    payloads: list[dict[str, object]] = []
+    clear_revocation_failure_handler()
+    register_revocation_failure_handler(lambda payload: payloads.append(payload))
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: cleaned.append(name))
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client._get_access_token_for_item",
+        lambda item, region_name=None, **kwargs: "access-token-failing",
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.revoke_item_access_structured",
+        lambda access_token: (False, {"error_code": "INTERNAL_SERVER_ERROR", "message": "boom"}),
+    )
+
+    try:
+        with connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO plaid_items (id, plaid_item_id, institution_name, access_token_ref, status)
+                VALUES (?, 'item_unlink_failed', 'Test Bank', 'secret/queued', 'active')
+                """,
+                (uuid.uuid4().hex,),
+            )
+            conn.commit()
+
+            ok = unlink_item(conn, "item_unlink_failed")
+            assert ok is True
+
+            row = conn.execute(
+                """
+                SELECT access_token_ref, status
+                  FROM plaid_items
+                 WHERE plaid_item_id = 'item_unlink_failed'
+                """
+            ).fetchone()
+
+        assert payloads == [
+            {
+                "plaid_item_id": "item_unlink_failed",
+                "secret_refs": ["secret/queued"],
+                "user_id": None,
+                "error": "boom",
+                "error_code": "INTERNAL_SERVER_ERROR",
+                "source": "unlink",
+            }
+        ]
+        assert row["access_token_ref"] is None
+        assert row["status"] == "disconnected"
+        assert cleaned == []
+    finally:
+        clear_revocation_failure_handler()
+
+
+def test_unlink_item_item_not_found_first_attempt(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    cleaned: list[str] = []
+    clear_revocation_failure_handler()
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: cleaned.append(name))
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client._get_access_token_for_item",
+        lambda item, region_name=None, **kwargs: "access-token-item-not-found",
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.revoke_item_access_structured",
+        lambda access_token: (False, {"error_code": "ITEM_NOT_FOUND", "message": "gone"}),
+    )
+
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO plaid_items (id, plaid_item_id, institution_name, access_token_ref, status)
+            VALUES (?, 'item_unlink_missing', 'Test Bank', 'secret/missing', 'active')
+            """,
+            (uuid.uuid4().hex,),
+        )
+        conn.commit()
+
+        ok = unlink_item(conn, "item_unlink_missing")
+        assert ok is True
+
+        row = conn.execute(
+            """
+            SELECT status
+              FROM plaid_items
+             WHERE plaid_item_id = 'item_unlink_missing'
+            """
+        ).fetchone()
+
+    assert row["status"] == "disconnected"
+    assert cleaned == ["secret/missing"]
+
+
+def test_unlink_item_no_handler_logs_and_falls_back(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    cleaned: list[str] = []
+    warnings: list[tuple[object, ...]] = []
+    clear_revocation_failure_handler()
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: cleaned.append(name))
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client._get_access_token_for_item",
+        lambda item, region_name=None, **kwargs: "access-token-no-handler",
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.revoke_item_access_structured",
+        lambda access_token: (False, {"error_code": "INTERNAL_SERVER_ERROR", "message": "boom"}),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.logger.warning",
+        lambda *args, **kwargs: warnings.append(args),
+    )
+
+    with connect(db_path) as conn:
+        conn.execute(
+            """
+            INSERT INTO plaid_items (id, plaid_item_id, institution_name, access_token_ref, status)
+            VALUES (?, 'item_unlink_no_handler', 'Test Bank', 'secret/no-handler', 'active')
+            """,
+            (uuid.uuid4().hex,),
+        )
+        conn.commit()
+
+        ok = unlink_item(conn, "item_unlink_no_handler")
+        assert ok is True
+
+    assert cleaned == ["secret/no-handler"]
+    assert warnings[0][0].startswith("plaid_item_remove_failed")
+
+
+def test_unlink_item_handler_raises_falls_back(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    cleaned: list[str] = []
+    errors: list[tuple[object, ...]] = []
+    clear_revocation_failure_handler()
+
+    def _raising_handler(payload: dict[str, object]) -> None:
+        raise RuntimeError("queue write failed")
+
+    register_revocation_failure_handler(_raising_handler)
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: cleaned.append(name))
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client._get_access_token_for_item",
+        lambda item, region_name=None, **kwargs: "access-token-handler-error",
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.revoke_item_access_structured",
+        lambda access_token: (False, {"error_code": "INTERNAL_SERVER_ERROR", "message": "boom"}),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.logger.error",
+        lambda *args, **kwargs: errors.append(args),
+    )
+
+    try:
+        with connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO plaid_items (id, plaid_item_id, institution_name, access_token_ref, status)
+                VALUES (?, 'item_unlink_handler_error', 'Test Bank', 'secret/handler-error', 'active')
+                """,
+                (uuid.uuid4().hex,),
+            )
+            conn.commit()
+
+            ok = unlink_item(conn, "item_unlink_handler_error")
+            assert ok is True
+
+        assert cleaned == ["secret/handler-error"]
+        assert errors[0][0].startswith("plaid_revocation_queue_write_failed")
+    finally:
+        clear_revocation_failure_handler()
 
 
 def test_unlink_item_invokes_secret_cleanup(tmp_path: Path, monkeypatch) -> None:
@@ -3237,7 +4394,7 @@ def test_unlink_item_skips_secret_cleanup_when_token_ref_shared_by_active_item(t
     )
     monkeypatch.setattr(
         "finance_cli.plaid_client._get_access_token_for_item",
-        lambda item, region_name=None: "access-token-shared",
+        lambda item, region_name=None, **kwargs: "access-token-shared",
     )
     monkeypatch.setattr("finance_cli.plaid_client._remove_remote_item", lambda access_token: remote_removed.append(access_token))
 
@@ -3287,7 +4444,7 @@ def test_unlink_item_calls_remote_remove_when_token_ref_not_shared(tmp_path: Pat
     )
     monkeypatch.setattr(
         "finance_cli.plaid_client._get_access_token_for_item",
-        lambda item, region_name=None: "access-token-single",
+        lambda item, region_name=None, **kwargs: "access-token-single",
     )
     monkeypatch.setattr("finance_cli.plaid_client._remove_remote_item", lambda access_token: remote_removed.append(access_token))
 
@@ -3311,3 +4468,54 @@ def test_unlink_item_calls_remote_remove_when_token_ref_not_shared(tmp_path: Pat
 
     assert remote_removed == ["access-token-single"]
     assert cleaned == ["secret/single"]
+
+
+def test_handle_unlink_mcp_path_invokes_handler(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    cleaned: list[str] = []
+    payloads: list[dict[str, object]] = []
+    clear_revocation_failure_handler()
+    register_revocation_failure_handler(lambda payload: payloads.append(payload))
+    monkeypatch.setattr("finance_cli.plaid_client.delete_secret", lambda name, region_name=None: cleaned.append(name))
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client._get_access_token_for_item",
+        lambda item, region_name=None, **kwargs: "access-token-cli-unlink",
+    )
+    monkeypatch.setattr(
+        "finance_cli.plaid_client.revoke_item_access_structured",
+        lambda access_token: (False, {"error_code": "INTERNAL_SERVER_ERROR", "message": "boom"}),
+    )
+
+    try:
+        with connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO plaid_items (id, plaid_item_id, institution_name, access_token_ref, status)
+                VALUES (?, 'item_cli_unlink', 'Test Bank', 'secret/cli-unlink', 'active')
+                """,
+                (uuid.uuid4().hex,),
+            )
+            conn.commit()
+
+            result = plaid_cmd.handle_unlink(SimpleNamespace(item="item_cli_unlink"), conn)
+
+        assert result["data"]["status"] == "disconnected"
+        assert payloads == [
+            {
+                "plaid_item_id": "item_cli_unlink",
+                "secret_refs": ["secret/cli-unlink"],
+                "user_id": None,
+                "error": "boom",
+                "error_code": "INTERNAL_SERVER_ERROR",
+                "source": "unlink",
+            }
+        ]
+        assert cleaned == []
+    finally:
+        clear_revocation_failure_handler()

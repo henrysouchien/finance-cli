@@ -355,6 +355,14 @@ def test_pl_unclassified_count(db_path: Path) -> None:
             category_name="Unclassified Category",
             use_type=None,
         )
+        _seed_business_txn(
+            conn,
+            account_id=account_id,
+            amount_cents=-1_000,
+            date_str="2026-01-05",
+            category_name="Unclassified Category",
+            use_type=None,
+        )
         conn.commit()
         result = biz_cmd.handle_pl(_pl_args(month="2026-02"), conn)
 
@@ -394,12 +402,21 @@ def test_cashflow_basic(db_path: Path) -> None:
         _seed_business_txn(conn, account_id=account_id, amount_cents=50_000, date_str="2026-02-01", category_name="Cashflow Category")
         _seed_business_txn(conn, account_id=account_id, amount_cents=-12_000, date_str="2026-02-02", category_name="Cashflow Category")
         _seed_business_txn(conn, account_id=account_id, amount_cents=5_000, date_str="2026-01-15", category_name="Cashflow Category")
+        _seed_business_txn(
+            conn,
+            account_id=account_id,
+            amount_cents=-1_000,
+            date_str="2026-01-16",
+            category_name="Cashflow Category",
+            use_type=None,
+        )
         conn.commit()
         result = biz_cmd.handle_cashflow(_cashflow_args(month="2026-02"), conn)
 
     assert result["data"]["business_income_cents"] == 50_000
     assert result["data"]["business_expense_cents"] == -12_000
     assert result["data"]["net_operating_cash_flow_cents"] == 38_000
+    assert result["data"]["unclassified_count"] == 0
 
 
 def test_cashflow_business_balances(db_path: Path) -> None:
@@ -529,6 +546,26 @@ def test_tax_empty(db_path: Path) -> None:
     assert result["data"]["line_items"] == []
 
 
+def test_tax_unclassified_count_ignores_other_years(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        account_id = _seed_business_account(conn)
+        _seed_category(conn, "Other Year Unclassified")
+        _seed_business_txn(
+            conn,
+            account_id=account_id,
+            amount_cents=-1_000,
+            date_str="2026-01-05",
+            category_name="Other Year Unclassified",
+            use_type=None,
+        )
+        conn.commit()
+        result = biz_cmd.handle_tax(_tax_args(year="2025"), conn)
+
+    assert result["data"]["unclassified_count"] == 0
+    assert result["summary"]["unclassified_count"] == 0
+    assert "WARNING: Unclassified transactions (NULL use_type): 0" in result["cli_report"]
+
+
 def test_tax_cli_report(db_path: Path) -> None:
     with connect(db_path) as conn:
         account_id = _seed_business_account(conn)
@@ -551,6 +588,14 @@ def test_estimated_tax_basic(db_path: Path) -> None:
         _seed_schedule_c_map(conn, "Est Expense", "Advertising", "8", 1.0, tax_year=2025)
         _seed_business_txn(conn, account_id=account_id, amount_cents=100_000, date_str="2025-01-15", category_name="Est Income")
         _seed_business_txn(conn, account_id=account_id, amount_cents=-20_000, date_str="2025-02-15", category_name="Est Expense")
+        _seed_business_txn(
+            conn,
+            account_id=account_id,
+            amount_cents=-1_000,
+            date_str="2025-07-01",
+            category_name="Est Expense",
+            use_type=None,
+        )
         conn.commit()
         result = biz_cmd.handle_estimated_tax(_est_args(est_quarter="2025-Q2", rate=0.30), conn)
 
@@ -558,6 +603,7 @@ def test_estimated_tax_basic(db_path: Path) -> None:
     assert result["data"]["annualized_profit_cents"] == 160_000
     assert result["data"]["estimated_annual_tax_cents"] == 48_000
     assert result["data"]["estimated_quarterly_payment_cents"] == 12_000
+    assert result["data"]["unclassified_count"] == 0
 
 
 def test_estimated_tax_custom_rate(db_path: Path) -> None:
@@ -1137,6 +1183,14 @@ class TestGoldenOutputs:
                 date_str="2026-03-10",
                 category_name="Forecast Revenue",
             )
+            _seed_business_txn(
+                conn,
+                account_id=account_id,
+                amount_cents=-1_000,
+                date_str="2026-01-10",
+                category_name="Forecast Revenue",
+                use_type=None,
+            )
             conn.commit()
             result = biz_cmd.handle_forecast(Namespace(months=2, streams=False, format="json"), conn)
 
@@ -1150,6 +1204,7 @@ class TestGoldenOutputs:
             "",
         ]
         assert lines[-1] == "WARNING: Unclassified transactions (NULL use_type): 0"
+        assert result["data"]["unclassified_count"] == 0
         assert "Trend: ↑ $200.00/mo" in result["cli_report"]
         assert "Projected next month: $1,400.00" in result["cli_report"]
 
@@ -1173,6 +1228,14 @@ class TestGoldenOutputs:
                 date_str="2026-03-10",
                 category_name="Runway Expense",
             )
+            _seed_business_txn(
+                conn,
+                account_id=account_id,
+                amount_cents=-1_000,
+                date_str="2026-01-10",
+                category_name="Runway Expense",
+                use_type=None,
+            )
             conn.commit()
             result = biz_cmd.handle_runway(Namespace(months=2, format="json"), conn)
 
@@ -1184,6 +1247,7 @@ class TestGoldenOutputs:
         assert "Runway: 3.00 months (through 2026-06-13)" in report
         assert "Expense Breakdown" in report
         assert "Other" in report and "$400.00" in report
+        assert result["data"]["unclassified_count"] == 0
 
     def test_seasonal_golden_empty(self, db_path: Path) -> None:
         with connect(db_path) as conn:

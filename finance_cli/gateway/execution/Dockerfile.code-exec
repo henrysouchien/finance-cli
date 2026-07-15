@@ -1,0 +1,23 @@
+FROM python:3.12-slim
+
+ENV PYTHONDONTWRITEBYTECODE=1 \
+    PYTHONUNBUFFERED=1 \
+    PYTHONPATH=/app
+
+RUN pip install --no-cache-dir \
+    matplotlib \
+    numpy \
+    pandas \
+    scipy \
+    numpy-financial
+
+# Bake advisory math library into the sandbox image. Pure compute, no
+# DB/network/secrets. Tests stay out via .dockerignore.
+COPY finance_cli/__init__.py /app/finance_cli/__init__.py
+COPY finance_cli/advisory /app/finance_cli/advisory
+
+RUN groupadd -g 1000 codeexec && \
+    useradd -u 1000 -g codeexec -m -s /bin/false codeexec
+
+USER codeexec
+WORKDIR /workspace

@@ -7,6 +7,7 @@ import sqlite3
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 
 from .user_rules import (
     UserRules,
@@ -454,8 +455,9 @@ def match_transaction(
     plaid_category: str | None = None,
     source_category: str | None = None,
     is_payment: bool = False,
+    rules_path: Path | None = None,
 ) -> MatchResult | None:
-    rules = load_rules()
+    rules = load_rules(path=rules_path) if rules_path is not None else load_rules()
 
     # Priority 1: Payment keywords from rules.yaml (user-configured, highest priority)
     if match_payment_keyword(description, rules):
@@ -598,6 +600,7 @@ def apply_match(
     txn_id: str,
     result: MatchResult,
     dry_run: bool = False,
+    rules_path: Path | None = None,
 ) -> bool:
     row = conn.execute(
         "SELECT id, use_type FROM transactions WHERE id = ?",
@@ -609,7 +612,7 @@ def apply_match(
     if dry_run:
         return True
 
-    rules = load_rules()
+    rules = load_rules(path=rules_path) if rules_path is not None else load_rules()
 
     resolved_use_type = None
     if row["use_type"] is None and result.resolved_use_type in {"Business", "Personal"}:

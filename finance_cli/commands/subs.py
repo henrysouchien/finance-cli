@@ -5,8 +5,13 @@ from __future__ import annotations
 import sqlite3
 import uuid
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from typing import Any
 
+from finance_cli.exceptions import NotFoundError, ValidationError
+
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..debt_calculator import (
     MAX_SIM_MONTHS,
     compute_dashboard,
@@ -21,9 +26,10 @@ from ..subscriptions import (
     detect_recurring_patterns,
     detect_subscriptions,
     subscription_burn,
+    subscription_spend_history,
 )
 from ..spending_analysis import (
-    _DEFAULT_ESSENTIAL_CATEGORIES,
+    _DEFAULT_ESSENTIAL_CATEGORIES as _DEFAULT_ESSENTIAL_CATEGORIES,
     is_essential as _is_essential,
     load_essential_categories as _load_essential_categories,
 )
@@ -53,6 +59,17 @@ def register(subparsers, format_parent) -> None:
     p_add.add_argument("--use-type", choices=["Business", "Personal"])
     p_add.set_defaults(func=handle_add, command_name="subs.add")
 
+    p_update = subs_sub.add_parser("update", parents=[format_parent], help="Update subscription")
+    p_update.add_argument("id")
+    p_update.add_argument("--vendor")
+    p_update.add_argument("--amount")
+    p_update.add_argument("--frequency", choices=["weekly", "biweekly", "monthly", "quarterly", "yearly"])
+    p_update.add_argument("--category")
+    p_update.add_argument("--clear-category", action="store_true")
+    p_update.add_argument("--use-type", choices=["Business", "Personal"])
+    p_update.add_argument("--clear-use-type", action="store_true")
+    p_update.set_defaults(func=handle_update, command_name="subs.update")
+
     p_cancel = subs_sub.add_parser("cancel", parents=[format_parent], help="Cancel subscription")
     p_cancel.add_argument("id")
     p_cancel.set_defaults(func=handle_cancel, command_name="subs.cancel")
@@ -71,6 +88,50 @@ _MONTHLY_MULTIPLIERS = {
     "quarterly": 1 / 3,
     "yearly": 1 / 12,
 }
+
+
+def _resolve_subscription_id(conn: sqlite3.Connection, subscription_id: str) -> str:
+    subscription_id = subscription_id.strip()
+    if not subscription_id:
+        raise ValidationError("Subscription id is required")
+    row = conn.execute(
+        "SELECT id FROM subscriptions WHERE id = ?",
+        (subscription_id,),
+    ).fetchone()
+    if row is not None:
+        return str(row["id"])
+
+    matches = conn.execute(
+        """
+        SELECT id
+          FROM subscriptions
+         WHERE substr(id, 1, ?) = ?
+         ORDER BY id
+         LIMIT 2
+        """,
+        (len(subscription_id), subscription_id),
+    ).fetchall()
+    if not matches:
+        raise NotFoundError(f"Subscription {subscription_id} not found")
+    if len(matches) > 1:
+        raise ValidationError(f"Subscription id prefix {subscription_id} is ambiguous; use the full id")
+    return str(matches[0]["id"])
+
+
+def _fetch_subscription(conn: sqlite3.Connection, subscription_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT s.*, c.name AS category_name
+          FROM subscriptions s
+          LEFT JOIN categories c ON c.id = s.category_id
+         WHERE s.id = ?
+        """,
+        (subscription_id,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"Subscription {subscription_id} not found")
+    return row
+
 
 def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
     rows = conn.execute(
@@ -108,12 +169,13 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
         header = f"{len(active_subs)} active subscription{'s' if len(active_subs) != 1 else ''} \u2014 {fmt_dollars(total_monthly_burn)}/mo"
         cli_lines = [header, ""]
         for s in display_subs:
+            short_id = str(s.get("id") or "")[:8].ljust(8)
             vendor = (s.get("vendor_name") or "")[:30].ljust(30)
             freq = (s.get("frequency") or "")[:10].ljust(10)
             amt = fmt_dollars(abs(s["amount"]))
             monthly = fmt_dollars(s["monthly_amount"])
             sub_type_tag = " [metered]" if s.get("sub_type") == "metered" else ""
-            cli_lines.append(f"  {vendor} {freq} {amt:>10s}  {monthly:>10s}/mo{sub_type_tag}")
+            cli_lines.append(f"  {short_id} {vendor} {freq} {amt:>10s}  {monthly:>10s}/mo{sub_type_tag}")
         if not args.show_all and inactive_subs:
             cli_lines.append("")
             cli_lines.append(f"({len(inactive_subs)} inactive hidden \u2014 use --all to show)")
@@ -129,11 +191,22 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_detect(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    report = detect_subscriptions(conn)
+    dry_run = bool(getattr(args, "dry_run", False))
+    report = detect_subscriptions(conn, dry_run=dry_run)
+    if not dry_run:
+        log_event(
+            _connected_main_db_path(conn),
+            "feature.subscription_detected",
+            properties={"count": int(report.get("detected", 0))},
+        )
+    data = dict(report)
+    if dry_run:
+        data["dry_run"] = True
     return {
-        "data": report,
+        "data": data,
         "summary": {"total_detected": report["detected"]},
         "cli_report": (
+            f"{'[DRY RUN] ' if dry_run else ''}"
             f"detected={report['detected']} inserted={report['inserted']} updated={report['updated']} "
             f"deactivated={report['deactivated']} recurring={report['recurring_patterns']} "
             f"recurring_txns={report['recurring_txns']}"
@@ -194,48 +267,213 @@ def handle_recurring(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    idempotency_key = getattr(args, "idempotency_key", None)
     category_id = get_category_id_by_name(conn, args.category, required=True)
     sub_id = uuid.uuid4().hex
 
-    conn.execute(
-        """
-        INSERT INTO subscriptions (
-            id,
-            vendor_name,
-            category_id,
-            amount_cents,
-            frequency,
-            next_expected,
-            is_active,
-            use_type,
-            is_auto_detected
-        ) VALUES (?, ?, ?, ?, ?, NULL, 1, ?, 0)
-        """,
-        (sub_id, args.vendor, category_id, dollars_to_cents(args.amount), args.frequency, args.use_type),
-    )
-    conn.commit()
-
-    return {
-        "data": {"subscription_id": sub_id},
+    try:
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                id,
+                vendor_name,
+                category_id,
+                amount_cents,
+                frequency,
+                next_expected,
+                is_active,
+                use_type,
+                is_auto_detected,
+                idempotency_key
+            ) VALUES (?, ?, ?, ?, ?, NULL, 1, ?, 0, ?)
+            """,
+            (
+                sub_id,
+                args.vendor,
+                category_id,
+                dollars_to_cents(args.amount),
+                args.frequency,
+                args.use_type,
+                idempotency_key,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        if idempotency_key and "idempotency_key" in str(exc):
+            conn.rollback()
+            existing = conn.execute(
+                "SELECT id FROM subscriptions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                raise
+            return {
+                "data": {
+                    "subscription_id": existing["id"],
+                    "already_existed": True,
+                    **({"dry_run": True} if dry_run else {}),
+                },
+                "summary": {"total_subscriptions": 1},
+                "cli_report": f"Subscription {existing['id']} already exists (idempotent retry)",
+            }
+        raise
+    result = {
+        "data": {"subscription_id": sub_id, **({"dry_run": True} if dry_run else {})},
         "summary": {"total_subscriptions": 1},
-        "cli_report": f"Added subscription {args.vendor}",
+        "cli_report": (
+            f"[DRY RUN] Would add subscription {args.vendor}"
+            if dry_run
+            else f"Added subscription {args.vendor}"
+        ),
+    }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
+
+
+def handle_update(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    subscription_id = _resolve_subscription_id(conn, str(args.id))
+    existing = _fetch_subscription(conn, subscription_id)
+
+    if getattr(args, "category", None) and bool(getattr(args, "clear_category", False)):
+        raise ValidationError("subs update accepts --category or --clear-category, not both")
+    if getattr(args, "use_type", None) and bool(getattr(args, "clear_use_type", False)):
+        raise ValidationError("subs update accepts --use-type or --clear-use-type, not both")
+
+    updates: list[tuple[str, Any]] = []
+    changes: dict[str, dict[str, Any]] = {}
+    field_requested = False
+
+    def add_change(column: str, old_value: Any, new_value: Any, *, public_name: str | None = None) -> None:
+        if old_value == new_value:
+            return
+        updates.append((column, new_value))
+        changes[public_name or column] = {"old": old_value, "new": new_value}
+
+    vendor = getattr(args, "vendor", None)
+    if vendor is not None:
+        field_requested = True
+        vendor = str(vendor).strip()
+        if not vendor:
+            raise ValidationError("subs update --vendor cannot be empty")
+        add_change("vendor_name", existing["vendor_name"], vendor, public_name="vendor")
+
+    amount = getattr(args, "amount", None)
+    if amount is not None:
+        field_requested = True
+        amount_cents = dollars_to_cents(amount)
+        if amount_cents <= 0:
+            raise ValidationError("Subscription amount must be greater than zero")
+        existing_amount_cents = int(existing["amount_cents"])
+        if existing_amount_cents != amount_cents:
+            updates.append(("amount_cents", amount_cents))
+            changes["amount"] = {
+                "old": cents_to_dollars(existing_amount_cents),
+                "new": cents_to_dollars(amount_cents),
+            }
+
+    frequency = getattr(args, "frequency", None)
+    if frequency is not None:
+        field_requested = True
+        add_change("frequency", existing["frequency"], frequency)
+
+    if bool(getattr(args, "clear_category", False)):
+        field_requested = True
+        if existing["category_id"] is not None:
+            updates.append(("category_id", None))
+            changes["category"] = {"old": existing["category_name"], "new": None}
+    elif getattr(args, "category", None) is not None:
+        field_requested = True
+        category_name = str(args.category).strip()
+        if not category_name:
+            raise ValidationError("subs update --category cannot be empty")
+        category_id = get_category_id_by_name(conn, category_name)
+        if not category_id:
+            raise NotFoundError(f"Category '{category_name}' not found")
+        if existing["category_id"] != category_id:
+            updates.append(("category_id", category_id))
+            changes["category"] = {"old": existing["category_name"], "new": category_name}
+
+    if bool(getattr(args, "clear_use_type", False)):
+        field_requested = True
+        add_change("use_type", existing["use_type"], None)
+    elif getattr(args, "use_type", None) is not None:
+        field_requested = True
+        add_change("use_type", existing["use_type"], args.use_type)
+
+    if not field_requested:
+        raise ValidationError(
+            "subs update requires at least one field: --vendor, --amount, --frequency, "
+            "--category, --clear-category, --use-type, or --clear-use-type"
+        )
+
+    if not updates:
+        return {
+            "data": {
+                "subscription_id": subscription_id,
+                "changes": {},
+                "no_changes": True,
+                **({"dry_run": True} if dry_run else {}),
+            },
+            "summary": {"total_subscriptions": 1, "fields_changed": 0},
+            "cli_report": f"No changes needed for subscription {subscription_id}",
+        }
+
+    if not dry_run:
+        set_clause = ", ".join(f"{column} = ?" for column, _value in updates)
+        conn.execute(
+            f"UPDATE subscriptions SET {set_clause} WHERE id = ?",
+            [value for _column, value in updates] + [subscription_id],
+        )
+        conn.commit()
+
+    changed_fields = ", ".join(changes.keys())
+    return {
+        "data": {
+            "subscription_id": subscription_id,
+            "changes": changes,
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {"total_subscriptions": 1, "fields_changed": len(changes)},
+        "cli_report": (
+            f"[DRY RUN] Would update subscription {subscription_id}: {changed_fields}"
+            if dry_run
+            else f"Updated subscription {subscription_id}: {changed_fields}"
+        ),
     }
 
 
 def handle_cancel(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    subscription_id = _resolve_subscription_id(conn, str(args.id))
     cursor = conn.execute(
         "UPDATE subscriptions SET is_active = 0 WHERE id = ?",
-        (args.id,),
+        (subscription_id,),
     )
-    conn.commit()
     if cursor.rowcount == 0:
-        raise ValueError(f"Subscription {args.id} not found")
+        raise NotFoundError(f"Subscription {subscription_id} not found")
 
-    return {
-        "data": {"subscription_id": args.id, "is_active": False},
+    result = {
+        "data": {
+            "subscription_id": subscription_id,
+            "is_active": False,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_subscriptions": 1},
-        "cli_report": f"Canceled subscription {args.id}",
+        "cli_report": (
+            f"[DRY RUN] Would cancel subscription {subscription_id}"
+            if dry_run
+            else f"Canceled subscription {subscription_id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_total(args, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -256,8 +494,115 @@ def handle_total(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_audit(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    essential_categories = _load_essential_categories()
+def handle_history(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    """Monthly subscription burn history for sparklines."""
+    months_count = max(1, getattr(args, "months", 6))
+    essential_categories = _load_essential_categories(rules_path=rules_path)
+    history = subscription_spend_history(
+        conn,
+        months=months_count,
+        essential_categories=essential_categories,
+    )
+    month_keys = list(history["months"])
+
+    if not month_keys:
+        return {
+            "data": {
+                "months": month_keys,
+                "totals_cents": {},
+                "essential_cents": {},
+                "discretionary_cents": {},
+            },
+            "summary": {"months": 0},
+            "cli_report": "No months.",
+        }
+
+    transaction_count = int(history.get("transaction_count", 0))
+    if transaction_count > 0:
+        return {
+            "data": {
+                "months": month_keys,
+                "totals_cents": history["totals_cents"],
+                "essential_cents": history["essential_cents"],
+                "discretionary_cents": history["discretionary_cents"],
+            },
+            "summary": {
+                "months": len(month_keys),
+                "source": "transactions",
+                "transaction_count": transaction_count,
+            },
+            "cli_report": (
+                f"Subscription burn history: {transaction_count} matched charge"
+                f"{'' if transaction_count == 1 else 's'} across {len(month_keys)} months"
+            ),
+        }
+
+    rows = conn.execute(
+        """
+        SELECT s.amount_cents,
+               s.frequency,
+               c.name AS category_name
+          FROM subscriptions s
+          LEFT JOIN categories c ON c.id = s.category_id
+         WHERE s.is_active = 1
+        """
+    ).fetchall()
+
+    if not rows:
+        zero_months = {month: 0 for month in month_keys}
+        return {
+            "data": {
+                "months": month_keys,
+                "totals_cents": zero_months,
+                "essential_cents": zero_months.copy(),
+                "discretionary_cents": zero_months.copy(),
+            },
+            "summary": {"months": len(month_keys)},
+            "cli_report": "No active subscriptions.",
+        }
+
+    total_cents = 0
+    essential_cents = 0
+    discretionary_cents = 0
+
+    for row in rows:
+        monthly_cents = _monthly_equivalent(
+            abs(int(row["amount_cents"] or 0)),
+            str(row["frequency"] or "monthly"),
+        )
+        total_cents += monthly_cents
+        category_name = str(row["category_name"] or "")
+        if _is_essential(category_name, essential_categories):
+            essential_cents += monthly_cents
+        else:
+            discretionary_cents += monthly_cents
+
+    totals = {month: total_cents for month in month_keys}
+    essentials = {month: essential_cents for month in month_keys}
+    discretionaries = {month: discretionary_cents for month in month_keys}
+
+    return {
+        "data": {
+            "months": month_keys,
+            "totals_cents": totals,
+            "essential_cents": essentials,
+            "discretionary_cents": discretionaries,
+        },
+        "summary": {"months": len(month_keys)},
+        "cli_report": f"Subscription burn: {total_cents} cents/mo projected across {len(month_keys)} months",
+    }
+
+
+def handle_audit(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    essential_categories = _load_essential_categories(rules_path=rules_path)
 
     rows = conn.execute(
         """
@@ -456,6 +801,15 @@ def handle_audit(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     avg_apr = baseline.get("weighted_avg_apr")
     avg_apr_text = f"{float(avg_apr):.2f}%" if avg_apr is not None else "N/A"
+    unknown_apr_caveat = ""
+    unknown_apr_count = int(baseline.get("apr_unknown_count") or 0)
+    unknown_apr_balance_cents = int(baseline.get("apr_unknown_balance_cents") or 0)
+    if unknown_apr_count > 0:
+        unknown_apr_caveat = (
+            f"{unknown_apr_count} debt card(s) totaling "
+            f"{fmt_dollars(cents_to_dollars(unknown_apr_balance_cents))} have unknown APR; "
+            "interest and payoff estimates are lower-bound because those balances use 0% APR."
+        )
     if baseline["fully_paid_off"]:
         min_only_text = f"~{baseline['months_to_payoff']} months"
     else:
@@ -487,6 +841,8 @@ def handle_audit(args, conn: sqlite3.Connection) -> dict[str, Any]:
             f"{fmt_dollars(cents_to_dollars(int(baseline['total_interest_cents'])))} interest"
         ),
     ]
+    if unknown_apr_caveat:
+        cli_lines.append(f"  Note: {unknown_apr_caveat}")
     if not baseline_fully_paid_off:
         cli_lines.append(
             f"  Note: Balance never reaches zero within {MAX_SIM_MONTHS}-month cap; savings estimates are approximate."
@@ -535,16 +891,20 @@ def handle_audit(args, conn: sqlite3.Connection) -> dict[str, Any]:
         )
         cli_lines.append("")
 
+    data = {
+        "subscriptions": subscriptions,
+        "essential_count": len(essential_subs),
+        "essential_monthly_cents": essential_monthly_cents,
+        "discretionary_count": len(discretionary_subs),
+        "discretionary_monthly_cents": discretionary_monthly_cents,
+        "scenarios": scenarios,
+        "baseline": baseline,
+    }
+    if unknown_apr_caveat:
+        data["caveat"] = unknown_apr_caveat
+
     return {
-        "data": {
-            "subscriptions": subscriptions,
-            "essential_count": len(essential_subs),
-            "essential_monthly_cents": essential_monthly_cents,
-            "discretionary_count": len(discretionary_subs),
-            "discretionary_monthly_cents": discretionary_monthly_cents,
-            "scenarios": scenarios,
-            "baseline": baseline,
-        },
+        "data": data,
         "summary": {
             "total_subscriptions": len(subscriptions),
             "essential_count": len(essential_subs),

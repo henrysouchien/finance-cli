@@ -615,9 +615,9 @@ def _contractor_summary_payload(
     }
 
 
-def _has_home_split_rule_conflict() -> bool:
+def _has_home_split_rule_conflict(rules_path: Path | None = None) -> bool:
     try:
-        split_rules = load_rules().split_rules
+        split_rules = load_rules(path=rules_path).split_rules if rules_path is not None else load_rules().split_rules
     except Exception:
         return False
     target_categories = {"rent", "utilities"}
@@ -629,10 +629,14 @@ def _has_home_split_rule_conflict() -> bool:
     return False
 
 
-def _compute_home_office(config: dict[str, str], line_31_before_home_office: int) -> dict[str, Any]:
+def _compute_home_office(
+    config: dict[str, str],
+    line_31_before_home_office: int,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     method = str(config.get("home_office_method", "") or "").strip().lower()
     if method == "simplified":
-        if _has_home_split_rule_conflict():
+        if _has_home_split_rule_conflict(rules_path=rules_path):
             raise ValueError(
                 "Simplified home office cannot be combined with Rent/Utilities split rules; disable split rules first."
             )
@@ -936,6 +940,19 @@ def _quarter_bounds(year: int, quarter: int) -> tuple[date, date]:
     return start, end
 
 
+def _month_shift(month_start: date, delta_months: int) -> date:
+    month_index = (month_start.year * 12) + (month_start.month - 1) + int(delta_months)
+    year, month_zero = divmod(month_index, 12)
+    return date(year, month_zero + 1, 1)
+
+
+def _trailing_month_bounds(months: int) -> tuple[date, date]:
+    current_month = date.today().replace(day=1)
+    start = _month_shift(current_month, -(int(months) - 1))
+    end = _month_shift(current_month, 1) - timedelta(days=1)
+    return start, end
+
+
 def _period_mode(args, default_mode: str) -> str:
     if getattr(args, "month", None):
         return "month"
@@ -1038,14 +1055,28 @@ def _line_number_key(line_number: str) -> tuple[int, str]:
     return (int(match.group(1)), match.group(2).lower())
 
 
-def _unclassified_count(conn: sqlite3.Connection) -> int:
+def _unclassified_count(
+    conn: sqlite3.Connection,
+    *,
+    start: date | None = None,
+    end: date | None = None,
+) -> int:
+    clauses = ["is_active = 1", "use_type IS NULL"]
+    params: list[Any] = []
+    if start is not None:
+        clauses.append("date >= ?")
+        params.append(start.isoformat())
+    if end is not None:
+        clauses.append("date <= ?")
+        params.append(end.isoformat())
+
     row = conn.execute(
-        """
+        f"""
         SELECT COUNT(*) AS cnt
           FROM transactions
-         WHERE is_active = 1
-           AND use_type IS NULL
-        """
+         WHERE {" AND ".join(clauses)}
+        """,
+        tuple(params),
     ).fetchone()
     return int(row["cnt"] or 0)
 
@@ -1240,7 +1271,7 @@ def handle_pl(args, conn: sqlite3.Connection) -> dict[str, Any]:
     mapped_rows = _pl_rows(conn, start, end)
     unmapped_rows = _pl_unmapped_rows(conn, start, end)
     data = _build_pl_data(mapped_rows, unmapped_rows)
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(conn, start=start, end=end)
 
     compare_payload: dict[str, Any] | None = None
     if bool(getattr(args, "compare", False)):
@@ -1351,6 +1382,7 @@ def _schedule_c_snapshot(
     end: date,
     tax_year: int,
     config: dict[str, str] | None = None,
+    rules_path: Path | None = None,
 ) -> dict[str, Any]:
     line_1_row = conn.execute(
         """
@@ -1480,7 +1512,11 @@ def _schedule_c_snapshot(
     line_28_total_expenses_cents = sum(int(item["deductible_cents"]) for item in line_items)
     line_7_gross_income_cents = line_1_cents - line_4_cogs_cents
     line_31_before_home_office_cents = line_7_gross_income_cents - line_28_total_expenses_cents
-    home_office = _compute_home_office(config or {}, line_31_before_home_office_cents)
+    home_office = _compute_home_office(
+        config or {},
+        line_31_before_home_office_cents,
+        rules_path=rules_path,
+    )
     line_30_home_office_cents = int(home_office["deduction_cents"])
     line_31_net_profit_cents = line_31_before_home_office_cents - line_30_home_office_cents
     unmapped_rows = _schedule_c_unmapped_rows(conn, start=start, end=end, tax_year=tax_year)
@@ -1842,7 +1878,11 @@ def _build_tax_detail_lines(
     return lines
 
 
-def handle_tax(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_tax(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     explicit_year = _year_for_period_args(args)
     latest_tax_year = _latest_tax_year(conn)
     default_tax_year = latest_tax_year or date.today().year
@@ -1862,7 +1902,14 @@ def handle_tax(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if salary_override_cents is not None:
         summary_config["analysis_salary_override_cents"] = str(salary_override_cents)
 
-    snapshot = _schedule_c_snapshot(conn, start=start, end=end, tax_year=selected_tax_year, config=config)
+    snapshot = _schedule_c_snapshot(
+        conn,
+        start=start,
+        end=end,
+        tax_year=selected_tax_year,
+        config=config,
+        rules_path=rules_path,
+    )
     quarterly_breakdown: list[dict[str, Any]] = []
     for quarter in (1, 2, 3, 4):
         q_start, q_end = _quarter_bounds(start.year, quarter)
@@ -1876,6 +1923,7 @@ def handle_tax(args, conn: sqlite3.Connection) -> dict[str, Any]:
             end=range_end,
             tax_year=selected_tax_year,
             config=config,
+            rules_path=rules_path,
         )
         quarterly_breakdown.append(
             {
@@ -1892,7 +1940,7 @@ def handle_tax(args, conn: sqlite3.Connection) -> dict[str, Any]:
     detail = str(getattr(args, "detail", "") or "").strip().lower() or None
     transaction_groups = _schedule_c_transaction_groups(conn, start=start, end=end, tax_year=selected_tax_year)
     tax_summary = _compute_full_tax_summary(conn, snapshot, summary_config, selected_tax_year)
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(conn, start=start, end=end)
 
     detail_payloads = {
         "form-8829": snapshot.get("home_office", {}),
@@ -2046,7 +2094,11 @@ def handle_tax_setup(args, conn: sqlite3.Connection) -> dict[str, Any]:
     conn.commit()
 
     config = _get_tax_config(conn, tax_year)
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(
+        conn,
+        start=date(tax_year, 1, 1),
+        end=date(tax_year, 12, 31),
+    )
     lines = [f"TAX SETUP - {tax_year}"]
     if updates:
         lines.append("")
@@ -2110,7 +2162,11 @@ def _build_tax_package_markdown(
     return "\n".join(lines)
 
 
-def handle_tax_package(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_tax_package(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     year = str(getattr(args, "year", "")).strip()
     if not _YEAR_RE.match(year):
         raise ValueError("year must be in YYYY format")
@@ -2125,11 +2181,25 @@ def handle_tax_package(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if salary_override_cents is not None:
         summary_config["analysis_salary_override_cents"] = str(salary_override_cents)
 
-    snapshot = _schedule_c_snapshot(conn, start=start, end=end, tax_year=tax_year, config=config)
+    snapshot = _schedule_c_snapshot(
+        conn,
+        start=start,
+        end=end,
+        tax_year=tax_year,
+        config=config,
+        rules_path=rules_path,
+    )
     quarterly_breakdown: list[dict[str, Any]] = []
     for quarter in (1, 2, 3, 4):
         q_start, q_end = _quarter_bounds(tax_year, quarter)
-        quarter_snapshot = _schedule_c_snapshot(conn, start=q_start, end=q_end, tax_year=tax_year, config=config)
+        quarter_snapshot = _schedule_c_snapshot(
+            conn,
+            start=q_start,
+            end=q_end,
+            tax_year=tax_year,
+            config=config,
+            rules_path=rules_path,
+        )
         quarterly_breakdown.append(
             {
                 "quarter": quarter,
@@ -2144,7 +2214,7 @@ def handle_tax_package(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     transaction_groups = _schedule_c_transaction_groups(conn, start=start, end=end, tax_year=tax_year)
     tax_summary = _compute_full_tax_summary(conn, snapshot, summary_config, tax_year)
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(conn, start=start, end=end)
     mileage_summary = _mileage_summary_payload(conn, tax_year=tax_year)
     contractor_summary = _contractor_summary_payload(conn, tax_year=tax_year, include_inactive=True)
     markdown_report = _build_tax_package_markdown(
@@ -2257,7 +2327,7 @@ def handle_estimated_tax(args, conn: sqlite3.Connection) -> dict[str, Any]:
         estimated_annual_tax_cents = _round_half_up(annualized_profit_cents * effective_rate)
 
     estimated_quarterly_payment_cents = _round_half_up(estimated_annual_tax_cents / 4)
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(conn, start=ytd_start, end=ytd_end)
 
     cli_lines = [
         f"ESTIMATED TAX - {label}",
@@ -2796,16 +2866,21 @@ def _fmt_projection(cents: int | None) -> str:
     return fmt_dollars(cents_to_dollars(int(cents)))
 
 
-def handle_forecast(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_forecast(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     months = int(getattr(args, "months", 6))
     if months < 1:
         raise ValueError("months must be >= 1")
 
     show_streams = bool(getattr(args, "streams", False))
-    trend_data = revenue_trend(conn, months=months)
+    trend_data = revenue_trend(conn, months=months, rules_path=rules_path)
     totals = list(trend_data.get("totals", []))
     stream_rows = list(trend_data.get("streams", []))
-    unclassified_count = _unclassified_count(conn)
+    trend_start, trend_end = _trailing_month_bounds(months)
+    unclassified_count = _unclassified_count(conn, start=trend_start, end=trend_end)
 
     lines = [f"REVENUE FORECAST - Last {months} month(s)", "", "Monthly Totals"]
     if totals:
@@ -2888,7 +2963,8 @@ def handle_runway(args, conn: sqlite3.Connection) -> dict[str, Any]:
         raise ValueError("months must be >= 1")
 
     runway_data = forecasting_runway(conn, months=months)
-    unclassified_count = _unclassified_count(conn)
+    runway_start, runway_end = _trailing_month_bounds(months)
+    unclassified_count = _unclassified_count(conn, start=runway_start, end=runway_end)
     monthly_income_cents = int(runway_data.get("monthly_avg_income_cents", 0))
     monthly_expense_cents = int(runway_data.get("monthly_avg_expense_cents", 0))
     monthly_net_burn_cents = int(runway_data.get("monthly_net_burn_cents", 0))
@@ -3046,7 +3122,7 @@ def handle_cashflow(args, conn: sqlite3.Connection) -> dict[str, Any]:
         }
         for row in business_account_rows
     ]
-    unclassified_count = _unclassified_count(conn)
+    unclassified_count = _unclassified_count(conn, start=start, end=end)
 
     lines = [f"CASH FLOW - {label}", "", "Operating Activities"]
     lines.append(f"  {'Business income received':<34} {fmt_dollars(cents_to_dollars(income_cents)):>14}")
@@ -3092,6 +3168,7 @@ def handle_cashflow(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_biz_budget_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     section = str(getattr(args, "section", "") or "").strip().lower()
     if section not in _BIZ_BUDGET_SECTION_SET:
         allowed = ", ".join(_BIZ_BUDGET_SECTIONS)
@@ -3126,10 +3203,9 @@ def handle_biz_budget_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
         """,
         (budget_id, section, amount_cents, period, effective_from),
     )
-    conn.commit()
 
     section_label = _SECTION_LABELS.get(section, section)
-    return {
+    result = {
         "data": {
             "id": budget_id,
             "pl_section": section,
@@ -3137,6 +3213,7 @@ def handle_biz_budget_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "amount_cents": int(amount_cents),
             "period": period,
             "effective_from": effective_from,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {
             "pl_section": section,
@@ -3144,10 +3221,22 @@ def handle_biz_budget_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "period": period,
         },
         "cli_report": (
-            f"Set {section_label} budget to {fmt_dollars(cents_to_dollars(int(amount_cents)))} "
-            f"per {period} effective {effective_from}"
+            (
+                f"[DRY RUN] Would set {section_label} budget to "
+                f"{fmt_dollars(cents_to_dollars(int(amount_cents)))} per {period} effective {effective_from}"
+            )
+            if dry_run
+            else (
+                f"Set {section_label} budget to {fmt_dollars(cents_to_dollars(int(amount_cents)))} "
+                f"per {period} effective {effective_from}"
+            )
         ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_biz_budget_status(args, conn: sqlite3.Connection) -> dict[str, Any]:

@@ -16,7 +16,9 @@ from datetime import date
 from pathlib import Path
 from typing import Any, Callable
 
-from .commands import biz_cmd
+from .commands import biz_cmd, debt_cmd, goal_cmd, summary_cmd
+from .commands import budget as budget_cmd
+from .commands import subs as subs_cmd
 from .models import cents_to_dollars
 
 _REQUIRED_SCOPES = (
@@ -31,6 +33,32 @@ _RETRYABLE_STATUS_CODES = {429, 500, 502, 503}
 _MAX_RETRIES = 3
 _RETRY_BASE_SECONDS = 1.0
 _CELL_BUDGET = 5_000_000
+
+# ── Formatting constants ──────────────────────────────────────────────
+
+_TAB_COLORS: dict[str, str] = {
+    "Dashboard": "#4085F5",          # blue
+    "Transactions": "#999999",       # gray
+    "Business Financials": "#9957B5", # purple
+    "Monthly Spending": "#F29933",   # orange
+    "Net Worth": "#33A854",          # green
+    "Budget Status": "#FAD62E",      # yellow
+    "Debt Tracker": "#DE4745",       # red
+    "Subscriptions": "#6BBFE8",      # light blue
+    "Goals": "#009688",              # teal
+}
+
+_CURRENCY_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "$#,##0.00"}}
+_PCT_DISPLAY_FMT = {"numberFormat": {"type": "NUMBER", "pattern": '#,##0.0"%"'}}
+_INTEGER_FMT = {"numberFormat": {"type": "NUMBER", "pattern": "#,##0"}}
+
+_HEADER_BG = {"red": 0.2, "green": 0.2, "blue": 0.2}
+_HEADER_FG = {"red": 1.0, "green": 1.0, "blue": 1.0}
+_SECTION_BG = {"red": 0.9, "green": 0.9, "blue": 0.9}
+
+_GREEN = {"red": 0.13, "green": 0.55, "blue": 0.13}
+_YELLOW_TEXT = {"red": 0.72, "green": 0.53, "blue": 0.04}
+_RED = {"red": 0.8, "green": 0.13, "blue": 0.13}
 
 
 @dataclass
@@ -516,6 +544,66 @@ def _resolve_windows(conn, *, date_from: str | None, date_to: str | None, year: 
     )
 
 
+def _build_dashboard_tab(conn, *, warnings: list[str]) -> _TabPayload:
+    try:
+        data = summary_cmd.handle_summary(_summary_namespace(), conn).get("data", {})
+    except Exception as exc:
+        _emit_warning(warnings, f"Dashboard skipped - failed to load summary data: {exc}")
+        return _TabPayload(
+            title="Dashboard",
+            header=None,
+            rows=[["Dashboard skipped - summary unavailable", ""]],
+            skipped=True,
+        )
+
+    def _money(key: str) -> float:
+        return cents_to_dollars(int(data.get(key) or 0))
+
+    def _ratio_percent(key: str) -> float | str:
+        value = data.get(key)
+        return round(float(value) * 100, 1) if value is not None else ""
+
+    def _multiple(key: str) -> float | str:
+        value = data.get(key)
+        return round(float(value), 2) if value is not None else ""
+
+    def _months(key: str) -> float | str:
+        value = data.get(key)
+        return round(float(value), 1) if value is not None else ""
+
+    rows = [
+        ["BALANCE SHEET", ""],
+        ["Net Worth", _money("net_worth_cents")],
+        ["Assets", _money("assets_cents")],
+        ["Total Debt", _money("total_debt_cents")],
+        ["Liquid Cash", _money("liquid_cash_cents")],
+        ["Investments", _money("investments_cents")],
+        ["", ""],
+        ["CASH FLOW (30-DAY)", ""],
+        ["Income", _money("income_30d_cents")],
+        ["Expenses", _money("expense_30d_cents")],
+        ["Savings Rate (%)", _ratio_percent("savings_rate")],
+        ["", ""],
+        ["RISK METRICS", ""],
+        ["Debt-to-Income (x)", _multiple("debt_to_income")],
+        ["Emergency Fund (months)", _months("emergency_fund_months")],
+        ["", ""],
+        ["FIXED OBLIGATIONS", ""],
+        ["Total Fixed", _money("fixed_obligations_cents")],
+        ["Recurring Flows", _money("recurring_flows_cents")],
+        ["Debt Minimums", _money("debt_minimums_cents")],
+        ["Subscriptions", _money("subscriptions_cents")],
+        ["", ""],
+        ["DATA HEALTH", ""],
+        ["Unreviewed", int(data.get("unreviewed") or 0)],
+        ["Uncategorized", int(data.get("uncategorized") or 0)],
+        ["Latest Transaction", str(data.get("latest_transaction_date") or "")],
+        ["Last Balance Refresh", str(data.get("latest_balance_refresh") or "")],
+    ]
+
+    return _TabPayload(title="Dashboard", header=None, rows=rows)
+
+
 def _build_transactions_tab(conn, *, date_from: str | None, date_to: str | None) -> _TabPayload:
     where = ["t.is_active = 1"]
     params: list[str] = []
@@ -580,6 +668,26 @@ def _build_transactions_tab(conn, *, date_from: str | None, date_to: str | None)
         header=["Date", "Description", "Amount", "Category", "Account", "Use Type", "Source", "Reviewed"],
         rows=data_rows,
     )
+
+
+def _summary_namespace() -> argparse.Namespace:
+    return argparse.Namespace(view="all", format="json")
+
+
+def _budget_status_namespace() -> argparse.Namespace:
+    return argparse.Namespace(month=None, view="all", format="json")
+
+
+def _debt_dashboard_namespace() -> argparse.Namespace:
+    return argparse.Namespace(include_zero_balance=False, sort="balance", format="json")
+
+
+def _subs_list_namespace() -> argparse.Namespace:
+    return argparse.Namespace(show_all=False, format="json")
+
+
+def _goal_status_namespace() -> argparse.Namespace:
+    return argparse.Namespace(format="json")
 
 
 def _business_namespace(year: str) -> argparse.Namespace:
@@ -797,6 +905,198 @@ def _build_net_worth_tab(conn) -> _TabPayload:
     )
 
 
+def _build_budget_status_tab(conn, *, warnings: list[str]) -> _TabPayload:
+    del warnings
+
+    status_rows = budget_cmd.handle_status(_budget_status_namespace(), conn).get("data", {}).get("status", [])
+    if not status_rows:
+        return _TabPayload(
+            title="Budget Status",
+            header=None,
+            rows=[["Budget Status skipped - no active monthly budgets"]],
+            skipped=True,
+        )
+
+    total_budget_cents = 0
+    total_spent_cents = 0
+    total_remaining_cents = 0
+    rows: list[list[Any]] = []
+
+    for item in status_rows:
+        budget_cents = int(item.get("budget_cents") or 0)
+        actual_cents = abs(int(item.get("actual_cents") or 0))
+        remaining_cents = int(item.get("remaining_cents") or 0)
+        utilization = item.get("utilization")
+
+        total_budget_cents += budget_cents
+        total_spent_cents += actual_cents
+        total_remaining_cents += remaining_cents
+
+        rows.append(
+            [
+                str(item.get("group_name") or ""),
+                str(item.get("category_name") or ""),
+                str(item.get("use_type") or ""),
+                cents_to_dollars(budget_cents),
+                cents_to_dollars(actual_cents),
+                cents_to_dollars(remaining_cents),
+                (float(utilization) * 100) if utilization is not None else "",
+            ]
+        )
+
+    rows.append(
+        [
+            "TOTAL",
+            "",
+            "",
+            cents_to_dollars(total_budget_cents),
+            cents_to_dollars(total_spent_cents),
+            cents_to_dollars(total_remaining_cents),
+            "",
+        ]
+    )
+
+    return _TabPayload(
+        title="Budget Status",
+        header=["Group", "Category", "Use Type", "Budget", "Spent", "Remaining", "Utilization %"],
+        rows=rows,
+    )
+
+
+def _build_debt_tracker_tab(conn, *, warnings: list[str]) -> _TabPayload:
+    del warnings
+
+    data = debt_cmd.handle_dashboard(_debt_dashboard_namespace(), conn).get("data", {})
+    cards = list(data.get("cards", []))
+    if not cards:
+        return _TabPayload(
+            title="Debt Tracker",
+            header=None,
+            rows=[["Debt Tracker skipped - no credit card balances"]],
+            skipped=True,
+        )
+
+    rows: list[list[Any]] = []
+    for item in cards:
+        apr = item.get("apr")
+        utilization = item.get("utilization_pct")
+        limit_cents = item.get("limit_cents")
+        rows.append(
+            [
+                str(item.get("label") or ""),
+                cents_to_dollars(int(item.get("balance_cents") or 0)),
+                float(apr) if apr is not None else "",
+                cents_to_dollars(int(item.get("min_payment_cents") or 0)),
+                cents_to_dollars(int(item.get("monthly_interest_cents") or 0)),
+                cents_to_dollars(int(limit_cents)) if limit_cents is not None else "",
+                float(utilization) if utilization is not None else "",
+            ]
+        )
+
+    weighted_avg_apr = data.get("weighted_avg_apr")
+    rows.append(
+        [
+            "TOTAL",
+            cents_to_dollars(int(data.get("total_balance_cents") or 0)),
+            f"{float(weighted_avg_apr):.2f}% avg" if weighted_avg_apr is not None else "",
+            cents_to_dollars(int(data.get("total_min_payment_cents") or 0)),
+            cents_to_dollars(int(data.get("total_monthly_interest_cents") or 0)),
+            "",
+            "",
+        ]
+    )
+
+    return _TabPayload(
+        title="Debt Tracker",
+        header=["Card", "Balance", "APR", "Min Payment", "Monthly Interest", "Credit Limit", "Utilization %"],
+        rows=rows,
+    )
+
+
+def _build_subscriptions_tab(conn, *, warnings: list[str]) -> _TabPayload:
+    del warnings
+
+    all_subscriptions = subs_cmd.handle_list(_subs_list_namespace(), conn).get("data", {}).get("subscriptions", [])
+    active_subscriptions = [item for item in all_subscriptions if int(item.get("is_active") or 0) == 1]
+    if not active_subscriptions:
+        return _TabPayload(
+            title="Subscriptions",
+            header=None,
+            rows=[["Subscriptions skipped - no active subscriptions"]],
+            skipped=True,
+        )
+
+    total_monthly = 0.0
+    rows: list[list[Any]] = []
+    for item in active_subscriptions:
+        amount = float(item.get("amount") or 0.0)
+        monthly_amount = float(item.get("monthly_amount") or 0.0)
+        total_monthly += monthly_amount
+        rows.append(
+            [
+                str(item.get("vendor_name") or ""),
+                str(item.get("category_name") or ""),
+                str(item.get("frequency") or ""),
+                amount,
+                monthly_amount,
+                str(item.get("use_type") or ""),
+            ]
+        )
+
+    rows.append(["TOTAL", "", "", "", round(total_monthly, 2), ""])
+
+    return _TabPayload(
+        title="Subscriptions",
+        header=["Vendor", "Category", "Frequency", "Amount", "Monthly Cost", "Use Type"],
+        rows=rows,
+    )
+
+
+def _build_goals_tab(conn, *, warnings: list[str]) -> _TabPayload:
+    del warnings
+
+    goals = goal_cmd.handle_status(_goal_status_namespace(), conn).get("data", {}).get("goals", [])
+    if not goals:
+        return _TabPayload(
+            title="Goals",
+            header=None,
+            rows=[["Goals skipped - no active goals"]],
+            skipped=True,
+        )
+
+    rows: list[list[Any]] = []
+    for item in goals:
+        metric = str(item.get("metric") or "")
+        if metric == "savings_rate":
+            starting = float(item.get("starting_pct") or 0.0)
+            current = float(item.get("current_pct") or 0.0)
+            target = float(item.get("target_pct") or 0.0)
+        else:
+            starting = float(item.get("starting") or 0.0)
+            current = float(item.get("current") or 0.0)
+            target = float(item.get("target") or 0.0)
+
+        estimated_months = item.get("estimated_months")
+        rows.append(
+            [
+                str(item.get("name") or ""),
+                metric,
+                str(item.get("direction") or ""),
+                starting,
+                current,
+                target,
+                float(item.get("progress_pct") or 0.0),
+                int(estimated_months) if estimated_months is not None else "",
+            ]
+        )
+
+    return _TabPayload(
+        title="Goals",
+        header=["Name", "Metric", "Direction", "Starting", "Current", "Target", "Progress %", "Est. Months"],
+        rows=rows,
+    )
+
+
 def _apply_cell_budget_guard(tabs: list[_TabPayload], warnings: list[str]) -> dict[str, int]:
     total_cells = sum(tab.projected_cells() for tab in tabs)
     if total_cells <= _CELL_BUDGET:
@@ -907,6 +1207,209 @@ def _write_tab(spreadsheet: Any, tab: _TabPayload) -> int:
     return len(values)
 
 
+# ── Formatting helpers ────────────────────────────────────────────────
+
+
+def _header_fmt_obj() -> dict:
+    return {
+        "backgroundColor": _HEADER_BG,
+        "textFormat": {"bold": True, "foregroundColor": _HEADER_FG},
+        "horizontalAlignment": "CENTER",
+    }
+
+
+def _section_fmt_obj() -> dict:
+    return {
+        "backgroundColor": _SECTION_BG,
+        "textFormat": {"bold": True},
+    }
+
+
+def _bold_fmt() -> dict:
+    return {"textFormat": {"bold": True}}
+
+
+def _color_text_fmt(color: dict) -> dict:
+    return {"textFormat": {"foregroundColor": color}}
+
+
+def _grid_range(sheet_id: int, *, start_row: int = 0, end_row: int | None = None,
+                start_col: int = 0, end_col: int | None = None) -> dict:
+    gr: dict[str, Any] = {"sheetId": sheet_id, "startRowIndex": start_row, "startColumnIndex": start_col}
+    if end_row is not None:
+        gr["endRowIndex"] = end_row
+    if end_col is not None:
+        gr["endColumnIndex"] = end_col
+    return gr
+
+
+def _cond_rule(sheet_id: int, col: int, condition_type: str, values: list[str],
+               fmt: dict, *, start_row: int = 1, end_row: int | None = None) -> dict:
+    """Build an addConditionalFormatRule request."""
+    return {
+        "addConditionalFormatRule": {
+            "rule": {
+                "ranges": [_grid_range(sheet_id, start_row=start_row, end_row=end_row,
+                                       start_col=col, end_col=col + 1)],
+                "booleanRule": {
+                    "condition": {
+                        "type": condition_type,
+                        "values": [{"userEnteredValue": v} for v in values],
+                    },
+                    "format": fmt,
+                },
+            },
+            "index": 0,
+        }
+    }
+
+
+def _format_tab(spreadsheet: Any, worksheet: Any, tab: _TabPayload) -> None:
+    """Apply formatting to a worksheet after data has been written."""
+    total_rows = len(tab.values_for_sheet())
+    col_count = tab.col_count()
+    if total_rows == 0:
+        return
+
+    sheet_id = worksheet.id
+
+    # Tab color
+    tab_color = _TAB_COLORS.get(tab.title)
+    if tab_color:
+        _call_with_retry(lambda: worksheet.update_tab_color(tab_color), idempotent=True)
+
+    fmt_ranges: list[tuple[str, dict]] = []
+    cond_rules: list[dict] = []
+
+    # Header row formatting (for tabs with headers)
+    if tab.header:
+        end_col_letter = _column_name(col_count)
+        fmt_ranges.append((f"A1:{end_col_letter}1", _header_fmt_obj()))
+        _call_with_retry(lambda: worksheet.freeze(rows=1), idempotent=True)
+    else:
+        _call_with_retry(lambda: worksheet.freeze(rows=0), idempotent=True)
+
+    # Auto-resize columns
+    _call_with_retry(lambda: worksheet.columns_auto_resize(0, col_count - 1), idempotent=True)
+
+    # Per-tab formatting
+    if tab.title == "Dashboard":
+        # Section label rows get bold + gray background
+        section_labels = {"BALANCE SHEET", "CASH FLOW (30-DAY)", "RISK METRICS",
+                          "FIXED OBLIGATIONS", "DATA HEALTH"}
+        non_currency_rows = {"Savings Rate (%)", "Debt-to-Income (x)",
+                             "Emergency Fund (months)",
+                             "Latest Transaction", "Last Balance Refresh"}
+        integer_rows = {"Unreviewed", "Uncategorized"}
+        for row_idx, row_data in enumerate(tab.rows):
+            if row_data and str(row_data[0]) in section_labels:
+                r = row_idx + 1  # 1-indexed
+                fmt_ranges.append((f"A{r}:B{r}", _section_fmt_obj()))
+            elif row_data and row_data[0] and str(row_data[0]) != "":
+                r = row_idx + 1
+                if str(row_data[0]) in integer_rows:
+                    fmt_ranges.append((f"B{r}", _INTEGER_FMT))
+                elif str(row_data[0]) in non_currency_rows:
+                    # Plain number (overrides stale currency from prior runs)
+                    fmt_ranges.append((f"B{r}", {"numberFormat": {"type": "NUMBER", "pattern": "#,##0.00"}}))
+                else:
+                    fmt_ranges.append((f"B{r}", _CURRENCY_FMT))
+
+    elif tab.title == "Transactions":
+        # Currency on col C (Amount)
+        end_row = total_rows
+        fmt_ranges.append((f"C2:C{end_row}", _CURRENCY_FMT))
+        # Conditional: red text where Amount < 0
+        cond_rules.append(_cond_rule(sheet_id, col=2, condition_type="NUMBER_LESS",
+                                     values=["0"], fmt=_color_text_fmt(_RED),
+                                     start_row=1, end_row=end_row))
+
+    elif tab.title == "Business Financials":
+        # Currency on cols C, D
+        fmt_ranges.append((f"C1:D{total_rows}", _CURRENCY_FMT))
+        # Bold sub-header rows
+        sub_headers = {"P&L", "Schedule C", "Tax Summary"}
+        for row_idx, row_data in enumerate(tab.rows):
+            if row_data and str(row_data[0]) in sub_headers:
+                r = row_idx + 1  # rows start at 1 (no header for this tab)
+                end_col_letter = _column_name(col_count)
+                fmt_ranges.append((f"A{r}:{end_col_letter}{r}", _section_fmt_obj()))
+
+    elif tab.title == "Monthly Spending":
+        # Currency on cols C onward (month columns)
+        if col_count >= 3:
+            start_col_letter = _column_name(3)
+            end_col_letter = _column_name(col_count)
+            fmt_ranges.append((f"{start_col_letter}2:{end_col_letter}{total_rows}", _CURRENCY_FMT))
+        # Freeze row 1 + cols A-B
+        _call_with_retry(lambda: worksheet.freeze(rows=1, cols=2), idempotent=True)
+
+    elif tab.title == "Net Worth":
+        # Currency on cols D, E, F (Balance, Available, Limit)
+        fmt_ranges.append((f"D2:F{total_rows}", _CURRENCY_FMT))
+        # Bold summary rows (Total Assets, Total Liabilities, Net Worth)
+        summary_labels = {"Total Assets", "Total Liabilities", "Net Worth"}
+        for row_idx, row_data in enumerate(tab.rows):
+            if row_data and str(row_data[0]) in summary_labels:
+                r = row_idx + 2  # +2 because header row is row 1
+                end_col_letter = _column_name(col_count)
+                fmt_ranges.append((f"A{r}:{end_col_letter}{r}", _bold_fmt()))
+
+    elif tab.title == "Budget Status":
+        # Currency on cols D, E, F (Budget, Spent, Remaining)
+        fmt_ranges.append((f"D2:F{total_rows}", _CURRENCY_FMT))
+        # Pct display on col G (Utilization — values already ×100)
+        fmt_ranges.append((f"G2:G{total_rows}", _PCT_DISPLAY_FMT))
+        # Conditional on col G: green ≤50%, yellow 50-80%, red >100%
+        cond_rules.append(_cond_rule(sheet_id, col=6, condition_type="NUMBER_LESS_THAN_EQ",
+                                     values=["50"], fmt=_color_text_fmt(_GREEN),
+                                     start_row=1, end_row=total_rows))
+        cond_rules.append(_cond_rule(sheet_id, col=6, condition_type="NUMBER_BETWEEN",
+                                     values=["50", "80"], fmt=_color_text_fmt(_YELLOW_TEXT),
+                                     start_row=1, end_row=total_rows))
+        cond_rules.append(_cond_rule(sheet_id, col=6, condition_type="NUMBER_GREATER",
+                                     values=["100"], fmt=_color_text_fmt(_RED),
+                                     start_row=1, end_row=total_rows))
+        # Red text on col F where Remaining < 0
+        cond_rules.append(_cond_rule(sheet_id, col=5, condition_type="NUMBER_LESS",
+                                     values=["0"], fmt=_color_text_fmt(_RED),
+                                     start_row=1, end_row=total_rows))
+        # Bold TOTAL row
+        fmt_ranges.append((f"A{total_rows}:{_column_name(col_count)}{total_rows}", _bold_fmt()))
+
+    elif tab.title == "Debt Tracker":
+        # Currency on cols B, D, E, F
+        for col_letter in ("B", "D", "E", "F"):
+            fmt_ranges.append((f"{col_letter}2:{col_letter}{total_rows}", _CURRENCY_FMT))
+        # Pct on cols C, G (APR, Utilization)
+        for col_letter in ("C", "G"):
+            fmt_ranges.append((f"{col_letter}2:{col_letter}{total_rows}", _PCT_DISPLAY_FMT))
+        # Bold TOTAL row
+        fmt_ranges.append((f"A{total_rows}:{_column_name(col_count)}{total_rows}", _bold_fmt()))
+
+    elif tab.title == "Subscriptions":
+        # Currency on cols D, E (Amount, Monthly Cost)
+        fmt_ranges.append((f"D2:E{total_rows}", _CURRENCY_FMT))
+        # Bold TOTAL row
+        fmt_ranges.append((f"A{total_rows}:{_column_name(col_count)}{total_rows}", _bold_fmt()))
+
+    elif tab.title == "Goals":
+        # Pct on col G (Progress %)
+        fmt_ranges.append((f"G2:G{total_rows}", _PCT_DISPLAY_FMT))
+        # Currency on cols D, E, F (Starting, Current, Target)
+        fmt_ranges.append((f"D2:F{total_rows}", _CURRENCY_FMT))
+
+    # Apply batch format
+    if fmt_ranges:
+        payload = [{"range": r, "format": f} for r, f in fmt_ranges]
+        _call_with_retry(lambda: worksheet.batch_format(payload), idempotent=True)
+
+    # Apply conditional formatting
+    if cond_rules:
+        body = {"requests": cond_rules}
+        _call_with_retry(lambda: spreadsheet.batch_update(body), idempotent=True)
+
+
 def _spreadsheet_url(spreadsheet: Any) -> str:
     url = getattr(spreadsheet, "url", None)
     if url:
@@ -959,10 +1462,15 @@ def export_to_sheets(
     )
 
     tabs: list[_TabPayload] = [
+        _build_dashboard_tab(conn, warnings=warnings),
         _build_transactions_tab(conn, date_from=resolved.txn_from, date_to=resolved.txn_to),
         _build_business_financials_tab(conn, business_year=resolved.business_year, warnings=warnings),
         _build_monthly_spending_tab(conn, date_from=resolved.txn_from, date_to=resolved.txn_to),
         _build_net_worth_tab(conn),
+        _build_budget_status_tab(conn, warnings=warnings),
+        _build_debt_tracker_tab(conn, warnings=warnings),
+        _build_subscriptions_tab(conn, warnings=warnings),
+        _build_goals_tab(conn, warnings=warnings),
     ]
 
     skipped_tabs = [tab.title for tab in tabs if tab.skipped]
@@ -987,6 +1495,12 @@ def export_to_sheets(
             break
         successful_tabs.append(tab.title)
         row_counts[tab.title] = written_rows
+
+        try:
+            ws = spreadsheet.worksheet(tab.title)
+            _format_tab(spreadsheet, ws, tab)
+        except Exception as exc:
+            _emit_warning(warnings, f"Formatting failed for {tab.title}: {exc}")
 
     result: dict[str, Any] = {
         "spreadsheet_id": _spreadsheet_id_from_object(spreadsheet),

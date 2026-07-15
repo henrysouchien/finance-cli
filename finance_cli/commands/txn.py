@@ -4,7 +4,10 @@ from __future__ import annotations
 
 import sqlite3
 import uuid
+from pathlib import Path
 from typing import Any
+
+from finance_cli.exceptions import NotFoundError, ValidationError
 
 from ..categorizer import normalize_description
 from ..importers import import_csv, import_income_csv
@@ -74,6 +77,7 @@ def register(subparsers, format_parent) -> None:
 
     p_search = txn_sub.add_parser("search", parents=[format_parent], help="FTS transaction search")
     p_search.add_argument("--query", required=True)
+    p_search.add_argument("--category", default=None, help="Filter by category name")
     p_search.set_defaults(func=handle_search, command_name="txn.search")
 
     p_cat = txn_sub.add_parser("categorize", parents=[format_parent], help="Categorize transaction(s)")
@@ -94,6 +98,11 @@ def register(subparsers, format_parent) -> None:
     p_edit.add_argument("--description")
     p_edit.add_argument("--notes")
     p_edit.set_defaults(func=handle_edit, command_name="txn.edit")
+
+    p_deactivate = txn_sub.add_parser("deactivate", parents=[format_parent], help="Deactivate a transaction")
+    p_deactivate.add_argument("id")
+    p_deactivate.add_argument("--dry-run", action="store_true")
+    p_deactivate.set_defaults(func=handle_deactivate, command_name="txn.deactivate")
 
     p_tag = txn_sub.add_parser("tag", parents=[format_parent], help="Tag transaction with a project")
     p_tag.add_argument("id")
@@ -141,9 +150,9 @@ def _project_id_by_name(conn: sqlite3.Connection, project_name: str) -> str:
 
 def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if args.limit < 1:
-        raise ValueError("--limit must be >= 1")
+        raise ValidationError("--limit must be >= 1")
     if args.offset < 0:
-        raise ValueError("--offset must be >= 0")
+        raise ValidationError("--offset must be >= 0")
 
     where = ["t.is_active = 1"]
     params: list[Any] = []
@@ -244,7 +253,7 @@ def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
         (args.id,),
     ).fetchone()
     if not row:
-        raise ValueError(f"Transaction {args.id} not found")
+        raise NotFoundError(f"Transaction {args.id} not found")
 
     txn = txn_row_to_dict(row)
     return {
@@ -254,7 +263,11 @@ def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_explain(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_explain(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     row = conn.execute(
         """
         SELECT t.id,
@@ -273,7 +286,7 @@ def handle_explain(args, conn: sqlite3.Connection) -> dict[str, Any]:
         (args.id,),
     ).fetchone()
     if not row:
-        raise ValueError(f"Transaction {args.id} not found")
+        raise NotFoundError(f"Transaction {args.id} not found")
 
     txn = txn_row_to_dict(row)
     category_source = row["category_source"]
@@ -309,7 +322,7 @@ def handle_explain(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     keyword_rule_match = None
     if category_source == "keyword_rule":
-        keyword_match = match_keyword_rule(txn["description"], load_rules())
+        keyword_match = match_keyword_rule(txn["description"], load_rules(path=rules_path))
         if keyword_match:
             keyword_rule_match = {
                 "matched_keyword": keyword_match.matched_keyword,
@@ -384,35 +397,44 @@ def handle_explain(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_search(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    category_filter = getattr(args, "category", None)
+    cat_clause = ""
+    cat_params: list[Any] = []
+    if category_filter:
+        cat_clause = "AND c.name = ?"
+        cat_params = [category_filter]
+
     try:
         rows = conn.execute(
-            """
+            f"""
             SELECT t.*, c.name AS category_name
               FROM txn_fts f
               JOIN transactions t ON t.rowid = f.rowid
               LEFT JOIN categories c ON c.id = t.category_id
              WHERE txn_fts MATCH ?
                AND t.is_active = 1
+               {cat_clause}
              ORDER BY t.date DESC
             """,
-            (args.query,),
+            (args.query, *cat_params),
         ).fetchall()
     except sqlite3.Error as exc:
         # Fallback keeps search usable when user query contains FTS syntax
         # characters that would otherwise raise parser errors.
         fallback_term = args.query.replace("*", " ").replace('"', " ").strip()
         if not fallback_term:
-            raise ValueError(f"Invalid search query: {exc}") from exc
+            raise ValidationError(f"Invalid search query: {exc}") from exc
         rows = conn.execute(
-            """
+            f"""
             SELECT t.*, c.name AS category_name
               FROM transactions t
               LEFT JOIN categories c ON c.id = t.category_id
              WHERE t.is_active = 1
                AND lower(t.description) LIKE lower(?)
+               {cat_clause}
              ORDER BY t.date DESC
             """,
-            (f"%{fallback_term}%",),
+            (f"%{fallback_term}%", *cat_params),
         ).fetchall()
 
     txns = [txn_row_to_dict(row) for row in rows]
@@ -472,9 +494,10 @@ def _upsert_vendor_memory_rule(
 
 
 def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     category_id = get_category_id_by_name(conn, args.category)
     if not category_id:
-        raise ValueError(f"Category '{args.category}' not found")
+        raise NotFoundError(f"Category '{args.category}' not found")
     is_payment_val = 1 if args.category.lower() == "payments & transfers" else 0
 
     ids_csv = str(getattr(args, "ids", "") or "").strip()
@@ -483,7 +506,7 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
         if ids_csv:
             requested_ids = [value.strip() for value in ids_csv.split(",") if value.strip()]
             if not requested_ids:
-                raise ValueError("--ids must include at least one transaction id")
+                raise ValidationError("--ids must include at least one transaction id")
             placeholders = ",".join("?" for _ in requested_ids)
             rows = conn.execute(
                 f"SELECT id FROM transactions WHERE is_active = 1 AND id IN ({placeholders})",
@@ -491,7 +514,7 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
             ).fetchall()
         else:
             if not any([args.query, args.date_from, args.date_to]):
-                raise ValueError("Bulk categorize requires at least one filter: --ids, --query, --from, or --to")
+                raise ValidationError("Bulk categorize requires at least one filter: --ids, --query, --from, or --to")
             where = ["is_active = 1"]
             params: list[Any] = []
             if args.date_from:
@@ -512,9 +535,9 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
         txn_ids = [row["id"] for row in rows]
         if not txn_ids:
             return {
-                "data": {"updated": 0},
+                "data": {"updated": 0, **({"dry_run": True} if dry_run else {})},
                 "summary": {"total_transactions": 0, "total_amount": 0},
-                "cli_report": "No matching transactions",
+                "cli_report": "[DRY RUN] No matching transactions" if dry_run else "No matching transactions",
             }
 
         remembered_count = 0
@@ -545,22 +568,32 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
             """,
             [(category_id, is_payment_val, txn_id) for txn_id in txn_ids],
         )
-        conn.commit()
 
         data: dict[str, Any] = {"updated": len(txn_ids)}
         if args.remember:
             data["remembered_count"] = remembered_count
-        cli_report = f"Updated {len(txn_ids)} transactions"
+        if dry_run:
+            data["dry_run"] = True
+        cli_report = (
+            f"[DRY RUN] Would update {len(txn_ids)} transactions"
+            if dry_run
+            else f"Updated {len(txn_ids)} transactions"
+        )
         if args.remember:
             cli_report += f" and remembered {remembered_count} vendor patterns"
-        return {
+        result = {
             "data": data,
             "summary": {"total_transactions": len(txn_ids), "total_amount": 0},
             "cli_report": cli_report,
         }
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+        return result
 
     if not args.txn_id:
-        raise ValueError("txn_id is required unless --bulk or --ids is used")
+        raise ValidationError("txn_id is required unless --bulk or --ids is used")
 
     txn = conn.execute(
         """
@@ -571,7 +604,7 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
         (args.txn_id,),
     ).fetchone()
     if not txn:
-        raise ValueError(f"Transaction {args.txn_id} not found")
+        raise NotFoundError(f"Transaction {args.txn_id} not found")
 
     rule_id = None
     if args.remember:
@@ -592,9 +625,7 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
         """,
         (category_id, rule_id, is_payment_val, args.txn_id),
     )
-    conn.commit()
-
-    return {
+    result = {
         "data": {
             "transaction_id": args.txn_id,
             "category": args.category,
@@ -612,23 +643,39 @@ def handle_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
                 "category_confidence": 1.0,
                 "category_rule_id": rule_id,
             },
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {"total_transactions": 1, "total_amount": 0},
-        "cli_report": f"Categorized {args.txn_id} as {args.category}",
+        "cli_report": (
+            f"[DRY RUN] Would categorize {args.txn_id} as {args.category}"
+            if dry_run
+            else f"Categorized {args.txn_id} as {args.category}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_edit(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     sets = []
     params: list[Any] = []
 
     if args.amount is not None:
+        cents = dollars_to_cents(args.amount)
+        if cents == 0:
+            raise ValidationError("Transaction amount cannot be zero")
         sets.append("amount_cents = ?")
-        params.append(dollars_to_cents(args.amount))
+        params.append(cents)
     if args.date is not None:
         sets.append("date = ?")
         params.append(args.date)
     if args.description is not None:
+        if not str(args.description).strip():
+            raise ValidationError("Transaction description cannot be empty")
         sets.append("description = ?")
         params.append(args.description)
     if args.notes is not None:
@@ -636,7 +683,7 @@ def handle_edit(args, conn: sqlite3.Connection) -> dict[str, Any]:
         params.append(args.notes)
 
     if not sets:
-        raise ValueError("No fields provided for edit")
+        raise ValidationError("No fields provided for edit")
 
     sets.append("updated_at = datetime('now')")
     params.append(args.id)
@@ -645,48 +692,147 @@ def handle_edit(args, conn: sqlite3.Connection) -> dict[str, Any]:
         f"UPDATE transactions SET {', '.join(sets)} WHERE id = ?",
         tuple(params),
     )
-    conn.commit()
-
     if cursor.rowcount == 0:
-        raise ValueError(f"Transaction {args.id} not found")
+        raise NotFoundError(f"Transaction {args.id} not found")
 
-    return {
-        "data": {"transaction_id": args.id, "updated_fields": len(sets) - 1},
+    result = {
+        "data": {
+            "transaction_id": args.id,
+            "updated_fields": len(sets) - 1,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_transactions": 1, "total_amount": 0},
-        "cli_report": f"Updated transaction {args.id}",
+        "cli_report": (
+            f"[DRY RUN] Would update transaction {args.id}"
+            if dry_run
+            else f"Updated transaction {args.id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
+
+
+def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    row = conn.execute(
+        """
+        SELECT id, date, description, amount_cents, is_active, removed_at
+          FROM transactions
+         WHERE id = ?
+        """,
+        (args.id,),
+    ).fetchone()
+    if not row:
+        raise NotFoundError(f"Transaction {args.id} not found")
+
+    was_active = bool(row["is_active"])
+    cursor = conn.execute(
+        """
+        UPDATE transactions
+           SET is_active = 0,
+               removed_at = COALESCE(removed_at, datetime('now')),
+               updated_at = datetime('now')
+         WHERE id = ?
+           AND is_active = 1
+        """,
+        (args.id,),
+    )
+    deactivated = bool(cursor.rowcount)
+    amount = (int(row["amount_cents"] or 0)) / 100
+    result = {
+        "data": {
+            "transaction_id": args.id,
+            "deactivated": deactivated,
+            "previous": {
+                "is_active": was_active,
+                "removed_at": row["removed_at"],
+                "date": row["date"],
+                "description": row["description"],
+                "amount": amount,
+            },
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {
+            "total_transactions": 1,
+            "deactivated_count": int(deactivated),
+            "total_amount": amount,
+        },
+        "cli_report": (
+            f"[DRY RUN] Would deactivate transaction {args.id}"
+            if dry_run and deactivated
+            else (
+                f"Transaction {args.id} deactivated"
+                if deactivated
+                else f"Transaction {args.id} already inactive"
+            )
+        ),
+    }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_tag(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     project_id = _project_id_by_name(conn, args.project)
     cursor = conn.execute(
         "UPDATE transactions SET project_id = ?, updated_at = datetime('now') WHERE id = ?",
         (project_id, args.id),
     )
-    conn.commit()
     if cursor.rowcount == 0:
-        raise ValueError(f"Transaction {args.id} not found")
+        raise NotFoundError(f"Transaction {args.id} not found")
 
-    return {
-        "data": {"transaction_id": args.id, "project": args.project},
+    result = {
+        "data": {
+            "transaction_id": args.id,
+            "project": args.project,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_transactions": 1, "total_amount": 0},
-        "cli_report": f"Tagged {args.id} with project '{args.project}'",
+        "cli_report": (
+            f"[DRY RUN] Would tag {args.id} with project '{args.project}'"
+            if dry_run
+            else f"Tagged {args.id} with project '{args.project}'"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_review(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     if args.before:
         cursor = conn.execute(
             "UPDATE transactions SET is_reviewed = 1, updated_at = datetime('now') "
             "WHERE date < ? AND is_active = 1 AND is_reviewed = 0",
             (args.before,),
         )
-        conn.commit()
-        return {
-            "data": {"updated": cursor.rowcount, "before": args.before},
+        result = {
+            "data": {
+                "updated": cursor.rowcount,
+                "before": args.before,
+                **({"dry_run": True} if dry_run else {}),
+            },
             "summary": {"total_transactions": cursor.rowcount, "total_amount": 0},
-            "cli_report": f"Marked {cursor.rowcount} transactions before {args.before} as reviewed",
+            "cli_report": (
+                f"[DRY RUN] Would mark {cursor.rowcount} transactions before {args.before} as reviewed"
+                if dry_run
+                else f"Marked {cursor.rowcount} transactions before {args.before} as reviewed"
+            ),
         }
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+        return result
 
     if args.all_today:
         today = today_iso()
@@ -694,82 +840,147 @@ def handle_review(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "UPDATE transactions SET is_reviewed = 1, updated_at = datetime('now') WHERE date = ? AND is_active = 1",
             (today,),
         )
-        conn.commit()
-        return {
-            "data": {"updated": cursor.rowcount, "date": today},
+        result = {
+            "data": {
+                "updated": cursor.rowcount,
+                "date": today,
+                **({"dry_run": True} if dry_run else {}),
+            },
             "summary": {"total_transactions": cursor.rowcount, "total_amount": 0},
-            "cli_report": f"Marked {cursor.rowcount} transactions reviewed for {today}",
+            "cli_report": (
+                f"[DRY RUN] Would mark {cursor.rowcount} transactions reviewed for {today}"
+                if dry_run
+                else f"Marked {cursor.rowcount} transactions reviewed for {today}"
+            ),
         }
+        if dry_run:
+            conn.rollback()
+        else:
+            conn.commit()
+        return result
 
     if not args.txn_id:
-        raise ValueError("txn_id is required unless --all-today or --before is used")
+        raise ValidationError("txn_id is required unless --all-today or --before is used")
 
     cursor = conn.execute(
         "UPDATE transactions SET is_reviewed = 1, updated_at = datetime('now') WHERE id = ?",
         (args.txn_id,),
     )
-    conn.commit()
     if cursor.rowcount == 0:
-        raise ValueError(f"Transaction {args.txn_id} not found")
+        raise NotFoundError(f"Transaction {args.txn_id} not found")
 
-    return {
-        "data": {"transaction_id": args.txn_id, "is_reviewed": True},
+    result = {
+        "data": {
+            "transaction_id": args.txn_id,
+            "is_reviewed": True,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_transactions": 1, "total_amount": 0},
-        "cli_report": f"Marked {args.txn_id} reviewed",
+        "cli_report": (
+            f"[DRY RUN] Would mark {args.txn_id} reviewed"
+            if dry_run
+            else f"Marked {args.txn_id} reviewed"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    idempotency_key = getattr(args, "idempotency_key", None)
+    desc = args.description
+    if desc is None or not str(desc).strip():
+        raise ValidationError("Transaction description cannot be empty")
+    if dollars_to_cents(args.amount) == 0:
+        raise ValidationError("Transaction amount cannot be zero")
     category_id = None
     if args.category:
         category_id = get_category_id_by_name(conn, args.category)
         if not category_id:
-            raise ValueError(f"Category '{args.category}' not found")
+            raise NotFoundError(f"Category '{args.category}' not found")
 
     txn_id = uuid.uuid4().hex
-    conn.execute(
-        """
-        INSERT INTO transactions (
-            id,
-            date,
-            description,
-            amount_cents,
-            category_id,
-            category_source,
-            category_confidence,
-            source
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual')
-        """,
-        (
-            txn_id,
-            args.date,
-            args.description,
-            dollars_to_cents(args.amount),
-            category_id,
-            "user" if category_id else None,
-            1.0 if category_id else None,
-        ),
-    )
-    conn.commit()
-
-    return {
-        "data": {"transaction_id": txn_id},
+    try:
+        conn.execute(
+            """
+            INSERT INTO transactions (
+                id,
+                date,
+                description,
+                amount_cents,
+                category_id,
+                category_source,
+                category_confidence,
+                idempotency_key,
+                source
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, 'manual')
+            """,
+            (
+                txn_id,
+                args.date,
+                args.description,
+                dollars_to_cents(args.amount),
+                category_id,
+                "user" if category_id else None,
+                1.0 if category_id else None,
+                idempotency_key,
+            ),
+        )
+    except sqlite3.IntegrityError as exc:
+        if idempotency_key and "idempotency_key" in str(exc):
+            conn.rollback()
+            existing = conn.execute(
+                "SELECT id FROM transactions WHERE idempotency_key = ?",
+                (idempotency_key,),
+            ).fetchone()
+            if existing is None:
+                raise
+            return {
+                "data": {
+                    "transaction_id": existing["id"],
+                    "already_existed": True,
+                    **({"dry_run": True} if dry_run else {}),
+                },
+                "summary": {"total_transactions": 1, "total_amount": float(args.amount)},
+                "cli_report": f"Transaction {existing['id']} already exists (idempotent retry)",
+            }
+        raise
+    result = {
+        "data": {"transaction_id": txn_id, **({"dry_run": True} if dry_run else {})},
         "summary": {"total_transactions": 1, "total_amount": float(args.amount)},
-        "cli_report": f"Added transaction {txn_id}",
+        "cli_report": (
+            f"[DRY RUN] Would add transaction {txn_id}"
+            if dry_run
+            else f"Added transaction {txn_id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
-def handle_import(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_import(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     if args.income_source:
         if not args.file:
-            raise ValueError("--file is required when using --income-source")
-        rules = load_rules()
+            raise ValidationError("--file is required when using --income-source")
+        rules = load_rules(path=rules_path)
         report = import_income_csv(
             conn,
             file_path=args.file,
             source_name=args.income_source,
             rules=rules,
             dry_run=args.dry_run,
+            rules_path=rules_path,
         )
         return {
             "data": report.as_dict(),
@@ -783,9 +994,15 @@ def handle_import(args, conn: sqlite3.Connection) -> dict[str, Any]:
         }
 
     if not args.file or not args.source:
-        raise ValueError("--file and --source are required for CSV import")
+        raise ValidationError("--file and --source are required for CSV import")
 
-    report = import_csv(conn, file_path=args.file, source_name=args.source, dry_run=args.dry_run)
+    report = import_csv(
+        conn,
+        file_path=args.file,
+        source_name=args.source,
+        dry_run=args.dry_run,
+        rules_path=rules_path,
+    )
     return {
         "data": report.as_dict(),
         "summary": {

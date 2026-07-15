@@ -7,6 +7,8 @@ from collections import defaultdict
 from datetime import date, timedelta
 from typing import Any
 
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..models import cents_to_dollars
 from .common import fmt_dollars, use_type_filter
 
@@ -18,6 +20,12 @@ def register(subparsers, format_parent) -> None:
     p_trends = spending_sub.add_parser("trends", parents=[format_parent], help="Monthly spending trends")
     p_trends.add_argument("--months", type=int, default=6)
     p_trends.add_argument("--view", choices=["personal", "business", "all"], default="all")
+    p_trends.add_argument(
+        "--category",
+        dest="categories",
+        action="append",
+        help="Restrict trends to a category name; repeat for multiple categories",
+    )
     p_trends.set_defaults(func=handle_trends, command_name="spending.trends")
 
 
@@ -63,11 +71,28 @@ def _month_label(ym: str) -> str:
         return ym
 
 
+def _normalize_category_filter(raw: Any) -> list[str]:
+    if raw is None:
+        return []
+    values = raw if isinstance(raw, (list, tuple, set)) else [raw]
+    categories: list[str] = []
+    for value in values:
+        if value is None:
+            continue
+        for part in str(value).split(","):
+            category = part.strip()
+            if category:
+                categories.append(category)
+    return categories
+
+
 def handle_trends(args, conn: sqlite3.Connection) -> dict[str, Any]:
     """Monthly spending trends by category."""
     months = max(1, getattr(args, "months", 6))
     view = getattr(args, "view", "all")
     ut_filter = use_type_filter(view)
+    category_filter = _normalize_category_filter(getattr(args, "categories", None))
+    category_filter_set = {category.casefold() for category in category_filter}
 
     month_keys = _build_month_keys(months)
     if not month_keys:
@@ -81,18 +106,18 @@ def handle_trends(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     rows = conn.execute(
         f"""
-        SELECT c.name AS category,
+        SELECT COALESCE(c.name, 'Uncategorized') AS category,
                strftime('%Y-%m', t.date) AS month,
                COALESCE(SUM(ABS(t.amount_cents)), 0) AS total_cents
           FROM transactions t
-          JOIN categories c ON c.id = t.category_id
+          LEFT JOIN categories c ON c.id = t.category_id
          WHERE t.is_active = 1
            AND t.is_payment = 0
            AND t.amount_cents < 0
            AND t.date >= ?
            {ut_filter}
-         GROUP BY c.name, strftime('%Y-%m', t.date)
-         ORDER BY c.name, month
+         GROUP BY COALESCE(c.name, 'Uncategorized'), strftime('%Y-%m', t.date)
+         ORDER BY COALESCE(c.name, 'Uncategorized'), month
         """,
         (start_date,),
     ).fetchall()
@@ -101,6 +126,8 @@ def handle_trends(args, conn: sqlite3.Connection) -> dict[str, Any]:
     pivot: dict[str, dict[str, int]] = defaultdict(lambda: defaultdict(int))
     for row in rows:
         cat = row["category"]
+        if category_filter_set and str(cat).casefold() not in category_filter_set:
+            continue
         m = row["month"]
         if m in month_keys:
             pivot[cat][m] = int(row["total_cents"])
@@ -151,7 +178,9 @@ def handle_trends(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "totals_cents": dict(grand_totals),
         "grand_average": cents_to_dollars(grand_avg),
         "grand_trend": grand_trend,
+        "category_filter": category_filter,
     }
+    log_event(_connected_main_db_path(conn), "feature.spending_trends_viewed")
 
     return {
         "data": data,
@@ -171,9 +200,21 @@ def _build_cli_report(
     if not categories:
         return "No spending data for the requested period."
 
-    col_w = 9
     cat_w = 28
     labels = [_month_label(m) for m in month_keys]
+    value_widths: list[int] = [len(label) for label in labels]
+    value_widths.append(len("Avg"))
+    for cat_row in categories:
+        value_widths.extend(
+            len(fmt_dollars(cents_to_dollars(cat_row["months_cents"].get(m, 0))))
+            for m in month_keys
+        )
+        value_widths.append(len(fmt_dollars(cat_row["average"])))
+    value_widths.extend(
+        len(fmt_dollars(cents_to_dollars(grand_totals.get(m, 0)))) for m in month_keys
+    )
+    value_widths.append(len(fmt_dollars(cents_to_dollars(grand_avg))))
+    col_w = max(9, max(value_widths, default=0) + 1)
 
     header = f"{'':>{cat_w}s}"
     for lbl in labels:

@@ -1,0 +1,3 @@
+-- Special migration handled in finance_cli.db.
+-- Creates downstream-only _sync_changelog triggers for cost_ledger after
+-- migration 059 has added the Phase 2 cost attribution columns.

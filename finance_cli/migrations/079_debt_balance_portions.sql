@@ -1,0 +1,2 @@
+-- Special migration handled in finance_cli.db.
+-- Creates the synced debt_balance_portions table and its _sync_changelog triggers.

@@ -1,13 +1,17 @@
 from __future__ import annotations
 
 import dataclasses
+from pathlib import Path
 
 import pytest
 
+from finance_cli.db import connect, initialize_database
 from finance_cli.debt_calculator import (
     DebtCard,
+    _estimate_min_payment,
     compare_strategies,
     compute_dashboard,
+    load_debt_cards,
     monthly_interest_cents,
     project_interest,
     simulate_paydown,
@@ -32,6 +36,86 @@ def _card(
     )
 
 
+@pytest.fixture()
+def db_path(tmp_path: Path) -> Path:
+    path = tmp_path / "finance.db"
+    initialize_database(path)
+    return path
+
+
+def _seed_credit_card_account(
+    conn,
+    *,
+    account_id: str,
+    institution: str = "Test Bank",
+    name: str = "Card",
+    balance_cents: int = -100_000,
+) -> str:
+    conn.execute(
+        """
+        INSERT INTO accounts
+            (id, institution_name, account_name, account_type, balance_current_cents, is_active)
+        VALUES (?, ?, ?, 'credit_card', ?, 1)
+        """,
+        (account_id, institution, name, balance_cents),
+    )
+    conn.commit()
+    return account_id
+
+
+def _seed_credit_liability(
+    conn,
+    *,
+    account_id: str,
+    apr_purchase: float | None,
+    minimum_payment_cents: int | None = None,
+    next_monthly_payment_cents: int | None = None,
+) -> str:
+    liability_id = f"liability-{account_id}"
+    conn.execute(
+        """
+        INSERT INTO liabilities
+            (id, account_id, liability_type, is_active, apr_purchase, minimum_payment_cents, next_monthly_payment_cents)
+        VALUES (?, ?, 'credit', 1, ?, ?, ?)
+        """,
+        (liability_id, account_id, apr_purchase, minimum_payment_cents, next_monthly_payment_cents),
+    )
+    conn.commit()
+    return liability_id
+
+
+def _seed_debt_balance_portion(
+    conn,
+    *,
+    account_id: str,
+    portion_id: str,
+    label: str = "Plan It",
+    principal_cents: int,
+    apr_pct: float | None,
+    monthly_payment_cents: int | None = None,
+    portion_type: str = "installment",
+) -> str:
+    conn.execute(
+        """
+        INSERT INTO debt_balance_portions (
+            id, account_id, label, portion_type, principal_cents, apr_pct,
+            monthly_payment_cents, source, is_active
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, 'manual', 1)
+        """,
+        (
+            portion_id,
+            account_id,
+            label,
+            portion_type,
+            principal_cents,
+            apr_pct,
+            monthly_payment_cents,
+        ),
+    )
+    conn.commit()
+    return portion_id
+
+
 def test_monthly_interest_cents_basic_rounding() -> None:
     assert monthly_interest_cents(100_000, 24.0) == 2000
 
@@ -39,6 +123,252 @@ def test_monthly_interest_cents_basic_rounding() -> None:
 def test_monthly_interest_cents_zero_apr_and_zero_balance() -> None:
     assert monthly_interest_cents(100_000, 0.0) == 0
     assert monthly_interest_cents(0, 22.0) == 0
+
+
+def test_estimate_min_payment_returns_zero_for_non_positive_balance() -> None:
+    assert _estimate_min_payment(0, 21.6) == 0
+    assert _estimate_min_payment(-1, 21.6) == 0
+
+
+def test_estimate_min_payment_includes_one_percent_and_interest() -> None:
+    assert _estimate_min_payment(9_253_800, 21.6) == 259_106
+
+
+def test_estimate_min_payment_uses_floor_without_apr() -> None:
+    assert _estimate_min_payment(100_000, None) == 2_500
+    assert _estimate_min_payment(500_000, None) == 5_000
+
+
+def test_estimate_min_payment_can_exceed_floor_when_interest_present() -> None:
+    assert _estimate_min_payment(100_000, 24.0) == 3_000
+
+
+def test_estimate_min_payment_caps_floor_to_balance() -> None:
+    assert _estimate_min_payment(500, None) == 500
+
+
+def test_load_debt_cards_normalizes_missing_or_zero_minimum_payments(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        _seed_credit_card_account(conn, account_id="reported", institution="Reported", name="Card", balance_cents=-100_000)
+        _seed_credit_liability(
+            conn,
+            account_id="reported",
+            apr_purchase=19.99,
+            minimum_payment_cents=5_000,
+            next_monthly_payment_cents=8_000,
+        )
+
+        _seed_credit_card_account(conn, account_id="next-monthly", institution="Next", name="Card", balance_cents=-80_000)
+        _seed_credit_liability(
+            conn,
+            account_id="next-monthly",
+            apr_purchase=15.0,
+            minimum_payment_cents=None,
+            next_monthly_payment_cents=3_000,
+        )
+
+        _seed_credit_card_account(conn, account_id="missing", institution="Missing", name="Card", balance_cents=-200_000)
+        _seed_credit_liability(
+            conn,
+            account_id="missing",
+            apr_purchase=24.0,
+            minimum_payment_cents=None,
+            next_monthly_payment_cents=None,
+        )
+
+        _seed_credit_card_account(conn, account_id="zero", institution="Zero", name="Card", balance_cents=-50_000)
+        _seed_credit_liability(
+            conn,
+            account_id="zero",
+            apr_purchase=24.99,
+            minimum_payment_cents=0,
+            next_monthly_payment_cents=None,
+        )
+
+        _seed_credit_card_account(conn, account_id="no-liability", institution="No Liability", name="Card", balance_cents=-40_000)
+
+        cards = {card.card_id: card for card in load_debt_cards(conn)}
+
+    assert cards["reported"].min_payment_cents == 5_000
+    assert cards["next-monthly"].min_payment_cents == 3_000
+    assert cards["missing"].min_payment_cents == _estimate_min_payment(200_000, 24.0)
+    assert cards["zero"].min_payment_cents == _estimate_min_payment(50_000, 24.99)
+    assert cards["no-liability"].apr is None
+    assert cards["no-liability"].min_payment_cents == _estimate_min_payment(40_000, None)
+
+
+def test_load_debt_cards_full_balance_portion_replaces_parent_apr(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        account_id = _seed_credit_card_account(
+            conn,
+            account_id="amex-gold",
+            institution="American Express",
+            name="Gold",
+            balance_cents=-3_487_500,
+        )
+        _seed_credit_liability(
+            conn,
+            account_id=account_id,
+            apr_purchase=20.49,
+            minimum_payment_cents=120_000,
+        )
+        portion_id = _seed_debt_balance_portion(
+            conn,
+            account_id=account_id,
+            portion_id="plan-it-1",
+            label="Plan It",
+            principal_cents=3_487_500,
+            apr_pct=10.0,
+            monthly_payment_cents=89_600,
+        )
+
+        cards = load_debt_cards(conn)
+        dashboard = compute_dashboard(cards)
+
+    assert len(cards) == 1
+    card = cards[0]
+    assert card.card_id == f"{account_id}:{portion_id}"
+    assert card.parent_account_id == account_id
+    assert card.portion_id == portion_id
+    assert card.balance_cents == 3_487_500
+    assert card.apr == pytest.approx(10.0)
+    assert card.min_payment_cents == 89_600
+    assert dashboard["total_balance_cents"] == 3_487_500
+    assert dashboard["total_monthly_interest_cents"] == monthly_interest_cents(3_487_500, 10.0)
+    assert dashboard["weighted_avg_apr"] == pytest.approx(10.0)
+
+
+def test_load_debt_cards_partial_portion_keeps_purchase_apr_residual(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        account_id = _seed_credit_card_account(
+            conn,
+            account_id="amex-gold",
+            institution="American Express",
+            name="Gold",
+            balance_cents=-3_487_500,
+        )
+        _seed_credit_liability(
+            conn,
+            account_id=account_id,
+            apr_purchase=20.49,
+            minimum_payment_cents=120_000,
+        )
+        portion_id = _seed_debt_balance_portion(
+            conn,
+            account_id=account_id,
+            portion_id="plan-it-1",
+            label="Plan It",
+            principal_cents=2_000_000,
+            apr_pct=10.0,
+            monthly_payment_cents=89_600,
+        )
+
+        cards = {card.card_id: card for card in load_debt_cards(conn)}
+        dashboard = compute_dashboard(list(cards.values()))
+
+    portion = cards[f"{account_id}:{portion_id}"]
+    residual = cards[account_id]
+    assert portion.balance_cents == 2_000_000
+    assert portion.apr == pytest.approx(10.0)
+    assert portion.min_payment_cents == 89_600
+    assert residual.balance_cents == 1_487_500
+    assert residual.apr == pytest.approx(20.49)
+    assert residual.min_payment_cents == 30_400
+    assert residual.portion_type == "purchase_residual"
+    assert dashboard["total_balance_cents"] == 3_487_500
+    assert dashboard["total_min_payment_cents"] == 120_000
+    assert dashboard["total_monthly_interest_cents"] == (
+        monthly_interest_cents(2_000_000, 10.0)
+        + monthly_interest_cents(1_487_500, 20.49)
+    )
+
+
+def test_simulate_paydown_targets_high_apr_residual_before_installment(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        account_id = _seed_credit_card_account(
+            conn,
+            account_id="amex-gold",
+            institution="American Express",
+            name="Gold",
+            balance_cents=-3_487_500,
+        )
+        _seed_credit_liability(
+            conn,
+            account_id=account_id,
+            apr_purchase=20.49,
+            minimum_payment_cents=120_000,
+        )
+        portion_id = _seed_debt_balance_portion(
+            conn,
+            account_id=account_id,
+            portion_id="plan-it-1",
+            label="Plan It",
+            principal_cents=2_000_000,
+            apr_pct=10.0,
+            monthly_payment_cents=89_600,
+        )
+
+        result = simulate_paydown(
+            load_debt_cards(conn),
+            extra_cents=25_000,
+            strategy="avalanche",
+            summary_only=False,
+        )
+
+    first_month = result["schedule"][0]
+    by_card_id = {row["card_id"]: row for row in first_month["cards"]}
+    assert by_card_id[account_id]["extra_payment_cents"] == 25_000
+    assert by_card_id[f"{account_id}:{portion_id}"]["extra_payment_cents"] == 0
+
+
+def test_load_debt_cards_caps_overallocated_portions_at_parent_balance(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        account_id = _seed_credit_card_account(
+            conn,
+            account_id="card-1",
+            institution="Test Bank",
+            name="Rewards",
+            balance_cents=-100_000,
+        )
+        _seed_credit_liability(
+            conn,
+            account_id=account_id,
+            apr_purchase=24.0,
+            minimum_payment_cents=5_000,
+        )
+        _seed_debt_balance_portion(
+            conn,
+            account_id=account_id,
+            portion_id="portion-a",
+            label="Installment A",
+            principal_cents=80_000,
+            apr_pct=10.0,
+        )
+        _seed_debt_balance_portion(
+            conn,
+            account_id=account_id,
+            portion_id="portion-b",
+            label="Installment B",
+            principal_cents=50_000,
+            apr_pct=12.0,
+        )
+
+        cards = {card.card_id: card for card in load_debt_cards(conn)}
+        dashboard = compute_dashboard(list(cards.values()))
+
+    assert cards[f"{account_id}:portion-a"].balance_cents == 80_000
+    assert cards[f"{account_id}:portion-b"].balance_cents == 20_000
+    assert account_id not in cards
+    assert dashboard["total_balance_cents"] == 100_000
+    assert dashboard["portion_over_allocations"] == [
+        {
+            "card_id": f"{account_id}:portion-b",
+            "label": "Test Bank Rewards: Installment B",
+            "parent_account_id": account_id,
+            "portion_id": "portion-b",
+            "over_allocated_cents": 30_000,
+        }
+    ]
 
 
 def test_compute_dashboard_totals_weighted_avg_unknown_apr() -> None:

@@ -20,6 +20,10 @@ class ExtractOptions:
     require_reconciled: bool = False
     institution_hint: str | None = None
     card_ending_hint: str | None = None
+    db_path: str | Path | None = None
+    import_batch_id: str | None = None
+    api_key: str | None = None
+    ai_egress_mode: str | None = None
 
 
 @dataclass(frozen=True)

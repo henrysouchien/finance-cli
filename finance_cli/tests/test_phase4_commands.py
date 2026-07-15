@@ -48,8 +48,26 @@ def test_subscriptions_detect_total_and_cancel(tmp_path: Path, monkeypatch, caps
     assert total["data"]["monthly_burn_cents"] > 0
 
     sub_id = listed["data"]["subscriptions"][0]["id"]
-    canceled = _run_cli(["subs", "cancel", sub_id], capsys)
+    sub_id_prefix = sub_id[:8]
+    updated = _run_cli(["subs", "update", sub_id_prefix, "--amount", "17.99", "--use-type", "Business"], capsys)
+    assert updated["status"] == "success"
+    assert updated["command"] == "subs.update"
+    assert updated["data"]["subscription_id"] == sub_id
+    assert updated["data"]["changes"]["amount"]["new"] == 17.99
+    assert updated["data"]["changes"]["use_type"]["new"] == "Business"
+
+    with connect(db_path) as conn:
+        row = conn.execute(
+            "SELECT amount_cents, use_type, is_active FROM subscriptions WHERE id = ?",
+            (sub_id,),
+        ).fetchone()
+        assert int(row["amount_cents"]) == 1799
+        assert row["use_type"] == "Business"
+        assert int(row["is_active"]) == 1
+
+    canceled = _run_cli(["subs", "cancel", sub_id_prefix], capsys)
     assert canceled["status"] == "success"
+    assert canceled["data"]["subscription_id"] == sub_id
 
 
 def test_plan_create_show_review(tmp_path: Path, monkeypatch, capsys) -> None:

@@ -195,14 +195,14 @@ def test_alias_created_with_type_fallback_when_card_ending_not_numeric(tmp_path:
                 "Date": "2026-02-18",
                 "Description": "DINNER",
                 "Amount": "-50.00",
-                "Card Ending": "Amex",
+                "Card Ending": "",
                 "Account Type": "credit_card",
                 "Source": "Amex",
                 "Is Payment": "false",
             }
         ]
         import_normalized_rows(conn, rows, source_name="Amex", validate_name=False)
-        hash_account_id = _account_id_for_source("Amex", "Amex")
+        hash_account_id = _account_id_for_source("Amex", "")
         alias = conn.execute(
             "SELECT canonical_id FROM account_aliases WHERE hash_account_id = ?",
             (hash_account_id,),
@@ -368,7 +368,7 @@ def test_account_name_is_clean_for_new_hash_accounts(tmp_path: Path) -> None:
                     "Date": "2026-02-18",
                     "Description": "APPLE PURCHASE",
                     "Amount": "-2.00",
-                    "Card Ending": "Apple",
+                    "Card Ending": "",
                     "Account Type": "credit_card",
                     "Source": "Apple Card",
                     "Is Payment": "false",
@@ -393,7 +393,7 @@ def test_account_name_is_clean_for_new_hash_accounts(tmp_path: Path) -> None:
             source_name="Chase",
             validate_name=False,
         )
-        apple_id = _account_id_for_source("Apple Card", "Apple")
+        apple_id = _account_id_for_source("Apple Card", "")
         chase_id = _account_id_for_source("Chase", "0368")
         apple_name = conn.execute(
             "SELECT account_name FROM accounts WHERE id = ?",
@@ -409,7 +409,7 @@ def test_account_name_is_clean_for_new_hash_accounts(tmp_path: Path) -> None:
 
 
 def test_account_id_hash_regression_stable() -> None:
-    assert _account_id_for_source("Apple Card", "Apple") == "ebd916058bbc04f803c40585"
+    assert _account_id_for_source("Apple Card", "") == "a471c6e88014d681131e001e"
     assert _account_id_for_source("BofA Checking", "") == _account_id_for_source(
         "Bank of America",
         "",

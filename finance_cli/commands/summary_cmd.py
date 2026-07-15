@@ -15,7 +15,15 @@ def register(subparsers, format_parent) -> None:
     parser.set_defaults(func=handle_summary, command_name="summary")
 
 
-def _query_balances(conn: sqlite3.Connection) -> dict[str, int]:
+def _manual_loan_view_clause(view: str) -> str:
+    if view == "personal":
+        return "AND use_type = 'Personal'"
+    if view == "business":
+        return "AND use_type = 'Business'"
+    return ""
+
+
+def _query_balances(conn: sqlite3.Connection, view: str) -> dict[str, int]:
     """Query account balances by type, excluding aliases."""
     rows = conn.execute(
         """
@@ -49,11 +57,23 @@ def _query_balances(conn: sqlite3.Connection) -> dict[str, int]:
             if total > 0:
                 asset_cents += total
 
+    manual_loan_row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(current_balance_cents), 0) AS total_cents
+          FROM manual_loans
+         WHERE is_active = 1
+           {_manual_loan_view_clause(view)}
+        """
+    ).fetchone()
+    manual_loans_cents = int(manual_loan_row["total_cents"])
+    liability_cents += manual_loans_cents
+
     return {
         "liquid_cash_cents": liquid_cents,
         "investment_cents": investment_cents,
         "asset_cents": asset_cents,
         "liability_cents": liability_cents,
+        "manual_loans_cents": manual_loans_cents,
         "net_worth_cents": asset_cents - liability_cents,
     }
 
@@ -124,7 +144,7 @@ def _query_subscriptions(conn: sqlite3.Connection) -> int:
     return total
 
 
-def _query_debt_minimums(conn: sqlite3.Connection) -> int:
+def _query_debt_minimums(conn: sqlite3.Connection, view: str) -> int:
     """Sum liability minimum payments."""
     row = conn.execute(
         """
@@ -133,7 +153,19 @@ def _query_debt_minimums(conn: sqlite3.Connection) -> int:
          WHERE is_active = 1
         """
     ).fetchone()
-    return int(row["total_cents"])
+    total_min_cents = int(row["total_cents"])
+
+    loan_min_row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(monthly_payment_cents), 0) AS total_cents
+          FROM manual_loans
+         WHERE is_active = 1
+           AND monthly_payment_cents IS NOT NULL
+           {_manual_loan_view_clause(view)}
+        """
+    ).fetchone()
+    total_min_cents += int(loan_min_row["total_cents"])
+    return total_min_cents
 
 
 def _query_data_health(conn: sqlite3.Connection) -> dict[str, Any]:
@@ -226,13 +258,13 @@ def _build_cli_report(data: dict[str, Any]) -> str:
 
 def handle_summary(args, conn: sqlite3.Connection) -> dict[str, Any]:
     """Financial health dashboard."""
-    view = getattr(args, "view", "all")
+    view = args.get("view", "all") if isinstance(args, dict) else getattr(args, "view", "all")
 
-    balances = _query_balances(conn)
+    balances = _query_balances(conn, view)
     cash_flow = _query_cash_flow(conn, view)
     recurring_cents = _query_recurring_obligations(conn)
     subs_cents = _query_subscriptions(conn)
-    debt_min_cents = _query_debt_minimums(conn)
+    debt_min_cents = _query_debt_minimums(conn, view)
     health = _query_data_health(conn)
 
     income_30d = cash_flow["income_30d_cents"]
@@ -261,6 +293,8 @@ def handle_summary(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "assets_cents": balances["asset_cents"],
         "total_debt": cents_to_dollars(balances["liability_cents"]),
         "total_debt_cents": balances["liability_cents"],
+        "manual_loans": cents_to_dollars(balances["manual_loans_cents"]),
+        "manual_loans_cents": balances["manual_loans_cents"],
         "liquid_cash": cents_to_dollars(balances["liquid_cash_cents"]),
         "liquid_cash_cents": balances["liquid_cash_cents"],
         "investments": cents_to_dollars(balances["investment_cents"]),

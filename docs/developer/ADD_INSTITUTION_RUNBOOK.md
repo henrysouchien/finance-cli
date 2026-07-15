@@ -41,7 +41,7 @@ Answer these 5 questions by looking at the sample data (repeat for each account 
 | **2. Column mapping?** | Which columns map to Date, Description, Amount | Apple Card: `Transaction Date`, `Description`, `Amount (USD)` |
 | **3. Sign convention?** | Are expenses positive or negative? | Apple Card: expenses positive (inverted), Barclays: expenses negative (correct) |
 | **4. Payment detection?** | How to identify payment/credit rows | Apple Card: `Type == "Payment"`, Barclays: description contains "Payment Received" |
-| **5. Card ending / account ID?** | Is there a card number or account identifier? | Barclays: account number in header junk, Apple Card: hardcoded "Apple" |
+| **5. Card ending / account ID?** | Is there a card number or account identifier? | Barclays: account number in header junk, Apple Card: empty string (no card number available) |
 
 ## Step 4: Write the Normalizer
 
@@ -66,6 +66,13 @@ Key rules:
 - **Amount via Decimal**: use `_parse_amount()` and `_format_amount()` helpers
 - **Account Type**: emit `"Account Type"` in every row (`"credit_card"`, `"checking"`, `"savings"`). This is used by the alias system to match hash accounts to Plaid accounts.
 - **Skip rows missing date/description/amount**: increment `skipped_row_count`, add warning
+
+## Card Ending Guidelines
+
+- **Preferred**: extract the last 4 digits from the card or account number. This enables automatic Plaid matching.
+- **If no card number is available**: emit an empty string `""`. Do not use the institution name, brand, or another placeholder.
+- **Storage guard**: the import layer scrubs non-numeric values to `NULL` before writing `accounts.card_ending`. Only 4-digit numeric values are stored.
+- **Hash identity**: `Card Ending` participates in `_account_id_for_source()`. Changing it for an existing institution requires a migration that pre-computes old and new hashes and bridges them with `account_aliases`. Use `finance_cli/migrations/051_scrub_card_ending.sql` as the pattern.
 
 ## Step 5: Register in the Map
 
@@ -183,7 +190,7 @@ Format analysis:
 - Column names: <list the CSV column headers>
 - Sign convention: <positive = expense or income?>
 - Payment detection: <how to identify payments>
-- Card ending: <where to find it, or hardcoded value>
+- Card ending: <where to find it, or empty string if unavailable>
 - Date format: <MM/DD/YYYY, etc.>
 
 Follow the existing patterns in:

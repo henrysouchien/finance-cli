@@ -369,7 +369,7 @@ def test_mcp_account_set_business_updates_flag_and_backfill(tmp_path: Path, monk
 
     from finance_cli.mcp_server import account_set_business
 
-    result = account_set_business(account_id=account_id, is_business=True, backfill=True)
+    result = account_set_business(id=account_id, is_business=True, backfill=True)
     assert result["data"]["new_is_business"] == 1
     assert result["data"]["backfill"]["transactions_updated"] == 1
 

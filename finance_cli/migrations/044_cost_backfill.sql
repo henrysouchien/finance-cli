@@ -1,0 +1,4 @@
+-- 044_cost_backfill.sql
+-- Placeholder migration. The actual backfill runs in db.py via
+-- _apply_special_migration(), because it estimates costs from legacy rows
+-- and must be safe to re-run with INSERT OR IGNORE semantics.

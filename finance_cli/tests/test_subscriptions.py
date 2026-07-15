@@ -3,7 +3,9 @@ from __future__ import annotations
 import uuid
 from datetime import date, timedelta
 from pathlib import Path
+from types import SimpleNamespace
 
+from finance_cli.commands import subs as subs_cmd
 from finance_cli.db import connect, initialize_database
 from finance_cli.subscriptions import (
     _build_cluster_group,
@@ -14,6 +16,7 @@ from finance_cli.subscriptions import (
     _prefix_merge_match,
     detect_recurring_patterns,
     detect_subscriptions,
+    subscription_spend_history,
 )
 
 
@@ -103,6 +106,17 @@ def _build_group(conn, *, description: str, category_id: str, txns: list[tuple[s
 
 def _iso_days_ago(days: int) -> str:
     return (date.today() - timedelta(days=days)).isoformat()
+
+
+def _month_keys_for_today(months: int) -> list[str]:
+    anchor = date.today().replace(day=1)
+    keys: list[str] = []
+    for offset in range(months - 1, -1, -1):
+        current = anchor
+        for _ in range(offset):
+            current = (current - timedelta(days=1)).replace(day=1)
+        keys.append(current.strftime("%Y-%m"))
+    return keys
 
 
 def test_vendor_clustering_merges_prefix_token_first_token_and_respects_category_gate(tmp_path: Path) -> None:
@@ -1502,3 +1516,254 @@ def test_detect_subscriptions_returns_metered_count(tmp_path: Path) -> None:
     assert len(rows) == 1
     assert str(rows[0]["sub_type"]) == "metered"
     assert int(rows[0]["is_active"]) == 1
+
+
+def test_subscription_spend_history_rolls_up_actual_subscription_transactions_without_marking_recurring(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    with connect(db_path) as conn:
+        software = _add_category(conn, "Software & Subscriptions")
+        for txn_date, amount_cents in (
+            ("2025-12-10", -2_000),
+            ("2026-01-10", -2_000),
+            ("2026-02-10", -2_000),
+            ("2026-03-10", -2_500),
+            ("2026-04-10", -2_500),
+            ("2026-05-10", -2_500),
+            ("2026-06-10", -2_500),
+        ):
+            _add_transaction(
+                conn,
+                txn_date=txn_date,
+                description="Acme Cloud Subscription",
+                amount_cents=amount_cents,
+                category_id=software,
+            )
+        conn.commit()
+
+        history = subscription_spend_history(
+            conn,
+            months=7,
+            as_of=date(2026, 6, 20),
+            essential_categories=frozenset(),
+        )
+        recurring_count = conn.execute(
+            "SELECT COALESCE(SUM(is_recurring), 0) AS recurring_count FROM transactions"
+        ).fetchone()
+
+    assert history["months"] == [
+        "2025-12",
+        "2026-01",
+        "2026-02",
+        "2026-03",
+        "2026-04",
+        "2026-05",
+        "2026-06",
+    ]
+    assert history["totals_cents"]["2025-12"] == 2_000
+    assert history["totals_cents"]["2026-06"] == 2_500
+    assert history["discretionary_cents"]["2026-06"] == 2_500
+    assert history["transaction_count"] == 7
+    assert int(recurring_count["recurring_count"]) == 0
+
+
+def test_subscription_spend_history_filters_recurring_non_subscription_categories(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    with connect(db_path) as conn:
+        software = _add_category(conn, "Software")
+        groceries = _add_category(conn, "Groceries")
+        for txn_date in ("2026-01-05", "2026-02-05", "2026-03-05", "2026-04-05"):
+            _add_transaction(
+                conn,
+                txn_date=txn_date,
+                description="Acme Cloud",
+                amount_cents=-2_000,
+                category_id=software,
+            )
+            _add_transaction(
+                conn,
+                txn_date=txn_date,
+                description="Corner Market",
+                amount_cents=-10_000,
+                category_id=groceries,
+            )
+        conn.commit()
+
+        history = subscription_spend_history(
+            conn,
+            months=4,
+            as_of=date(2026, 4, 20),
+            essential_categories=frozenset(),
+        )
+
+    assert history["totals_cents"] == {
+        "2026-01": 2_000,
+        "2026-02": 2_000,
+        "2026-03": 2_000,
+        "2026-04": 2_000,
+    }
+    assert history["transaction_count"] == 4
+
+
+def test_subscription_spend_history_spreads_annual_renewals_to_monthly_burn(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    with connect(db_path) as conn:
+        software = _add_category(conn, "Software")
+        for txn_date in ("2024-05-10", "2025-05-10", "2026-05-10"):
+            _add_transaction(
+                conn,
+                txn_date=txn_date,
+                description="Acme Annual Plan",
+                amount_cents=-120_000,
+                category_id=software,
+            )
+        conn.commit()
+
+        history = subscription_spend_history(
+            conn,
+            months=7,
+            as_of=date(2026, 6, 20),
+            essential_categories=frozenset(),
+        )
+
+    assert history["months"] == [
+        "2025-12",
+        "2026-01",
+        "2026-02",
+        "2026-03",
+        "2026-04",
+        "2026-05",
+        "2026-06",
+    ]
+    assert set(history["totals_cents"].values()) == {10_000}
+    assert history["transaction_count"] == 3
+
+
+def test_handle_history_merges_transaction_history_with_manual_subscription_rows(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    month_keys = _month_keys_for_today(3)
+    with connect(db_path) as conn:
+        software = _add_category(conn, "Software")
+        utilities = _add_category(conn, "Utilities")
+        for month in month_keys:
+            _add_transaction(
+                conn,
+                txn_date=f"{month}-10",
+                description="Acme Cloud",
+                amount_cents=-2_000,
+                category_id=software,
+            )
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                id, vendor_name, category_id, amount_cents, frequency, is_active, is_auto_detected
+            ) VALUES (?, 'Water', ?, 1000, 'monthly', 1, 0)
+            """,
+            (uuid.uuid4().hex, utilities),
+        )
+        conn.commit()
+
+        result = subs_cmd.handle_history(SimpleNamespace(months=3), conn)
+
+    assert result["data"]["months"] == month_keys
+    assert result["data"]["totals_cents"] == {month: 3_000 for month in month_keys}
+    assert result["data"]["essential_cents"] == {month: 1_000 for month in month_keys}
+    assert result["data"]["discretionary_cents"] == {month: 2_000 for month in month_keys}
+    assert result["summary"]["source"] == "transactions"
+    assert result["summary"]["transaction_count"] == 3
+
+
+def test_handle_history_does_not_double_count_manual_row_matching_detected_history(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    month_keys = _month_keys_for_today(3)
+    with connect(db_path) as conn:
+        streaming = _add_category(conn, "Streaming")
+        for month in month_keys:
+            _add_transaction(
+                conn,
+                txn_date=f"{month}-10",
+                description="Netflix",
+                amount_cents=-1_599,
+                category_id=streaming,
+            )
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                id, vendor_name, category_id, amount_cents, frequency, is_active, is_auto_detected
+            ) VALUES (?, 'Netflix', ?, 1599, 'monthly', 1, 0)
+            """,
+            (uuid.uuid4().hex, streaming),
+        )
+        conn.commit()
+
+        result = subs_cmd.handle_history(SimpleNamespace(months=3), conn)
+
+    assert result["data"]["totals_cents"] == {month: 1_599 for month in month_keys}
+    assert result["summary"]["source"] == "transactions"
+    assert result["summary"]["transaction_count"] == 3
+
+
+def test_handle_history_keeps_distinct_manual_subscription_with_same_vendor_token_and_amount(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    month_keys = _month_keys_for_today(3)
+    with connect(db_path) as conn:
+        software = _add_category(conn, "Software")
+        for month in month_keys:
+            _add_transaction(
+                conn,
+                txn_date=f"{month}-10",
+                description="Adobe Photoshop",
+                amount_cents=-1_999,
+                category_id=software,
+            )
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                id, vendor_name, category_id, amount_cents, frequency, is_active, is_auto_detected
+            ) VALUES (?, 'Adobe Acrobat', ?, 1999, 'monthly', 1, 0)
+            """,
+            (uuid.uuid4().hex, software),
+        )
+        conn.commit()
+
+        result = subs_cmd.handle_history(SimpleNamespace(months=3), conn)
+
+    assert result["data"]["totals_cents"] == {month: 3_998 for month in month_keys}
+    assert result["summary"]["source"] == "transactions"
+    assert result["summary"]["transaction_count"] == 3
+
+
+def test_handle_history_falls_back_to_projected_subscription_rows_without_transaction_history(
+    tmp_path: Path,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    with connect(db_path) as conn:
+        utilities = _add_category(conn, "Utilities")
+        conn.execute(
+            """
+            INSERT INTO subscriptions (
+                id, vendor_name, category_id, amount_cents, frequency, is_active
+            ) VALUES (?, 'Water', ?, 10000, 'monthly', 1)
+            """,
+            (uuid.uuid4().hex, utilities),
+        )
+        conn.commit()
+
+        result = subs_cmd.handle_history(SimpleNamespace(months=3), conn)
+
+    totals = result["data"]["totals_cents"]
+    essentials = result["data"]["essential_cents"]
+    assert set(totals.values()) == {10_000}
+    assert set(essentials.values()) == {10_000}
+    assert result["summary"] == {"months": 3}

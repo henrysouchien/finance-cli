@@ -7,20 +7,47 @@ import sqlite3
 from datetime import date
 from typing import Any
 
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..models import cents_to_dollars
-from ..stripe_client import (
-    StripeSyncError,
-    StripeUnavailableError,
-    balance_status,
-    config_status,
-    link_connection,
-    run_sync,
-    unlink_connection,
-)
 
 _MONTH_RE = re.compile(r"^(\d{4})-(\d{2})$")
 _QUARTER_RE = re.compile(r"^(\d{4})-Q([1-4])$")
 _YEAR_RE = re.compile(r"^\d{4}$")
+
+
+def _stripe_client_attr(name: str):
+    from .. import stripe_client
+
+    return getattr(stripe_client, name)
+
+
+def _stripe_sync_error() -> type[Exception]:
+    return _stripe_client_attr("StripeSyncError")
+
+
+def _stripe_unavailable_error() -> type[Exception]:
+    return _stripe_client_attr("StripeUnavailableError")
+
+
+def balance_status(*args, **kwargs):
+    return _stripe_client_attr("balance_status")(*args, **kwargs)
+
+
+def config_status(*args, **kwargs):
+    return _stripe_client_attr("config_status")(*args, **kwargs)
+
+
+def link_connection(*args, **kwargs):
+    return _stripe_client_attr("link_connection")(*args, **kwargs)
+
+
+def run_sync(*args, **kwargs):
+    return _stripe_client_attr("run_sync")(*args, **kwargs)
+
+
+def unlink_connection(*args, **kwargs):
+    return _stripe_client_attr("unlink_connection")(*args, **kwargs)
 
 
 def _sync_cli_report(result: dict[str, Any]) -> str:
@@ -55,6 +82,16 @@ def _status_cli_report(data: dict[str, Any]) -> str:
         pending = int(data["balance"].get("pending_cents") or 0)
         line += f" available=${cents_to_dollars(available):,.2f} pending=${cents_to_dollars(pending):,.2f}"
     return line
+
+
+def _sanitize_connection(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    if row is None:
+        return None
+    connection = dict(row)
+    connection["has_api_key_ref"] = bool(connection.get("api_key_ref"))
+    connection.pop("api_key_ref", None)
+    connection.pop("sync_cursor", None)
+    return connection
 
 
 def _quarter_bounds(quarter: str) -> tuple[str, str]:
@@ -121,15 +158,18 @@ def register(subparsers, format_parent) -> None:
     stripe_sub = parser.add_subparsers(dest="stripe_command", required=True)
 
     p_link = stripe_sub.add_parser("link", parents=[format_parent], help="Connect Stripe account")
+    p_link.add_argument("--user-id", help="User ID for Secrets Manager-backed Stripe credentials")
     p_link.set_defaults(func=handle_link, command_name="stripe.link")
 
     p_sync = stripe_sub.add_parser("sync", parents=[format_parent], help="Sync Stripe balance transactions")
+    p_sync.add_argument("--user-id", help="User ID for Secrets Manager-backed Stripe credentials")
     p_sync.add_argument("--days", type=int, help="Sync last N days (overrides cursor)")
     p_sync.add_argument("--force", "-f", action="store_true", help="Bypass cooldown")
     p_sync.add_argument("--backfill", action="store_true", help="Full history sync (ignores cursor)")
     p_sync.set_defaults(func=handle_sync, command_name="stripe.sync")
 
     p_status = stripe_sub.add_parser("status", parents=[format_parent], help="Stripe connection status")
+    p_status.add_argument("--user-id", help="User ID for Secrets Manager-backed Stripe credentials")
     p_status.set_defaults(func=handle_status, command_name="stripe.status")
 
     p_revenue = stripe_sub.add_parser("revenue", parents=[format_parent], help="Revenue breakdown by period")
@@ -139,12 +179,13 @@ def register(subparsers, format_parent) -> None:
     p_revenue.set_defaults(func=handle_revenue, command_name="stripe.revenue")
 
     p_unlink = stripe_sub.add_parser("unlink", parents=[format_parent], help="Disconnect Stripe")
+    p_unlink.add_argument("--user-id", help="User ID for Secrets Manager-backed Stripe credentials")
     p_unlink.set_defaults(func=handle_unlink, command_name="stripe.unlink")
 
 
 def handle_link(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    del args
-    status = config_status(conn)
+    user_id = getattr(args, "user_id", None)
+    status = config_status(conn, user_id=user_id) if user_id else config_status(conn)
     ready = status.has_sdk and status.configured
     if not status.has_sdk:
         return {
@@ -170,8 +211,8 @@ def handle_link(args, conn: sqlite3.Connection) -> dict[str, Any]:
         }
 
     try:
-        linked = link_connection(conn)
-    except StripeUnavailableError as exc:
+        linked = link_connection(conn, user_id=user_id) if user_id else link_connection(conn)
+    except _stripe_unavailable_error() as exc:
         raise ValueError(str(exc)) from exc
 
     data = {
@@ -184,21 +225,42 @@ def handle_link(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     return {
         "data": data,
-        "summary": {"ready": True, "connections": config_status(conn).connection_count},
+        "summary": {
+            "ready": True,
+            "connections": (config_status(conn, user_id=user_id) if user_id else config_status(conn)).connection_count,
+        },
         "cli_report": f"Connected to {linked.get('account_name')}",
     }
 
 
 def handle_sync(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    db_path = _connected_main_db_path(conn)
+    user_id = getattr(args, "user_id", None)
     try:
-        result = run_sync(
-            conn,
-            days=getattr(args, "days", None),
-            force=bool(getattr(args, "force", False)),
-            backfill=bool(getattr(args, "backfill", False)),
-        )
-    except (StripeUnavailableError, StripeSyncError) as exc:
+        kwargs: dict[str, Any] = {
+            "days": getattr(args, "days", None),
+            "force": bool(getattr(args, "force", False)),
+            "backfill": bool(getattr(args, "backfill", False)),
+        }
+        if user_id:
+            kwargs["user_id"] = user_id
+        result = run_sync(conn, **kwargs)
+    except (_stripe_unavailable_error(), _stripe_sync_error()) as exc:
+        log_event(db_path, "import.stripe_synced", outcome="failed")
         raise ValueError(str(exc)) from exc
+
+    log_event(
+        db_path,
+        "import.stripe_synced",
+        properties={
+            "txn_count": (
+                int(result.get("charges_added", 0))
+                + int(result.get("fees_added", 0))
+                + int(result.get("refunds_added", 0))
+                + int(result.get("adjustments_added", 0))
+            ),
+        },
+    )
 
     return {
         "data": result,
@@ -220,8 +282,8 @@ def handle_sync(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_status(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    del args
-    status = config_status(conn)
+    user_id = getattr(args, "user_id", None)
+    status = config_status(conn, user_id=user_id) if user_id else config_status(conn)
     try:
         connection_row = conn.execute(
             """
@@ -246,13 +308,13 @@ def handle_status(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "account_name": status.account_name,
         "transaction_count": int(txn_row["n"] or 0),
         "connection_status": str(connection_row["status"] or "not_linked") if connection_row else "not_linked",
-        "connection": dict(connection_row) if connection_row else None,
+        "connection": _sanitize_connection(connection_row),
         "balance": None,
     }
 
     if status.configured and status.has_sdk:
         try:
-            data["balance"] = balance_status()
+            data["balance"] = balance_status(conn, user_id=user_id) if user_id else balance_status()
         except Exception:
             data["balance"] = None
 

@@ -4,7 +4,6 @@ from __future__ import annotations
 
 import json
 import uuid
-from argparse import Namespace
 from pathlib import Path
 from unittest.mock import MagicMock, patch
 
@@ -146,7 +145,7 @@ class TestWithSync:
     def test_sync_calls_plaid_handlers(self, db_env, capsys):
         _seed_transactions(db_env)
         with patch("finance_cli.commands.monthly_cmd.backup_database"), \
-             patch("finance_cli.commands.monthly_cmd.config_status", create=True) as mock_cfg, \
+             patch("finance_cli.commands.monthly_cmd.config_status", create=True), \
              patch("finance_cli.commands.plaid_cmd.run_sync") as mock_sync, \
              patch("finance_cli.commands.plaid_cmd.refresh_balances") as mock_balance, \
              patch("finance_cli.commands.dedup_cmd.find_cross_format_duplicates") as mock_dedup:
@@ -174,6 +173,40 @@ class TestWithSync:
         assert steps["sync"]["status"] == "success"
         assert steps["balance"]["status"] == "success"
 
+    def test_dry_run_sync_skips_provider_writes(self, db_env, capsys):
+        _seed_transactions(db_env)
+        with patch(
+            "finance_cli.plaid_client.config_status",
+            side_effect=AssertionError("dry-run monthly sync should not check Plaid"),
+        ), patch(
+            "finance_cli.commands.plaid_cmd.handle_sync",
+            side_effect=AssertionError("dry-run monthly sync should not import"),
+        ), patch(
+            "finance_cli.commands.plaid_cmd.handle_balance_refresh",
+            side_effect=AssertionError("dry-run monthly sync should not refresh balances"),
+        ), patch(
+            "finance_cli.commands.dedup_cmd.find_cross_format_duplicates"
+        ) as mock_dedup:
+            mock_dedup.return_value = MagicMock(matches=[], as_dict=lambda: {"matches": []})
+
+            code, payload = _run_cli(
+                ["monthly", "run", "--sync", "--dry-run", "--format", "json"],
+                capsys,
+            )
+
+        assert code == 0
+        steps = payload["data"]["steps"]
+        assert steps["sync"] == {
+            "status": "skipped",
+            "result": None,
+            "error": "dry-run preview skips provider sync",
+        }
+        assert steps["balance"] == {
+            "status": "skipped",
+            "result": None,
+            "error": "dry-run preview skips balance refresh",
+        }
+
     def test_sync_plaid_not_configured(self, db_env, capsys):
         """Plaid not configured -> skipped gracefully, not error."""
         _seed_transactions(db_env)
@@ -199,16 +232,15 @@ class TestWithAI:
         _seed_transactions(db_env)
         captured_args = {}
 
-        original_handle = None
-
-        def fake_auto_categorize(ns, conn):
+        def fake_auto_categorize(ns, conn, rules_path=None):
+            del rules_path
             captured_args["ai"] = ns.ai
             captured_args["dry_run"] = ns.dry_run
             return _CAT_RESULT
 
         with patch("finance_cli.commands.monthly_cmd.backup_database"), \
              patch("finance_cli.commands.dedup_cmd.find_cross_format_duplicates") as mock_dedup, \
-             patch("finance_cli.commands.cat.handle_auto_categorize", side_effect=fake_auto_categorize) as mock_cat:
+             patch("finance_cli.commands.cat.handle_auto_categorize", side_effect=fake_auto_categorize):
             mock_dedup.return_value = MagicMock(matches=[], as_dict=lambda: {"matches": []})
             code, payload = _run_cli(
                 ["monthly", "run", "--ai", "--format", "json"], capsys
@@ -238,6 +270,37 @@ class TestWithExportDir:
         assert steps["export"]["status"] == "success"
         mock_wave.assert_called_once()
 
+    def test_dry_run_export_skips_file_writes(self, db_env, capsys, tmp_path):
+        _seed_transactions(db_env)
+        export_dir = str(tmp_path / "wave_out")
+        with patch(
+            "finance_cli.commands.export.handle_wave",
+            side_effect=AssertionError("dry-run monthly export should not write files"),
+        ), patch(
+            "finance_cli.commands.dedup_cmd.find_cross_format_duplicates"
+        ) as mock_dedup:
+            mock_dedup.return_value = MagicMock(matches=[], as_dict=lambda: {"matches": []})
+
+            code, payload = _run_cli(
+                [
+                    "monthly",
+                    "run",
+                    "--export-dir",
+                    export_dir,
+                    "--dry-run",
+                    "--format",
+                    "json",
+                ],
+                capsys,
+            )
+
+        assert code == 0
+        assert payload["data"]["steps"]["export"] == {
+            "status": "skipped",
+            "result": None,
+            "error": "dry-run preview skips export",
+        }
+
 
 class TestDryRun:
     """With --dry-run flag."""
@@ -252,7 +315,8 @@ class TestDryRun:
 
         cat_args_captured = {}
 
-        def fake_auto_categorize(ns, conn):
+        def fake_auto_categorize(ns, conn, rules_path=None):
+            del rules_path
             cat_args_captured["dry_run"] = ns.dry_run
             return _CAT_RESULT
 
@@ -267,6 +331,17 @@ class TestDryRun:
 
         # backup_database should NOT be called in dry-run mode
         mock_backup.assert_not_called()
+        assert code == 0
+        assert payload["data"]["dry_run"] is True
+        assert payload["cli_report"].splitlines()[0].startswith(
+            "[DRY RUN] Monthly Run Preview:"
+        )
+        assert "2 duplicates would be removed" in payload["cli_report"]
+        assert "34 would be categorized" in payload["cli_report"]
+        assert (
+            "24 subscriptions would be detected (5 new, 3 updates)"
+            in payload["cli_report"]
+        )
         assert dedup_args_captured["commit"] is False
         assert cat_args_captured["dry_run"] is True
 
@@ -415,6 +490,28 @@ class TestHealthChecks:
         assert health["budget_alert_count"] == 2
         assert health["budget_warn_count"] == 3
         assert "Budget check: 1 over budget, 2 at risk, 3 warnings" in payload["cli_report"]
+
+
+class TestPruningSafetyNet:
+    def test_monthly_run_calls_observability_prune_hooks(self, db_env, capsys):
+        _seed_transactions(db_env)
+        with patch("finance_cli.commands.monthly_cmd.backup_database"), \
+             patch("finance_cli.commands.dedup_cmd.find_cross_format_duplicates") as mock_dedup, \
+             patch("finance_cli.commands.monthly_cmd.prune_analytics") as mock_prune_analytics, \
+             patch("finance_cli.commands.monthly_cmd.prune_perf_samples") as mock_prune_perf, \
+             patch("finance_cli.commands.monthly_cmd.prune_frontend_logs") as mock_prune_frontend_logs, \
+             patch("finance_cli.commands.monthly_cmd.prune_errors") as mock_prune_errors, \
+             patch("finance_cli.commands.monthly_cmd.prune_cost_ledger") as mock_prune_cost:
+            mock_dedup.return_value = MagicMock(matches=[], as_dict=lambda: {"matches": []})
+
+            code, payload = _run_cli(["monthly", "run", "--format", "json"], capsys)
+
+        assert payload["status"] == "success"
+        mock_prune_analytics.assert_called_once()
+        mock_prune_perf.assert_called_once()
+        mock_prune_frontend_logs.assert_called_once()
+        mock_prune_errors.assert_called_once()
+        mock_prune_cost.assert_called_once()
 
 
 class TestJSONOutput:

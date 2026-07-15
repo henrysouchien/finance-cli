@@ -37,6 +37,7 @@ def _migrated_conn() -> sqlite3.Connection:
     conn = sqlite3.connect(":memory:")
     conn.row_factory = sqlite3.Row
     conn.execute("PRAGMA foreign_keys = ON")
+    conn.create_function("current_session_id", 0, lambda: "", deterministic=True)
     migration_dir = Path(__file__).resolve().parents[1] / "migrations"
     for path in sorted(migration_dir.glob("*.sql")):
         conn.executescript(path.read_text(encoding="utf-8"))
@@ -199,6 +200,9 @@ def test_status_returns_connection_info(monkeypatch) -> None:
         result = stripe_cmd.handle_status(_ns(), conn)
         assert result["data"]["configured"] is True
         assert result["data"]["connection"]["account_id"] == "acct_status_123"
+        assert result["data"]["connection"]["has_api_key_ref"] is True
+        assert "api_key_ref" not in result["data"]["connection"]
+        assert "sync_cursor" not in result["data"]["connection"]
         assert result["data"]["transaction_count"] == 1
         assert result["data"]["balance"]["available_cents"] == 12345
     finally:

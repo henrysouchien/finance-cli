@@ -8,11 +8,13 @@ from typing import Any
 
 import yaml
 
-from .config import DEFAULT_DATA_DIR, ensure_data_dir
+from .config import PACKAGE_TEMPLATE_DIR, ensure_data_dir
+from .storage_client import _dispatch as storage_dispatch
+from .storage_lease import current_lease_scope
 
 _EXTRACTOR_BACKENDS: tuple[str, ...] = ("ai", "azure", "bsc")
 
-_rules_cache: tuple[int, Path, UserRules] | None = None
+_rules_cache: dict[Path, tuple[int, UserRules]] | None = None
 
 
 def invalidate_rules_cache() -> None:
@@ -155,7 +157,7 @@ def _workspace_rules_path() -> Path:
 
 
 def _package_default_rules_path() -> Path:
-    return DEFAULT_DATA_DIR / "rules.yaml"
+    return PACKAGE_TEMPLATE_DIR / "rules_template.yaml"
 
 
 def resolve_rules_path(path: Path | None = None) -> Path:
@@ -176,23 +178,75 @@ def resolve_rules_path(path: Path | None = None) -> Path:
     return workspace_path
 
 
-def load_rules(path: Path | None = None) -> UserRules:
+def load_rules(path: Path | None = None, *, user_id: str | int | None = None, lease_scope=None) -> UserRules:
     """Load rules from YAML config and validate basic schema."""
     global _rules_cache
 
     rules_path = resolve_rules_path(path)
-    try:
-        stat_result = rules_path.stat()
-        mtime_ns = stat_result.st_mtime_ns
-        if _rules_cache is not None:
-            cache_mtime_ns, cache_path, cache_rules = _rules_cache
-            if cache_path == rules_path and cache_mtime_ns == mtime_ns:
-                return cache_rules
+    mtime_ns: int | None = None
+    remote_payload = _load_remote_rules_payload(user_id=user_id, lease_scope=lease_scope)
+    if remote_payload is not None:
+        payload = remote_payload
+    else:
+        try:
+            stat_result = rules_path.stat()
+            mtime_ns = stat_result.st_mtime_ns
+            cached = _rules_cache.get(rules_path) if _rules_cache is not None else None
+            if cached is not None:
+                cache_mtime_ns, cache_rules = cached
+                if cache_mtime_ns == mtime_ns:
+                    return cache_rules
 
-        payload = yaml.safe_load(rules_path.read_text(encoding="utf-8")) or {}
-    except FileNotFoundError:
-        _rules_cache = None
-        return _empty_rules()
+            payload = yaml.safe_load(rules_path.read_text(encoding="utf-8")) or {}
+        except FileNotFoundError:
+            if _rules_cache is not None:
+                _rules_cache.pop(rules_path, None)
+                if not _rules_cache:
+                    _rules_cache = None
+            return _empty_rules()
+
+    return _parse_rules_payload(
+        payload,
+        cache_path=None if remote_payload is not None else rules_path,
+        mtime_ns=mtime_ns,
+    )
+
+
+def _load_remote_rules_payload(*, user_id: str | int | None, lease_scope) -> dict[str, Any] | None:
+    scope = lease_scope if lease_scope is not None else current_lease_scope()
+    if scope is None or scope.storage_mode != "remote":
+        return None
+    resolved_user_id = str(user_id or scope.user_id).strip()
+    if not resolved_user_id or str(scope.user_id) != resolved_user_id:
+        return None
+    target = storage_dispatch.storage_server_target()
+    if not target or not storage_dispatch.storage_client_enabled():
+        return None
+    from . import storage_files
+    from .storage_client import errors as storage_errors
+
+    try:
+        content = storage_files.read_file(
+            target,
+            user_id=resolved_user_id,
+            product="finance_cli",
+            relative_path="rules.yaml",
+        )
+    except storage_errors.StorageClientError as exc:
+        if str(exc.reason or "").strip() in {"rules.yaml", "not_found", "FileNotFoundError"}:
+            return {}
+        raise
+    return yaml.safe_load(content.decode("utf-8")) or {}
+
+
+def _parse_rules_payload(
+    payload: Any,
+    *,
+    cache_path: Path | None,
+    mtime_ns: int | None,
+) -> UserRules:
+    global _rules_cache
+    payload = payload or {}
 
     if not isinstance(payload, dict):
         raise ValueError("rules.yaml root must be a mapping")
@@ -382,7 +436,10 @@ def load_rules(path: Path | None = None) -> UserRules:
         extractors=extractors_raw,
         raw=payload,
     )
-    _rules_cache = (mtime_ns, rules_path, rules)
+    if _rules_cache is None:
+        _rules_cache = {}
+    if cache_path is not None and mtime_ns is not None:
+        _rules_cache[cache_path] = (mtime_ns, rules)
     return rules
 
 

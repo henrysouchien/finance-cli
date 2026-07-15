@@ -18,6 +18,7 @@ def test_json_envelope_contract(tmp_path: Path, capsys, monkeypatch) -> None:
 
     assert payload["status"] == "success"
     assert payload["command"] == "cat.list"
-    assert payload["version"] == "1.0.0"
+    from finance_cli import __version__
+    assert payload["version"] == __version__
     assert "data" in payload
     assert "summary" in payload

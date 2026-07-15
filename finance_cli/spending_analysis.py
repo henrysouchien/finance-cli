@@ -6,6 +6,7 @@ import sqlite3
 from dataclasses import dataclass
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 
 from .user_rules import load_rules
 
@@ -29,9 +30,9 @@ _EXCLUDED_CATEGORIES = frozenset({
 })
 
 
-def load_essential_categories() -> frozenset[str]:
+def load_essential_categories(rules_path: Path | None = None) -> frozenset[str]:
     """Load essential categories from rules.yaml, falling back to defaults."""
-    rules = load_rules()
+    rules = load_rules(path=rules_path) if rules_path is not None else load_rules()
     if not rules.raw:
         return _DEFAULT_ESSENTIAL_CATEGORIES
     if "essential_categories" not in rules.raw:
@@ -80,8 +81,17 @@ def category_spending_averages(
     conn: sqlite3.Connection,
     months: int = 3,
     as_of: date | None = None,
+    rules_path: Path | None = None,
+    use_type: str | None = None,
 ) -> list[CategorySpending]:
-    """Average monthly spend per category across last N complete calendar months."""
+    """Average monthly spend per category across last N complete calendar months.
+
+    ``use_type`` filters by the transactions.use_type column. Accepted values
+    mirror CLI view semantics: ``"Personal"`` matches rows tagged Personal OR
+    NULL (NULL-as-personal default), ``"Business"`` matches only Business
+    rows, and ``None`` returns all rows regardless of classification. Values
+    are case-insensitive; stored values are ``'Personal'`` / ``'Business'``.
+    """
     months = int(months)
     if months < 1:
         raise ValueError("months must be >= 1")
@@ -89,10 +99,21 @@ def category_spending_averages(
     as_of = as_of or date.today()
     end_of_last_complete_month = as_of.replace(day=1) - timedelta(days=1)
     start_of_window = _first_day_n_months_back(end_of_last_complete_month, months)
-    essential = load_essential_categories()
+    essential = load_essential_categories(rules_path=rules_path)
+
+    use_type_clause = ""
+    params: list[str] = [start_of_window.isoformat(), end_of_last_complete_month.isoformat()]
+    if use_type is not None:
+        normalized = str(use_type).strip().lower()
+        if normalized == "personal":
+            use_type_clause = " AND (t.use_type = 'Personal' OR t.use_type IS NULL)"
+        elif normalized == "business":
+            use_type_clause = " AND t.use_type = 'Business'"
+        else:
+            raise ValueError(f"use_type must be 'Personal', 'Business', or None; got {use_type!r}")
 
     rows = conn.execute(
-        """
+        f"""
         SELECT c.name,
                COALESCE(p.name, c.name) AS parent_name,
                c.is_income,
@@ -107,11 +128,12 @@ def category_spending_averages(
            AND c.is_income = 0
            AND t.date >= ?
            AND t.date <= ?
+           {use_type_clause}
          GROUP BY c.id
         HAVING total_cents > 0
          ORDER BY total_cents DESC
         """,
-        (start_of_window.isoformat(), end_of_last_complete_month.isoformat()),
+        tuple(params),
     ).fetchall()
 
     categories: list[CategorySpending] = []

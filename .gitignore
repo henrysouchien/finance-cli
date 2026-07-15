@@ -2,13 +2,40 @@ __pycache__/
 *.py[cod]
 .pytest_cache/
 .env
+.DS_Store
+.obsidian/
 
 finance_cli/data/finance.db
+finance_cli/data/finance_backup_*.db
+finance_cli/data/backups/
+finance_cli/data/agent_memory.md
+finance_cli/data/sessions/
 finance_cli/data/*.db-shm
 finance_cli/data/*.db-wal
+*.db-shm
+*.db-wal
 logs/
 inbox/
-exports/mcp_cache/
+exports/
 dist/
 build/
 *.egg-info/
+.venv/
+*.pid
+*.tsbuildinfo
+.claude/
+.gstack/
+finance.db
+finance_cli/data/skill_state.json
+finance_cli/data/rules_backup.yaml
+finance_cli/data/preferences_*.tar.gz
+finance_cli/db.db
+.context/
+.mcp.local.json
+data/gateway/*.sqlite3
+data/gateway/*.sqlite3-shm
+data/gateway/*.sqlite3-wal
+
+# AFCPE raw course materials — paid content, private, not for redistribution.
+# The paraphrased wiki under docs/afcpe/wiki/ is tracked (independent summary); only the raw mme1/ source is ignored.
+docs/afcpe/mme1/

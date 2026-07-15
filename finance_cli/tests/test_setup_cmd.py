@@ -1,10 +1,12 @@
 from __future__ import annotations
 
 import json
+from types import SimpleNamespace
 import uuid
 from pathlib import Path
 
 from finance_cli.__main__ import main
+from finance_cli.category_seed import CATEGORY_HIERARCHY, INCOME_NAMES
 from finance_cli.commands import setup_cmd
 from finance_cli.db import connect, initialize_database
 from finance_cli.plaid_client import PlaidConfigStatus
@@ -56,12 +58,12 @@ def test_setup_init_seeds_all_categories_with_hierarchy(tmp_path: Path, monkeypa
     assert len(rows) == len(CANONICAL_CATEGORIES)
     by_name = {str(row["name"]): row for row in rows}
 
-    for parent_name, children in setup_cmd._CATEGORY_HIERARCHY.items():
+    for parent_name, children in CATEGORY_HIERARCHY.items():
         parent_row = by_name[parent_name]
         assert parent_row["parent_id"] is None
         assert int(parent_row["level"]) == 0
         assert int(parent_row["is_system"]) == 1
-        expected_is_income = int(parent_name in setup_cmd._INCOME_NAMES)
+        expected_is_income = int(parent_name in INCOME_NAMES)
         assert int(parent_row["is_income"]) == expected_is_income
 
         for child_name in children:
@@ -69,7 +71,7 @@ def test_setup_init_seeds_all_categories_with_hierarchy(tmp_path: Path, monkeypa
             assert str(child_row["parent_id"]) == str(parent_row["id"])
             assert int(child_row["level"]) == 1
             assert int(child_row["is_system"]) == 1
-            expected_child_income = int(child_name in setup_cmd._INCOME_NAMES)
+            expected_child_income = int(child_name in INCOME_NAMES)
             assert int(child_row["is_income"]) == expected_child_income
 
 
@@ -158,6 +160,70 @@ def test_setup_init_does_not_overwrite_existing_env(tmp_path: Path, monkeypatch,
     assert env_path.read_text(encoding="utf-8") == original
 
 
+def test_handle_init_gateway_skips_env_and_rules(tmp_path: Path, monkeypatch) -> None:
+    db_path, env_path, rules_path = _configure_paths(tmp_path, monkeypatch)
+    initialize_database(db_path)
+
+    with connect(db_path) as conn:
+        result = setup_cmd.handle_init(SimpleNamespace(dry_run=False, gateway=True), conn)
+
+    assert result["data"]["env_template"]["skipped"] is True
+    assert result["data"]["rules_file"]["skipped"] is True
+    assert result["data"]["env_template"]["path"] is None
+    assert result["data"]["rules_file"]["path"] is None
+    assert env_path.exists() is False
+    assert rules_path.exists() is False
+
+    with connect(db_path) as conn:
+        count = conn.execute("SELECT COUNT(*) AS n FROM categories").fetchone()["n"]
+
+    assert count == len(CANONICAL_CATEGORIES)
+
+
+def test_handle_init_gateway_preserves_response_schema(tmp_path: Path, monkeypatch) -> None:
+    db_path, _, _ = _configure_paths(tmp_path, monkeypatch)
+    initialize_database(db_path)
+
+    with connect(db_path) as conn:
+        result = setup_cmd.handle_init(SimpleNamespace(dry_run=True, gateway=True), conn)
+
+    assert set(result["data"]["env_template"]) == {"path", "created", "would_create", "dry_run", "skipped"}
+    assert set(result["data"]["rules_file"]) == {
+        "path",
+        "created",
+        "source_path",
+        "would_create",
+        "dry_run",
+        "skipped",
+    }
+    assert result["data"]["env_template"]["path"] is None
+    assert result["data"]["env_template"]["created"] is False
+    assert result["data"]["env_template"]["would_create"] is False
+    assert result["data"]["env_template"]["dry_run"] is True
+    assert result["data"]["rules_file"]["path"] is None
+    assert result["data"]["rules_file"]["created"] is False
+    assert result["data"]["rules_file"]["source_path"] is None
+    assert result["data"]["rules_file"]["would_create"] is False
+    assert result["data"]["rules_file"]["dry_run"] is True
+
+
+def test_handle_init_cli_unchanged(tmp_path: Path, monkeypatch) -> None:
+    db_path, env_path, rules_path = _configure_paths(tmp_path, monkeypatch)
+    initialize_database(db_path)
+
+    with connect(db_path) as conn:
+        result = setup_cmd.handle_init(SimpleNamespace(dry_run=False), conn)
+
+    assert result["data"]["env_template"]["created"] is True
+    assert result["data"]["env_template"]["path"] == str(env_path.resolve())
+    assert "skipped" not in result["data"]["env_template"]
+    assert result["data"]["rules_file"]["created"] is True
+    assert result["data"]["rules_file"]["path"] == str(rules_path.resolve())
+    assert "skipped" not in result["data"]["rules_file"]
+    assert env_path.exists() is True
+    assert rules_path.exists() is True
+
+
 def test_setup_check_reports_missing_plaid_as_fail(tmp_path: Path, monkeypatch, capsys) -> None:
     _configure_paths(tmp_path, monkeypatch)
     monkeypatch.setattr(
@@ -226,6 +292,29 @@ def test_setup_connect_preflight_failure_does_not_open_browser(tmp_path: Path, m
     assert code == 1
     assert payload["status"] == "error"
     assert opened == []
+
+
+def test_setup_connect_preflight_failure_does_not_send_alerts(tmp_path: Path, monkeypatch, capsys) -> None:
+    _configure_paths(tmp_path, monkeypatch)
+    alert_calls: list[tuple[str, str]] = []
+    monkeypatch.setattr(
+        "finance_cli.error_capture.alerts",
+        SimpleNamespace(send=lambda body, channel: alert_calls.append((body, channel))),
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.config_status",
+        lambda: PlaidConfigStatus(configured=False, has_sdk=False, missing_env=["PLAID_CLIENT_ID"], env=None),
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd._aws_readiness",
+        lambda: {"ok": True, "region": "us-east-1", "region_source": "AWS_DEFAULT_REGION", "error": None},
+    )
+
+    code, payload = _run_cli(["setup", "connect", "--open-browser"], capsys)
+
+    assert code == 1
+    assert payload["status"] == "error"
+    assert alert_calls == []
 
 
 def test_setup_connect_aws_preflight_failure_does_not_open_browser(tmp_path: Path, monkeypatch, capsys) -> None:
@@ -477,7 +566,7 @@ def test_setup_status_delegates_to_db_and_plaid_handlers(tmp_path: Path, monkeyp
     _configure_paths(tmp_path, monkeypatch)
     monkeypatch.setattr(
         "finance_cli.commands.setup_cmd._run_env_checks",
-        lambda conn: {
+        lambda conn, db_path=None, rules_path=None: {
             "ready": True,
             "checks": [],
             "counts": {"ok": 1, "warn": 0, "fail": 0},
@@ -490,12 +579,148 @@ def test_setup_status_delegates_to_db_and_plaid_handlers(tmp_path: Path, monkeyp
     )
     monkeypatch.setattr(
         "finance_cli.commands.setup_cmd.plaid_cmd.handle_status",
-        lambda args, conn: {"data": {"items": [{"plaid_item_id": "item_1"}], "active_count": 1}},
+        lambda args, conn: {
+            "data": {
+                "items": [
+                    {
+                        "plaid_item_id": "item_1",
+                        "access_token_ref": "secret/item_1",
+                        "sync_cursor": "cursor-secret",
+                        "has_token_ref": True,
+                    }
+                ],
+                "active_count": 1,
+            }
+        },
     )
 
     code, payload = _run_cli(["setup", "status"], capsys)
     assert code == 0
     assert payload["status"] == "success"
     assert payload["data"]["db"] == {"transaction_counts": {"active": 7}}
-    assert payload["data"]["plaid"] == {"items": [{"plaid_item_id": "item_1"}], "active_count": 1}
+    assert payload["data"]["plaid"] == {
+        "items": [{"plaid_item_id": "item_1", "has_token_ref": True}],
+        "active_count": 1,
+        "token_missing_count": 0,
+    }
+    assert "access_token_ref" not in payload["data"]["plaid"]["items"][0]
+    assert "sync_cursor" not in payload["data"]["plaid"]["items"][0]
 
+
+def test_setup_status_env_check_uses_explicit_rules_path(tmp_path: Path, monkeypatch) -> None:
+    db_path, env_path, default_rules_path = _configure_paths(tmp_path, monkeypatch)
+    env_path.write_text("PLAID_CLIENT_ID=test\n", encoding="utf-8")
+    explicit_rules_path = tmp_path / "user" / "rules.yaml"
+    explicit_rules_path.parent.mkdir()
+    explicit_rules_path.write_text("{}\n", encoding="utf-8")
+    assert default_rules_path.exists() is False
+    initialize_database(db_path)
+
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.config_status",
+        lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd._aws_readiness",
+        lambda: {"ok": True, "region": "us-east-1", "region_source": "AWS_DEFAULT_REGION", "error": None},
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.db_cmd.handle_status",
+        lambda args, conn: {"data": {"transaction_counts": {"active": 1}}},
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.plaid_cmd.handle_status",
+        lambda args, conn: {"data": {"items": [{"status": "active"}], "active_count": 1}},
+    )
+
+    with connect(db_path) as conn:
+        setup_cmd._seed_canonical_categories(conn, dry_run=False)
+        conn.commit()
+
+        result = setup_cmd.handle_status(
+            SimpleNamespace(),
+            conn,
+            db_path=db_path,
+            rules_path=explicit_rules_path,
+        )
+
+    rules_check = next(check for check in result["data"]["env"]["checks"] if check["id"] == "rules")
+    assert result["summary"]["ready"] is True
+    assert rules_check["status"] == "OK"
+    assert str(explicit_rules_path.resolve()) in rules_check["detail"]
+    assert result["data"]["rules"] == {
+        "path": str(explicit_rules_path.resolve()),
+        "exists": True,
+    }
+    assert "rules.yaml missing" not in "\n".join(result["data"]["next_steps"])
+
+
+def test_setup_status_warns_when_active_plaid_item_missing_token_ref(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    _, _, rules_path = _configure_paths(tmp_path, monkeypatch)
+    rules_path.write_text("{}\n", encoding="utf-8")
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd._run_env_checks",
+        lambda conn, db_path=None, rules_path=None: {
+            "ready": True,
+            "checks": [],
+            "counts": {"ok": 1, "warn": 0, "fail": 0},
+            "next_steps": [],
+        },
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.db_cmd.handle_status",
+        lambda args, conn: {"data": {"transaction_counts": {"active": 7}}},
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd._category_coverage",
+        lambda conn: {
+            "expected_total": 2,
+            "present_count": 2,
+            "missing_count": 0,
+            "missing": [],
+        },
+    )
+    monkeypatch.setattr(
+        "finance_cli.commands.setup_cmd.plaid_cmd.handle_status",
+        lambda args, conn: {
+            "data": {
+                "items": [
+                    {
+                        "plaid_item_id": "item_missing_token",
+                        "institution_name": "Missing Token Bank",
+                        "status": "active",
+                        "access_token_ref": None,
+                        "sync_cursor": "cursor-secret",
+                        "has_token_ref": False,
+                        "token_missing": True,
+                    }
+                ],
+                "active_count": 1,
+                "token_missing_count": 1,
+            }
+        },
+    )
+
+    code, payload = _run_cli(["setup", "status"], capsys)
+    assert code == 0
+    assert payload["status"] == "success"
+    assert payload["data"]["plaid"]["token_missing_count"] == 1
+    assert payload["data"]["plaid"]["items"] == [
+        {
+            "plaid_item_id": "item_missing_token",
+            "institution_name": "Missing Token Bank",
+            "status": "active",
+            "has_token_ref": False,
+            "token_missing": True,
+        }
+    ]
+    assert payload["summary"]["plaid_token_missing_count"] == 1
+    assert payload["data"]["next_steps"] == [
+        "One Plaid item is active but missing its token reference; "
+        "run `finance_cli plaid unlink --item item_missing_token` and reconnect."
+    ]
+    assert "Plaid Items:   1 total, 1 active, 1 token missing" in payload["cli_report"]

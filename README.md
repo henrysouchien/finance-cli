@@ -3,7 +3,7 @@
 Personal finance CLI and MCP server for AI-assisted financial management.
 
 Import bank statements (Plaid, CSV, PDF), categorize transactions via rules + AI,
-track budgets, subscriptions, debt, and net worth. SQLite backend, 130 MCP tools
+track budgets, subscriptions, debt, and net worth. SQLite backend, 151 MCP tools
 for Claude Code integration.
 
 ## Features
@@ -15,7 +15,7 @@ for Claude Code integration.
 - **Subscription detection**: Fixed + metered recurring charge detection
 - **Business accounting**: P&L, Schedule C, estimated tax, 1099 tracking
 - **Net worth tracking**: Balance snapshots, investment accounts, projections
-- **130 MCP tools**: Full Claude Code integration for AI-assisted workflows
+- **151 MCP tools**: Full Claude Code integration for AI-assisted workflows
 
 ## Quick Start
 
@@ -58,10 +58,10 @@ OPENAI_API_KEY=...
 ANTHROPIC_API_KEY=...
 ```
 
-## MCP Server (Claude Code)
+## Local MCP (Claude Code)
 
 ```bash
-claude mcp add finance-cli -- python3 -m finance_cli.mcp_server
+claude mcp add finance-cli -- python3 -m finance_cli.mcp_local
 ```
 
 ## Documentation
@@ -79,4 +79,4 @@ claude mcp add finance-cli -- python3 -m finance_cli.mcp_server
 
 ## License
 
-MIT
+PolyForm Noncommercial 1.0.0

@@ -1,0 +1,2 @@
+-- 034_bot_sessions.sql (placeholder - real logic in db.py _apply_bot_sessions)
+-- See _apply_bot_sessions() in db.py

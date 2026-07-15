@@ -85,13 +85,13 @@ def _insert_account(conn, account_id: str) -> None:
 def test_apple_card_canonicalized() -> None:
     txn = _extract_single_txn(_parsed_payload(institution="Apple"))
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] is None
 
 
 def test_apple_card_variant_canonicalized() -> None:
     txn = _extract_single_txn(_parsed_payload(institution="Apple Card Inc"))
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] is None
 
 
 def test_barclays_canonicalized() -> None:
@@ -115,7 +115,7 @@ def test_canonical_card_ending_overrides_extracted() -> None:
         )
     )
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] == "1234"
 
 
 def test_punctuation_stripped_in_canonicalization() -> None:
@@ -128,7 +128,7 @@ def test_punctuation_stripped_in_canonicalization() -> None:
 def test_whitespace_variants_canonicalized() -> None:
     txn = _extract_single_txn(_parsed_payload(institution="  Apple   Card  "))
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] is None
 
 
 def test_statement_level_card_ending_used() -> None:
@@ -211,7 +211,7 @@ def test_derived_account_matches_csv_apple(tmp_path: Path) -> None:
             "Date": "2025-01-01",
             "Description": "Coffee",
             "Amount": "-1.00",
-            "Card Ending": "Apple",
+            "Card Ending": "",
             "Source": "Apple Card",
             "Is Payment": "false",
         }
@@ -438,7 +438,7 @@ def test_derived_account_matches_csv_amex(tmp_path: Path) -> None:
             "Date": "2025-01-01",
             "Description": "Coffee",
             "Amount": "-1.00",
-            "Card Ending": "Amex",
+            "Card Ending": "",
             "Source": "Amex",
             "Is Payment": "false",
         }
@@ -545,13 +545,13 @@ def test_goldman_sachs_canonicalized_to_apple_card() -> None:
     """Apple Card statements often say 'Goldman Sachs' as the issuing bank."""
     txn = _extract_single_txn(_parsed_payload(institution="Goldman Sachs"))
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] is None
 
 
 def test_goldman_sachs_bank_usa_canonicalized() -> None:
     txn = _extract_single_txn(_parsed_payload(institution="Goldman Sachs Bank USA"))
     assert txn["source"] == "Apple Card"
-    assert txn["card_ending"] == "Apple"
+    assert txn["card_ending"] is None
 
 
 def test_american_express_canonicalized_to_american_express() -> None:

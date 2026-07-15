@@ -11,6 +11,10 @@ from datetime import date as _date
 
 from .categorizer import normalize_description
 from .models import normalize_date
+from .transaction_heuristics import (
+    POSSIBLE_MULTI_PASSENGER_TRAVEL_FLAG,
+    duplicate_charge_review_flags,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -22,8 +26,6 @@ SOURCE_PRIORITY: dict[str, int] = {
     "plaid": 4,
     "pdf_import": 5,
 }
-
-
 @dataclass(frozen=True)
 class DedupMatch:
     keep_id: str
@@ -57,6 +59,60 @@ class DedupReport:
             "match_count": len(self.matches),
             "elapsed_ms": self.elapsed_ms,
             "matches": [match.as_dict() for match in self.matches],
+        }
+
+
+@dataclass
+class SameSourceGroupRow:
+    """Per-row detail within a same-source duplicate candidate group."""
+
+    transaction_id: str
+    date: str
+    description: str
+    amount_cents: int
+    source: str
+    created_at: str
+    keep: bool
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "transaction_id": self.transaction_id,
+            "date": self.date,
+            "description": self.description,
+            "amount_cents": self.amount_cents,
+            "source": self.source,
+            "created_at": self.created_at,
+            "keep": self.keep,
+        }
+
+
+@dataclass
+class SameSourceGroup:
+    account_id: str
+    institution_name: str
+    card_ending: str
+    date: str
+    amount_cents: int
+    normalized_desc: str
+    count: int
+    excess: int
+    rows: list[SameSourceGroupRow]
+    suspicion: str
+    review_flags: tuple[str, ...] = ()
+
+    def as_dict(self) -> dict[str, object]:
+        return {
+            "account_id": self.account_id,
+            "institution_name": self.institution_name,
+            "card_ending": self.card_ending,
+            "date": self.date,
+            "amount_cents": self.amount_cents,
+            "normalized_desc": self.normalized_desc,
+            "count": self.count,
+            "excess": self.excess,
+            "rows": [row.as_dict() for row in self.rows],
+            "suspicion": self.suspicion,
+            "review_flags": list(self.review_flags),
         }
 
 
@@ -95,6 +151,154 @@ def _pick_keeper(txn_a: sqlite3.Row, txn_b: sqlite3.Row) -> tuple[sqlite3.Row, s
     if a_key <= b_key:
         return txn_a, txn_b
     return txn_b, txn_a
+
+
+def _same_source_review_flags(count: int, normalized_desc: str) -> tuple[str, ...]:
+    return duplicate_charge_review_flags(count, normalized_desc)
+
+
+def _same_source_suspicion(
+    count: int,
+    amount_cents: int,
+    review_flags: tuple[str, ...] = (),
+) -> str:
+    abs_amount = abs(int(amount_cents))
+    if POSSIBLE_MULTI_PASSENGER_TRAVEL_FLAG in review_flags:
+        return "medium"
+    if count == 2 and abs_amount > 1000:
+        return "high"
+    if count == 2 or abs_amount > 1000:
+        return "medium"
+    return "low"
+
+
+def find_same_source_duplicates(
+    conn: sqlite3.Connection,
+    account_id: str | None = None,
+    min_amount_cents: int = 0,
+) -> list[SameSourceGroup]:
+    alias_rows = conn.execute(
+        "SELECT hash_account_id, canonical_id FROM account_aliases"
+    ).fetchall()
+    alias_map: dict[str, str] = {
+        str(row["hash_account_id"]): str(row["canonical_id"])
+        for row in alias_rows
+    }
+    reverse_aliases: dict[str, set[str]] = defaultdict(set)
+    for hash_account_id, canonical_id in alias_map.items():
+        reverse_aliases[canonical_id].add(hash_account_id)
+
+    where = [
+        "is_active = 1",
+        "account_id IS NOT NULL",
+        "source = 'csv_import'",
+        "parent_transaction_id IS NULL",
+    ]
+    params: list[object] = []
+    if account_id:
+        canonical = alias_map.get(account_id, account_id)
+        effective_ids = {account_id, canonical}
+        effective_ids.update(reverse_aliases.get(canonical, set()))
+        placeholders = ", ".join("?" for _ in sorted(effective_ids))
+        where.append(f"account_id IN ({placeholders})")
+        params.extend(sorted(effective_ids))
+
+    rows = conn.execute(
+        f"""
+        SELECT id, account_id, date, amount_cents, description, source, created_at
+          FROM transactions
+         WHERE {' AND '.join(where)}
+         ORDER BY account_id, date, amount_cents, description, created_at, id
+        """,
+        tuple(params),
+    ).fetchall()
+
+    account_ids = {str(row["account_id"]) for row in rows}
+    resolved_account_ids = {alias_map.get(account_id_value, account_id_value) for account_id_value in account_ids}
+    account_ids.update(resolved_account_ids)
+    account_lookup: dict[str, sqlite3.Row] = {}
+    if account_ids:
+        placeholders = ", ".join("?" for _ in sorted(account_ids))
+        account_rows = conn.execute(
+            f"""
+            SELECT id, institution_name, card_ending
+              FROM accounts
+             WHERE id IN ({placeholders})
+            """,
+            tuple(sorted(account_ids)),
+        ).fetchall()
+        account_lookup = {str(row["id"]): row for row in account_rows}
+
+    grouped: dict[tuple[str, str, int], list[sqlite3.Row]] = defaultdict(list)
+    for row in rows:
+        resolved_account_id = alias_map.get(str(row["account_id"]), str(row["account_id"]))
+        norm_date = normalize_date(str(row["date"]))
+        key = (resolved_account_id, norm_date, int(row["amount_cents"]))
+        grouped[key].append(row)
+
+    threshold = max(0, int(min_amount_cents or 0))
+    groups: list[SameSourceGroup] = []
+    for (resolved_account_id, norm_date, amount_cents), bucket in grouped.items():
+        if abs(amount_cents) < threshold:
+            continue
+
+        by_description: dict[str, list[sqlite3.Row]] = defaultdict(list)
+        for row in bucket:
+            by_description[normalize_description(str(row["description"] or ""))].append(row)
+
+        for norm_desc, desc_rows in by_description.items():
+            if len(desc_rows) <= 1:
+                continue
+
+            ordered_rows = sorted(
+                desc_rows,
+                key=lambda row: (str(row["created_at"] or ""), str(row["id"])),
+            )
+            group_rows = [
+                SameSourceGroupRow(
+                    transaction_id=str(row["id"]),
+                    date=str(row["date"]),
+                    description=str(row["description"] or ""),
+                    amount_cents=int(row["amount_cents"]),
+                    source=str(row["source"] or ""),
+                    created_at=str(row["created_at"] or ""),
+                    keep=idx == 0,
+                )
+                for idx, row in enumerate(ordered_rows)
+            ]
+
+            account_row = account_lookup.get(resolved_account_id)
+            if account_row is None and ordered_rows:
+                account_row = account_lookup.get(str(ordered_rows[0]["account_id"]))
+
+            review_flags = _same_source_review_flags(len(group_rows), norm_desc)
+            groups.append(
+                SameSourceGroup(
+                    account_id=resolved_account_id,
+                    institution_name=str(account_row["institution_name"] or "") if account_row else "",
+                    card_ending=str(account_row["card_ending"] or "") if account_row else "",
+                    date=norm_date,
+                    amount_cents=amount_cents,
+                    normalized_desc=norm_desc,
+                    count=len(group_rows),
+                    excess=len(group_rows) - 1,
+                    rows=group_rows,
+                    suspicion=_same_source_suspicion(len(group_rows), amount_cents, review_flags),
+                    review_flags=review_flags,
+                )
+            )
+
+    suspicion_rank = {"high": 0, "medium": 1, "low": 2}
+    groups.sort(
+        key=lambda group: (
+            suspicion_rank.get(group.suspicion, 99),
+            -abs(group.amount_cents),
+            group.account_id,
+            group.date,
+            group.normalized_desc,
+        )
+    )
+    return groups
 
 
 def find_cross_format_duplicates(
@@ -164,7 +368,7 @@ def find_cross_format_duplicates(
     }
     fuzzy_merged_keys: set[tuple[str, str, int]] = set()
 
-    # --- Neighbor-merge pass for +/-1 day date tolerance ---
+    # --- Neighbor-merge pass for +/-2 day date tolerance ---
     # Only merge leftover single-source groups with each other.
     # No interaction with exact-match groups - keeps logic simple and consistent.
     single_source = {k: v for k, v in all_grouped.items() if k not in grouped}
@@ -184,7 +388,7 @@ def find_cross_format_duplicates(
                     continue
                 if (acct, dt_b, amt) in claimed_neighbor_keys:
                     continue
-                if _date_offset_days(dt_a, dt_b) > 1:
+                if _date_offset_days(dt_a, dt_b) > 2:
                     continue
                 if src_a & src_b:
                     continue
@@ -392,12 +596,124 @@ def apply_dedup(
     return removed
 
 
+def apply_same_source_dedup(
+    conn: sqlite3.Connection,
+    ids: list[str],
+    candidate_ids: set[str],
+    groups: list[SameSourceGroup],
+) -> tuple[int, list[tuple[str, str]]]:
+    rejected: list[tuple[str, str]] = []
+    valid_ids: list[str] = []
+
+    for txn_id in ids:
+        if txn_id not in candidate_ids:
+            rejected.append((txn_id, "not in candidate set"))
+            continue
+        row = conn.execute(
+            """
+            SELECT 1
+              FROM transactions
+             WHERE id = ?
+               AND is_active = 1
+               AND source = 'csv_import'
+            """,
+            (txn_id,),
+        ).fetchone()
+        if row is None:
+            rejected.append((txn_id, "not active csv_import"))
+            continue
+        valid_ids.append(txn_id)
+
+    if not valid_ids:
+        return 0, rejected
+
+    group_by_id: dict[str, tuple[int, SameSourceGroup, SameSourceGroupRow]] = {}
+    for group_index, group in enumerate(groups):
+        for row in group.rows:
+            group_by_id[row.transaction_id] = (group_index, group, row)
+
+    valid_by_group: dict[int, list[str]] = defaultdict(list)
+    applicable_ids: list[str] = []
+    for txn_id in valid_ids:
+        mapping = group_by_id.get(txn_id)
+        if mapping is None:
+            rejected.append((txn_id, "not in candidate set"))
+            continue
+        valid_by_group[mapping[0]].append(txn_id)
+        applicable_ids.append(txn_id)
+
+    group_rejections: set[str] = set()
+    for group_index, group_ids in valid_by_group.items():
+        group = groups[group_index]
+        if not group_ids:
+            continue
+        member_ids = [row.transaction_id for row in group.rows]
+        placeholders = ", ".join("?" for _ in member_ids)
+        current_active_row = conn.execute(
+            f"""
+            SELECT COUNT(*) AS n
+              FROM transactions
+             WHERE id IN ({placeholders})
+               AND is_active = 1
+            """,
+            tuple(member_ids),
+        ).fetchone()
+        current_active = int(current_active_row["n"] if current_active_row else 0)
+        deactivation_count = len(group_ids)
+        if current_active - deactivation_count > 0:
+            continue
+
+        needed_rejections = deactivation_count - (current_active - 1)
+        row_lookup = {row.transaction_id: row for row in group.rows}
+        row_position = {
+            row.transaction_id: idx
+            for idx, row in enumerate(group.rows)
+        }
+        ordered_ids = sorted(
+            group_ids,
+            key=lambda txn_id: (
+                0 if row_lookup[txn_id].keep else 1,
+                row_position[txn_id],
+            ),
+        )
+        for txn_id in ordered_ids[:needed_rejections]:
+            group_rejections.add(txn_id)
+            rejected.append((txn_id, "would remove last surviving row from group"))
+
+    deactivated = 0
+    for txn_id in applicable_ids:
+        if txn_id in group_rejections:
+            continue
+        cursor = conn.execute(
+            """
+            UPDATE transactions
+               SET is_active = 0,
+                   notes = COALESCE(notes || ' | ', '') || 'same-source-dedup',
+                   removed_at = datetime('now'),
+                   updated_at = datetime('now')
+             WHERE id = ?
+               AND is_active = 1
+               AND source = 'csv_import'
+            """,
+            (txn_id,),
+        )
+        deactivated += int(cursor.rowcount or 0)
+
+    if deactivated:
+        conn.commit()
+    return deactivated, rejected
+
+
 __all__ = [
     "DedupMatch",
     "DedupReport",
+    "SameSourceGroup",
+    "SameSourceGroupRow",
     "SOURCE_PRIORITY",
     "_descriptions_match",
     "_pick_keeper",
+    "apply_same_source_dedup",
     "find_cross_format_duplicates",
+    "find_same_source_duplicates",
     "apply_dedup",
 ]

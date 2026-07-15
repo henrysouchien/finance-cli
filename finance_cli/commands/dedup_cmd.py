@@ -9,7 +9,14 @@ from itertools import combinations
 from typing import Any
 
 from ..db import backup_database
-from ..dedup import DedupMatch, apply_dedup, find_cross_format_duplicates
+from ..dedup import (
+    DedupMatch,
+    SameSourceGroup,
+    apply_dedup,
+    apply_same_source_dedup,
+    find_cross_format_duplicates,
+    find_same_source_duplicates,
+)
 from ..importers import _INSTITUTION_EQUIVALENTS, backfill_account_aliases, upsert_account_alias
 from ..institution_names import canonicalize, is_known, similar_names
 
@@ -35,6 +42,17 @@ def register(subparsers, format_parent) -> None:
         help="Include risky key_only matches when committing dedup changes",
     )
     p_cross.set_defaults(func=handle_cross_format, command_name="dedup.cross-format")
+
+    p_same_source = dedup_sub.add_parser(
+        "same-source",
+        parents=[format_parent],
+        help="Find same-source CSV duplicate candidates",
+    )
+    p_same_source.add_argument("--account-id")
+    p_same_source.add_argument("--min-amount", type=int, default=0, help="Min abs(amount_cents) filter")
+    p_same_source.add_argument("--commit", action="store_true", help="Deactivate specified IDs")
+    p_same_source.add_argument("--ids", help="Comma-separated transaction IDs to deactivate (requires --commit)")
+    p_same_source.set_defaults(func=handle_same_source, command_name="dedup.same-source")
 
     p_backfill = dedup_sub.add_parser(
         "backfill-aliases",
@@ -123,6 +141,39 @@ def _build_cli_report(
     if len(matches) > 50:
         lines.append(f"... {len(matches) - 50} more")
     return "\n".join(lines)
+
+
+def _build_same_source_cli_report(groups: list[SameSourceGroup]) -> str:
+    if not groups:
+        return "No same-source CSV duplicate candidates found"
+
+    lines = ["=== Same-Source Duplicate Candidates ===", ""]
+    for group in groups[:50]:
+        account_label = group.institution_name.strip() or group.account_id
+        if group.card_ending:
+            account_label = f"{account_label} {group.card_ending}"
+        amount = abs(group.amount_cents) / 100
+        lines.append(
+            f"[{group.suspicion.upper()}] {account_label} | {group.date} | ${amount:.2f} | "
+            f"{group.count} rows ({group.excess} excess)"
+        )
+        if "possible_multi_passenger_travel" in group.review_flags:
+            lines.append(
+                "  Review note: possible multi-passenger travel; confirm duplicate import before deactivating."
+            )
+        for row in group.rows:
+            label = "KEEP" if row.keep else "DUP "
+            created_at = row.created_at or "unknown"
+            row_amount = abs(row.amount_cents) / 100
+            lines.append(
+                f"  {label} {row.transaction_id}  {row.date}  ${row_amount:.2f}  "
+                f"{row.description}  (created {created_at})"
+            )
+        lines.append("")
+    if len(groups) > 50:
+        lines.append(f"... {len(groups) - 50} more (use --format json for full output)")
+    lines.append("To deactivate: dedup same-source --commit --ids <comma-separated-transaction-ids>")
+    return "\n".join(lines).rstrip()
 
 
 def _build_backfill_cli_report(report: dict[str, int], *, commit: bool) -> str:
@@ -401,6 +452,79 @@ def _build_review_key_only_cli_report(
     lines.append("")
     lines.append(f"To apply: {' '.join(apply_cmd)}")
     return "\n".join(lines)
+
+
+def handle_same_source(args, conn) -> dict[str, Any]:
+    ids_csv = str(getattr(args, "ids", "") or "").strip()
+    if args.commit and not ids_csv:
+        raise ValueError("--commit requires --ids")
+    if ids_csv and not args.commit:
+        raise ValueError("--ids requires --commit")
+
+    groups = find_same_source_duplicates(
+        conn,
+        account_id=args.account_id,
+        min_amount_cents=args.min_amount,
+    )
+
+    if args.commit:
+        raw_tokens = [token.strip() for token in ids_csv.split(",")]
+        if not raw_tokens or any(not token for token in raw_tokens):
+            raise ValueError("--ids cannot contain empty transaction ids")
+        requested_ids = list(dict.fromkeys(raw_tokens))
+        candidate_ids = {
+            row.transaction_id
+            for group in groups
+            for row in group.rows
+        }
+        backup_path = str(backup_database(conn=conn))
+        deactivated, rejected = apply_same_source_dedup(
+            conn,
+            requested_ids,
+            candidate_ids,
+            groups,
+        )
+        rejected_payload = [
+            {"id": txn_id, "reason": reason}
+            for txn_id, reason in rejected
+        ]
+        cli_lines = [f"Deactivated {deactivated} rows. Rejected: {len(rejected)}"]
+        for txn_id, reason in rejected[:50]:
+            cli_lines.append(f"{txn_id}: {reason}")
+        if len(rejected) > 50:
+            cli_lines.append(f"... {len(rejected) - 50} more rejected ids")
+        return {
+            "data": {
+                "deactivated": deactivated,
+                "rejected": rejected_payload,
+                "backup_path": backup_path,
+                "dry_run": False,
+                "account_id": args.account_id,
+                "min_amount": args.min_amount,
+            },
+            "summary": {
+                "deactivated": deactivated,
+                "rejected_count": len(rejected),
+            },
+            "cli_report": "\n".join(cli_lines),
+        }
+
+    total_excess = sum(group.excess for group in groups)
+    return {
+        "data": {
+            "groups": [group.as_dict() for group in groups],
+            "total_groups": len(groups),
+            "total_excess": total_excess,
+            "dry_run": True,
+            "account_id": args.account_id,
+            "min_amount": args.min_amount,
+        },
+        "summary": {
+            "total_groups": len(groups),
+            "total_excess_rows": total_excess,
+        },
+        "cli_report": _build_same_source_cli_report(groups),
+    }
 
 
 def handle_cross_format(args, conn) -> dict[str, Any]:

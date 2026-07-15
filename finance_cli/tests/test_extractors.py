@@ -184,6 +184,48 @@ def test_ai_extractor_forwards_require_reconciled(tmp_path: Path, monkeypatch) -
     assert captured == {"allow_partial": False, "require_reconciled": True}
 
 
+def test_ai_extractor_forwards_ai_egress_mode(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "stmt.pdf"
+    pdf_path.write_bytes(b"dummy")
+    captured: dict[str, Any] = {}
+
+    parsed = {
+        "statement": {"institution": "Citi", "currency": "USD"},
+        "transactions": [],
+        "extraction_meta": {"expected_transaction_count": 0},
+    }
+    validation = validate_ai_parse(parsed)
+
+    def _fake_ai_parse_statement(*_args, **kwargs):
+        captured["ai_egress_mode"] = kwargs.get("ai_egress_mode")
+        return AIParseResult(
+            raw_json=json.dumps(parsed),
+            parsed=parsed,
+            validation=validation,
+            provider="openai",
+            model="gpt-test",
+            prompt_version="v1",
+            prompt_hash="a" * 64,
+            extracted_text="statement text",
+        )
+
+    monkeypatch.setattr("finance_cli.extractors.ai_extractor.ai_parse_statement", _fake_ai_parse_statement)
+    monkeypatch.setattr(
+        "finance_cli.extractors.ai_extractor.ai_result_to_extract_result",
+        lambda *_a, **_k: ExtractResult(
+            transactions=[],
+            extracted_total_cents=0,
+            reconciled=True,
+            warnings=[],
+        ),
+    )
+
+    extractor = AIExtractor({"provider": "openai", "model": "gpt-test"})
+    extractor.extract(pdf_path, ExtractOptions(ai_egress_mode="redacted"))
+
+    assert captured == {"ai_egress_mode": "redacted"}
+
+
 def test_ai_extractor_reconcile_status_always_no_totals(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "stmt.pdf"
     pdf_path.write_bytes(b"dummy")

@@ -10,15 +10,15 @@ from pathlib import Path
 import pytest
 
 try:
-    import notify
-    from notify import config as notify_config
-    from notify.channels import imessage, telegram
+    import alerts
+    from alerts import config as alerts_config
+    from alerts.channels import imessage, telegram
 
-    _HAS_NOTIFY = True
+    _HAS_ALERTS = True
 except ImportError:
-    _HAS_NOTIFY = False
+    _HAS_ALERTS = False
 
-pytestmark = pytest.mark.skipif(not _HAS_NOTIFY, reason="notify module not installed")
+pytestmark = pytest.mark.skipif(not _HAS_ALERTS, reason="alerts module not installed")
 
 from finance_cli.__main__ import build_parser, main
 from finance_cli.budget_engine import set_budget
@@ -72,10 +72,23 @@ def test_send_telegram_posts_expected_payload(monkeypatch) -> None:
 
 
 def test_send_imessage_requires_binary(monkeypatch) -> None:
-    monkeypatch.setattr(imessage.os.path, "exists", lambda _path: False)
+    seen: dict[str, object] = {}
 
-    with pytest.raises(FileNotFoundError, match="imsg binary not found"):
-        imessage.send_imessage("hi", "+15551234567")
+    def fake_run(cmd, *, timeout, capture_output):
+        seen["cmd"] = cmd
+        seen["timeout"] = timeout
+        seen["capture_output"] = capture_output
+        return subprocess.CompletedProcess(args=cmd, returncode=0, stdout=b"", stderr=b"")
+
+    monkeypatch.setattr(imessage.os.path, "exists", lambda _path: False)
+    monkeypatch.setattr(imessage.subprocess, "run", fake_run)
+
+    result = imessage.send_imessage("hi", "+15551234567")
+
+    assert seen["cmd"][0] == "osascript"
+    assert seen["timeout"] == 10
+    assert seen["capture_output"] is True
+    assert result["backend"] == "applescript"
 
 
 def test_send_imessage_invokes_rpc(monkeypatch) -> None:
@@ -115,16 +128,16 @@ def test_notify_config_requires_environment(monkeypatch) -> None:
     monkeypatch.delenv("IMESSAGE_TARGET", raising=False)
 
     with pytest.raises(ValueError, match="TELEGRAM_BOT_TOKEN"):
-        notify_config.get_telegram_config()
+        alerts_config.get_telegram_config()
 
     with pytest.raises(ValueError, match="IMESSAGE_TARGET"):
-        notify_config.get_imessage_target()
+        alerts_config.get_imessage_target()
 
 
 def test_notify_send_dispatches_telegram_with_env(monkeypatch) -> None:
     seen: dict[str, str] = {}
 
-    monkeypatch.setattr(notify, "get_telegram_config", lambda: ("tok", "chat"))
+    monkeypatch.setattr(alerts, "get_telegram_config", lambda _env=None: ("tok", "chat"))
 
     def fake_send_telegram(message: str, token: str, chat_id: str) -> dict:
         seen["message"] = message
@@ -132,9 +145,9 @@ def test_notify_send_dispatches_telegram_with_env(monkeypatch) -> None:
         seen["chat_id"] = chat_id
         return {"ok": True, "message_id": 1}
 
-    monkeypatch.setattr(notify, "send_telegram", fake_send_telegram)
+    monkeypatch.setattr(alerts, "send_telegram", fake_send_telegram)
 
-    result = notify.send("ping", channel="telegram")
+    result = alerts.send("ping", channel="telegram")
 
     assert result["ok"] is True
     assert seen == {"message": "ping", "token": "tok", "chat_id": "chat"}
@@ -143,23 +156,35 @@ def test_notify_send_dispatches_telegram_with_env(monkeypatch) -> None:
 def test_notify_send_dispatches_imessage_with_kwargs(monkeypatch) -> None:
     seen: dict[str, str] = {}
 
-    def fake_send_imessage(message: str, target: str, service: str = "imessage") -> dict:
+    def fake_send_imessage(
+        message: str,
+        target: str,
+        service: str = "imessage",
+        *,
+        backend: str | None = None,
+    ) -> dict:
         seen["message"] = message
         seen["target"] = target
         seen["service"] = service
+        seen["backend"] = backend or ""
         return {"ok": True}
 
-    monkeypatch.setattr(notify, "send_imessage", fake_send_imessage)
+    monkeypatch.setattr(alerts, "send_imessage", fake_send_imessage)
 
-    result = notify.send("ping", channel="imessage", target="person@example.com", service="sms")
+    result = alerts.send("ping", channel="imessage", target="person@example.com", service="sms")
 
     assert result["ok"] is True
-    assert seen == {"message": "ping", "target": "person@example.com", "service": "sms"}
+    assert seen == {
+        "message": "ping",
+        "target": "person@example.com",
+        "service": "sms",
+        "backend": "",
+    }
 
 
 def test_notify_send_rejects_unknown_channel() -> None:
     with pytest.raises(ValueError, match="Unknown channel"):
-        notify.send("hello", channel="slack")
+        alerts.send("hello", channel="slack")
 
 
 def test_notify_cli_parser_registers_subcommands() -> None:
@@ -235,7 +260,7 @@ def test_notify_cmd_handle_test_calls_notify_send(monkeypatch) -> None:
         seen["channel"] = channel
         return {"ok": True}
 
-    monkeypatch.setattr(notify_cmd.notify, "send", fake_send)
+    monkeypatch.setattr(notify_cmd.alerts, "send", fake_send)
 
     result = notify_cmd.handle_test(Namespace(channel="telegram", dry_run=False), None)
 

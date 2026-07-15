@@ -85,6 +85,37 @@ def test_list_goals_with_data(db_path: Path) -> None:
     assert result["data"]["goals"][0]["name"] == "Fund"
 
 
+def test_abandon_goal_deactivates_and_logs_distinct_signal(db_path: Path) -> None:
+    with connect(db_path) as conn:
+        _seed_account(conn, account_type="checking", balance_cents=500_000)
+        goal_cmd.handle_set(
+            _ns(name="Fund", target=10000, metric="liquid_cash", direction="up", deadline=None),
+            conn,
+        )
+
+        result = goal_cmd.handle_abandon(_ns(name="Fund"), conn)
+
+        row = conn.execute(
+            "SELECT id, is_active FROM goals WHERE name = 'Fund'"
+        ).fetchone()
+        event = conn.execute(
+            """
+            SELECT event, outcome, json_extract(properties, '$.goal_id') AS goal_id,
+                   json_extract(properties, '$.goal_name') AS goal_name
+              FROM analytics_events
+             WHERE event = 'feature.goal_abandoned'
+            """
+        ).fetchone()
+
+    assert result["summary"] == {"name": "Fund", "abandoned": True}
+    assert row is not None
+    assert row["is_active"] == 0
+    assert event is not None
+    assert event["outcome"] == "abandoned"
+    assert event["goal_id"] == row["id"]
+    assert event["goal_name"] == "Fund"
+
+
 def test_status_up_goal(db_path: Path) -> None:
     """Status with an 'up' goal shows correct progress."""
     with connect(db_path) as conn:

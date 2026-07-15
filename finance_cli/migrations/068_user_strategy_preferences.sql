@@ -1,0 +1,2 @@
+-- Special migration handled in finance_cli.db.
+-- Creates the synced user_strategy_preferences table and its _sync_changelog triggers.

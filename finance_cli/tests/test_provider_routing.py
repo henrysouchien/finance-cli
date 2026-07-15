@@ -220,7 +220,7 @@ def test_refresh_balances_skips_none_accounts(tmp_path: Path, monkeypatch) -> No
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "token")
 
         out = refresh_balances(conn, item_id="item_refresh_skip")
         assert out["items_refreshed"] == 1

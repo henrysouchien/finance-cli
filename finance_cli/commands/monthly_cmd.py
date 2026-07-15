@@ -8,6 +8,7 @@ from argparse import Namespace
 from datetime import datetime
 from typing import Any
 
+from ..cost_tracking import prune_cost_ledger
 from ..db import backup_database
 from ..models import cents_to_dollars
 from ..subscriptions import subscription_burn
@@ -15,8 +16,32 @@ from ..subscriptions import subscription_burn
 logger = logging.getLogger(__name__)
 
 
+def prune_analytics(*args, **kwargs):
+    from ..analytics import prune_analytics as _prune_analytics
+
+    return _prune_analytics(*args, **kwargs)
+
+
+def prune_errors(*args, **kwargs):
+    from ..error_capture import prune_errors as _prune_errors
+
+    return _prune_errors(*args, **kwargs)
+
+
+def prune_frontend_logs(*args, **kwargs):
+    from ..frontend_logs import prune_frontend_logs as _prune_frontend_logs
+
+    return _prune_frontend_logs(*args, **kwargs)
+
+
+def prune_perf_samples(*args, **kwargs):
+    from ..perf import prune_perf_samples as _prune_perf_samples
+
+    return _prune_perf_samples(*args, **kwargs)
+
+
 def register(subparsers, format_parent) -> None:
-    parser = subparsers.add_parser("monthly", parents=[format_parent], help="Monthly pipeline runner")
+    parser = subparsers.add_parser("monthly", parents=[format_parent], help="Monthly data quality and learning cycle")
     monthly_sub = parser.add_subparsers(dest="monthly_action")
     p_run = monthly_sub.add_parser("run", parents=[format_parent], help="Run monthly pipeline")
     p_run.add_argument("--month", default=datetime.now().strftime("%Y-%m"))
@@ -44,7 +69,7 @@ def _run_step(name: str, steps: dict, fn, *args, **kwargs) -> Any:
         return None
 
 
-def handle_run(args, conn) -> dict[str, Any]:
+def handle_run(args, conn, rules_path=None) -> dict[str, Any]:
     t0 = time.monotonic()
     steps: dict[str, dict] = {}
     skips = set(args.skip)
@@ -57,7 +82,14 @@ def handle_run(args, conn) -> dict[str, Any]:
             logger.warning("monthly run: backup failed: %s", exc)
 
     # --- Step 1: Plaid sync + balance refresh ---
-    if args.sync:
+    if args.sync and args.dry_run:
+        steps["sync"] = _step_entry(
+            "skipped", error="dry-run preview skips provider sync"
+        )
+        steps["balance"] = _step_entry(
+            "skipped", error="dry-run preview skips balance refresh"
+        )
+    elif args.sync:
         try:
             from ..plaid_client import config_status
 
@@ -74,6 +106,7 @@ def handle_run(args, conn) -> dict[str, Any]:
                     handle_sync,
                     Namespace(days=None, item=None, force=False),
                     conn,
+                    rules_path=rules_path,
                 )
                 _run_step(
                     "balance",
@@ -120,6 +153,7 @@ def handle_run(args, conn) -> dict[str, Any]:
             handle_auto_categorize,
             Namespace(dry_run=args.dry_run, ai=args.ai, provider=None, batch_size=None),
             conn,
+            rules_path=rules_path,
         )
         # handle_auto_categorize rolls back internally when dry_run=True,
         # but does NOT commit when dry_run=False — we must commit:
@@ -132,13 +166,7 @@ def handle_run(args, conn) -> dict[str, Any]:
     if "detect" not in skips:
         from .subs import handle_detect
 
-        _run_step("detect", steps, handle_detect, Namespace(), conn)
-        # detect_subscriptions writes but does not commit:
-        if steps.get("detect", {}).get("status") == "success":
-            if not args.dry_run:
-                conn.commit()
-            else:
-                conn.rollback()
+        _run_step("detect", steps, handle_detect, Namespace(dry_run=args.dry_run), conn)
     else:
         steps["detect"] = _step_entry("skipped")
 
@@ -153,7 +181,9 @@ def handle_run(args, conn) -> dict[str, Any]:
         pass
 
     # --- Step 5: Wave export ---
-    if args.export_dir:
+    if args.export_dir and args.dry_run:
+        steps["export"] = _step_entry("skipped", error="dry-run preview skips export")
+    elif args.export_dir:
         from .export import handle_wave
 
         _run_step(
@@ -206,6 +236,13 @@ def handle_run(args, conn) -> dict[str, Any]:
     except Exception:
         pass
 
+    if not args.dry_run:
+        prune_analytics(conn)
+        prune_perf_samples(conn)
+        prune_frontend_logs(conn)
+        prune_errors(conn)
+        prune_cost_ledger(conn)
+
     elapsed_ms = int((time.monotonic() - t0) * 1000)
 
     # --- Build summary counts ---
@@ -227,6 +264,7 @@ def handle_run(args, conn) -> dict[str, Any]:
     # --- Build CLI report ---
     cli_report = _build_cli_report(
         month=args.month,
+        dry_run=bool(args.dry_run),
         elapsed_ms=elapsed_ms,
         steps=steps,
         health=health,
@@ -238,6 +276,7 @@ def handle_run(args, conn) -> dict[str, Any]:
     return {
         "data": {
             "month": args.month,
+            "dry_run": bool(args.dry_run),
             "elapsed_ms": elapsed_ms,
             "steps": steps,
             "health": health,
@@ -263,6 +302,7 @@ def _step_line(label: str, detail: str, status: str) -> str:
 def _build_cli_report(
     *,
     month: str,
+    dry_run: bool,
     elapsed_ms: int,
     steps: dict,
     health: dict,
@@ -271,7 +311,12 @@ def _build_cli_report(
     export_dir: str | None,
 ) -> str:
     elapsed_s = elapsed_ms / 1000
-    lines = [f"Monthly Run: {month} \u2014 completed in {elapsed_s:.1f}s", ""]
+    title = (
+        f"[DRY RUN] Monthly Run Preview: {month}"
+        if dry_run
+        else f"Monthly Run: {month}"
+    )
+    lines = [f"{title} \u2014 completed in {elapsed_s:.1f}s", ""]
 
     # Sync
     sync_entry = steps.get("sync", {})
@@ -295,7 +340,11 @@ def _build_cli_report(
         r = dedup_entry.get("result", {}) or {}
         d = r.get("data", {}) if isinstance(r, dict) else {}
         removed = d.get("removed", 0)
-        detail = f"{removed} duplicates removed"
+        detail = (
+            f"{removed} duplicates would be removed"
+            if dry_run
+            else f"{removed} duplicates removed"
+        )
     elif dedup_entry.get("status") == "error":
         detail = dedup_entry.get("error", "unknown error")
     else:
@@ -313,7 +362,11 @@ def _build_cli_report(
         for src, cnt in by_source.items():
             parts.append(f"{cnt} {src}")
         source_detail = f" ({', '.join(parts)})" if parts else ""
-        detail = f"{updated} categorized{source_detail}"
+        detail = (
+            f"{updated} would be categorized{source_detail}"
+            if dry_run
+            else f"{updated} categorized{source_detail}"
+        )
     elif cat_entry.get("status") == "error":
         detail = cat_entry.get("error", "unknown error")
     else:
@@ -323,8 +376,16 @@ def _build_cli_report(
     # Detect
     detect_entry = steps.get("detect", {})
     if detect_entry.get("status") == "success":
-        burn_dollars = cents_to_dollars(burn_cents)
-        detail = f"{active_count} active subscriptions at ${burn_dollars:,.0f}/mo"
+        if dry_run:
+            r = detect_entry.get("result", {}) or {}
+            d = r.get("data", {}) if isinstance(r, dict) else {}
+            detail = (
+                f"{d.get('detected', 0)} subscriptions would be detected "
+                f"({d.get('inserted', 0)} new, {d.get('updated', 0)} updates)"
+            )
+        else:
+            burn_dollars = cents_to_dollars(burn_cents)
+            detail = f"{active_count} active subscriptions at ${burn_dollars:,.0f}/mo"
     elif detect_entry.get("status") == "error":
         detail = detect_entry.get("error", "unknown error")
     else:

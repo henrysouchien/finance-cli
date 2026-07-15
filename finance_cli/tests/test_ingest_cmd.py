@@ -8,7 +8,8 @@ from typing import Any
 import pytest
 
 from finance_cli.__main__ import main
-from finance_cli.ai_statement_parser import AIParseResult, PROMPT_VERSION, _default_model
+from finance_cli.ai_client import default_model as _default_model
+from finance_cli.ai_statement_parser import AIParseResult, PROMPT_VERSION
 from finance_cli.db import connect, initialize_database
 from finance_cli.extractors import ExtractorMeta, ExtractorOutput
 from finance_cli.importers.pdf import ExtractResult
@@ -139,10 +140,13 @@ def ai_stub(monkeypatch):
 
     def _fake_send(
         provider: str,
+        *,
         system_prompt: str,
         user_prompt: str,
         model: str,
-        max_tokens: int = 16384,
+        max_tokens: int | None = 16384,
+        timeout: int = 120,
+        api_key: str | None = None,
     ) -> tuple[str, dict[str, int]]:
         state["calls"].append(
             {
@@ -150,6 +154,9 @@ def ai_stub(monkeypatch):
                 "model": model,
                 "user_prompt": user_prompt,
                 "system_prompt": system_prompt,
+                "max_tokens": max_tokens,
+                "timeout": timeout,
+                "api_key": api_key,
             }
         )
 
@@ -161,7 +168,7 @@ def ai_stub(monkeypatch):
         return json.dumps(value), usage
 
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", _fake_extract)
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", _fake_send)
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", _fake_send)
     return state
 
 
@@ -463,6 +470,11 @@ def test_ingest_statement_config_knobs_forwarded(tmp_path: Path, monkeypatch, ca
         model: str,
         max_text_chars: int,
         max_tokens: int,
+        api_key: str | None = None,
+        ai_egress_mode: str | None = None,
+        db_path=None,
+        import_batch_id=None,
+        file_hash=None,
         confidence_warn: float,
         confidence_block: float,
     ) -> AIParseResult:
@@ -470,6 +482,11 @@ def test_ingest_statement_config_knobs_forwarded(tmp_path: Path, monkeypatch, ca
         captured["model"] = model
         captured["max_text_chars"] = max_text_chars
         captured["max_tokens"] = max_tokens
+        captured["api_key"] = api_key
+        captured["ai_egress_mode"] = ai_egress_mode
+        captured["db_path"] = db_path
+        captured["import_batch_id"] = import_batch_id
+        captured["file_hash"] = file_hash
         captured["confidence_warn"] = confidence_warn
         captured["confidence_block"] = confidence_block
 
@@ -499,6 +516,11 @@ def test_ingest_statement_config_knobs_forwarded(tmp_path: Path, monkeypatch, ca
         "model": "claude-special",
         "max_text_chars": 12345,
         "max_tokens": 16384,
+        "api_key": None,
+        "ai_egress_mode": None,
+        "db_path": tmp_path / "finance.db",
+        "import_batch_id": None,
+        "file_hash": None,
         "confidence_warn": 0.91,
         "confidence_block": 0.74,
     }

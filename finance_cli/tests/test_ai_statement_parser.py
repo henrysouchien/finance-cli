@@ -5,6 +5,7 @@ from pathlib import Path
 
 import pytest
 
+from finance_cli.ai_egress import AIEgressBlockedError
 from finance_cli.ai_statement_parser import (
     AIParseResult,
     _build_parse_prompt,
@@ -131,12 +132,25 @@ def test_parse_success(tmp_path: Path, monkeypatch) -> None:
     parsed = _valid_parsed_payload()
 
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", lambda *_: json.dumps(parsed))
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", lambda *_args, **_kwargs: json.dumps(parsed))
 
     result = ai_parse_statement(pdf_path, provider="openai", model="gpt-test")
     assert result.provider == "openai"
     assert result.model == "gpt-test"
     assert result.validation.passed is True
+
+
+def test_parse_blocks_when_ai_egress_redacted(tmp_path: Path, monkeypatch) -> None:
+    pdf_path = tmp_path / "stmt.pdf"
+    pdf_path.write_bytes(b"dummy")
+    monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
+    monkeypatch.setattr(
+        "finance_cli.ai_statement_parser._send_ai_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("AI request should be blocked")),
+    )
+
+    with pytest.raises(AIEgressBlockedError, match="redacted"):
+        ai_parse_statement(pdf_path, provider="openai", model="gpt-test", ai_egress_mode="redacted")
 
 
 def test_parse_normalizes_mmddyyyy_dates_before_validation(tmp_path: Path, monkeypatch) -> None:
@@ -149,7 +163,7 @@ def test_parse_normalizes_mmddyyyy_dates_before_validation(tmp_path: Path, monke
     parsed["transactions"][1]["date"] = "01/05/2025"
 
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", lambda *_: json.dumps(parsed))
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", lambda *_args, **_kwargs: json.dumps(parsed))
 
     result = ai_parse_statement(pdf_path, provider="openai", model="gpt-test")
     assert result.validation.passed is True
@@ -165,14 +179,14 @@ def test_parse_retry_on_malformed(tmp_path: Path, monkeypatch) -> None:
     parsed = _valid_parsed_payload()
     calls = {"count": 0}
 
-    def _fake_send(*_args):
+    def _fake_send(*_args, **_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             return "{bad json"
         return json.dumps(parsed)
 
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", _fake_send)
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", _fake_send)
 
     result = ai_parse_statement(pdf_path, provider="openai")
     assert result.validation.passed is True
@@ -183,7 +197,7 @@ def test_parse_both_retries_fail(tmp_path: Path, monkeypatch) -> None:
     pdf_path = tmp_path / "stmt.pdf"
     pdf_path.write_bytes(b"dummy")
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", lambda *_: "bad")
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", lambda *_args, **_kwargs: "bad")
     with pytest.raises(ValueError):
         ai_parse_statement(pdf_path, provider="openai")
 
@@ -209,14 +223,14 @@ def test_parse_accumulates_token_usage_across_retries(tmp_path: Path, monkeypatc
     parsed = _valid_parsed_payload()
     calls = {"count": 0}
 
-    def _fake_send(*_args):
+    def _fake_send(*_args, **_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             return "{bad json", {"input_tokens": 10, "output_tokens": 2}
         return json.dumps(parsed), {"input_tokens": 20, "output_tokens": 4}
 
     monkeypatch.setattr("finance_cli.ai_statement_parser.extract_pdf_text", lambda *_: "statement text")
-    monkeypatch.setattr("finance_cli.ai_statement_parser._send_parse_request", _fake_send)
+    monkeypatch.setattr("finance_cli.ai_statement_parser._send_ai_request", _fake_send)
 
     result = ai_parse_statement(pdf_path, provider="openai")
     assert result.validation.passed is True

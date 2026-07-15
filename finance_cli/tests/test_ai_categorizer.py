@@ -3,16 +3,19 @@ from __future__ import annotations
 import json
 import uuid
 from pathlib import Path
+from typing import Any
 
 import pytest
 
 from finance_cli.__main__ import main
+from finance_cli.ai_egress import AIEgressBlockedError
 from finance_cli.ai_categorizer import (
     _available_categories,
     _get_or_create_category_id,
     categorize_batch,
     categorize_uncategorized,
 )
+from finance_cli.user_context import UserContext, reset_user_context, set_user_context
 from finance_cli.db import connect, initialize_database
 from finance_cli.user_rules import UserRules
 
@@ -38,6 +41,37 @@ def _seed_transaction(conn, txn_id: str, description: str) -> None:
     conn.commit()
 
 
+def _set_claude_monthly_cap(conn, *, limit_usd6: int, system_limit_usd6: int | None = None) -> None:
+    conn.execute(
+        """
+        UPDATE cost_limits
+           SET limit_usd6 = ?,
+               system_limit_usd6 = ?
+         WHERE provider = 'claude'
+           AND period = 'monthly'
+        """,
+        (limit_usd6, system_limit_usd6),
+    )
+    conn.commit()
+
+
+def _claude_rules(model: str = "claude-sonnet-4-6") -> UserRules:
+    return UserRules(
+        keyword_rules=[],
+        split_rules=[],
+        category_overrides=[],
+        category_aliases={},
+        income_sources={},
+        ai_categorizer={
+            "provider": "claude",
+            "model": model,
+            "batch_size": 10,
+            "available_categories": ["Dining"],
+        },
+        raw={},
+    )
+
+
 def test_categorize_batch_uses_transaction_id_for_duplicate_descriptions(monkeypatch) -> None:
     response = json.dumps(
         [
@@ -46,8 +80,8 @@ def test_categorize_batch_uses_transaction_id_for_duplicate_descriptions(monkeyp
         ]
     )
     monkeypatch.setattr(
-        "finance_cli.ai_categorizer._request_provider",
-        lambda *_: (response, {"input_tokens": 10, "output_tokens": 4}),
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (response, {"input_tokens": 10, "output_tokens": 4}),
     )
 
     batch = categorize_batch(
@@ -70,7 +104,7 @@ def test_categorize_batch_uses_transaction_id_for_duplicate_descriptions(monkeyp
 def test_categorize_batch_retries_malformed_json_and_handles_partial_results(monkeypatch) -> None:
     calls = {"count": 0}
 
-    def _fake_request(*_args):
+    def _fake_request(*_args, **_kwargs):
         calls["count"] += 1
         if calls["count"] == 1:
             return ('[{"id":"txn_a","category":"Dining"', {"input_tokens": 11, "output_tokens": 2})
@@ -88,7 +122,7 @@ def test_categorize_batch_retries_malformed_json_and_handles_partial_results(mon
             {"input_tokens": 13, "output_tokens": 3},
         )
 
-    monkeypatch.setattr("finance_cli.ai_categorizer._request_provider", _fake_request)
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
 
     batch = categorize_batch(
         transactions=[
@@ -116,8 +150,8 @@ def test_categorize_batch_logs_info(monkeypatch) -> None:
         [{"id": "txn_a", "category": "Dining", "use_type": "Personal", "reasoning": "Meal"}]
     )
     monkeypatch.setattr(
-        "finance_cli.ai_categorizer._request_provider",
-        lambda *_: (response, {"input_tokens": 9, "output_tokens": 4}),
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (response, {"input_tokens": 9, "output_tokens": 4}),
     )
 
     messages: list[str] = []
@@ -154,10 +188,10 @@ def test_categorize_batch_retry_accumulates_tokens(monkeypatch) -> None:
         ),
     ]
 
-    def _fake_request(*_args):
+    def _fake_request(*_args, **_kwargs):
         return responses.pop(0)
 
-    monkeypatch.setattr("finance_cli.ai_categorizer._request_provider", _fake_request)
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
     batch = categorize_batch(
         transactions=[{"id": "txn_a", "description": "Lunch"}],
         categories=["Dining"],
@@ -176,10 +210,10 @@ def test_categorize_batch_failure_reports_tokens(monkeypatch) -> None:
         ('{"still":"bad"}', {"input_tokens": 21, "output_tokens": 5}),
     ]
 
-    def _fake_request(*_args):
+    def _fake_request(*_args, **_kwargs):
         return responses.pop(0)
 
-    monkeypatch.setattr("finance_cli.ai_categorizer._request_provider", _fake_request)
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
     batch = categorize_batch(
         transactions=[{"id": "txn_a", "description": "Lunch"}],
         categories=["Dining"],
@@ -217,8 +251,8 @@ def test_categorize_uncategorized_auto_remember_and_alias_resolution(tmp_path: P
 
     monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: rules)
     monkeypatch.setattr(
-        "finance_cli.ai_categorizer._request_provider",
-        lambda *_: (
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (
             json.dumps(
                 [{"id": "txn_1", "category": "Food", "use_type": "Personal", "reasoning": "Restaurant"}]
             ),
@@ -239,7 +273,7 @@ def test_categorize_uncategorized_auto_remember_and_alias_resolution(tmp_path: P
             "SELECT category_id, is_confirmed FROM vendor_memory ORDER BY rowid ASC LIMIT 1"
         ).fetchone()
         ai_log = conn.execute(
-            "SELECT provider, model, prompt_hash, category_name FROM ai_categorization_log WHERE transaction_id = 'txn_1'"
+            "SELECT provider, model, prompt_hash, category_name, input_tokens, output_tokens, elapsed_ms FROM ai_categorization_log WHERE transaction_id = 'txn_1'"
         ).fetchone()
 
     assert report["categorized"] == 1
@@ -261,6 +295,300 @@ def test_categorize_uncategorized_auto_remember_and_alias_resolution(tmp_path: P
     assert ai_log["model"] == "gpt-test"
     assert ai_log["category_name"] == "Dining"
     assert len(str(ai_log["prompt_hash"])) == 64
+    assert ai_log["input_tokens"] == 25
+    assert ai_log["output_tokens"] == 6
+    assert ai_log["elapsed_ms"] >= 0
+
+
+def test_categorize_uncategorized_no_user_context_bypasses_cap_check(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: _claude_rules())
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: (_ for _ in ()).throw(AssertionError("billing should not load")),
+    )
+
+    def _fake_request(*args, **kwargs):
+        captured["provider"] = args[0]
+        captured["model"] = kwargs["model"]
+        return (
+            json.dumps(
+                [{"id": "txn_no_ctx", "category": "Dining", "use_type": "Personal"}]
+            ),
+            {"input_tokens": 25, "output_tokens": 6},
+        )
+
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
+
+    with connect(db_path) as conn:
+        _set_claude_monthly_cap(conn, limit_usd6=0, system_limit_usd6=0)
+        _seed_category(conn, "Dining")
+        _seed_transaction(conn, "txn_no_ctx", "JOE'S PIZZA")
+
+        report = categorize_uncategorized(conn, limit=10, dry_run=False, provider="claude")
+        cost_row = conn.execute(
+            """
+            SELECT cost_usd6,
+                   allowance_debit_usd6,
+                   credits_debit_usd6,
+                   overflow_unattributed_usd6
+              FROM cost_ledger
+             ORDER BY created_at DESC
+             LIMIT 1
+            """
+        ).fetchone()
+
+    assert report["blocked"] is False
+    assert report["categorized"] == 1
+    assert captured == {"provider": "claude", "model": "claude-sonnet-4-6"}
+    assert (
+        cost_row["allowance_debit_usd6"]
+        + cost_row["credits_debit_usd6"]
+        + cost_row["overflow_unattributed_usd6"]
+        == cost_row["cost_usd6"]
+    )
+
+
+def test_categorize_uncategorized_user_context_standard_cap_downgrades_to_haiku(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+    captured: dict[str, str] = {}
+
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: _claude_rules())
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: {"id": user_id, "tier": "paid"},
+    )
+
+    def _fake_request(*args, **kwargs):
+        captured["provider"] = args[0]
+        captured["model"] = kwargs["model"]
+        return (
+            json.dumps(
+                [{"id": "txn_ctx", "category": "Dining", "use_type": "Personal"}]
+            ),
+            {"input_tokens": 25, "output_tokens": 6},
+        )
+
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
+
+    token = set_user_context(UserContext.from_paths(db_path, expected_user_id="user-ai"))
+    try:
+        with connect(db_path) as conn:
+            _set_claude_monthly_cap(conn, limit_usd6=0, system_limit_usd6=0)
+            _seed_category(conn, "Dining")
+            _seed_transaction(conn, "txn_ctx", "JOE'S PIZZA")
+
+            report = categorize_uncategorized(conn, limit=10, dry_run=False, provider="claude")
+    finally:
+        reset_user_context(token)
+
+    assert report["blocked"] is False
+    assert report["categorized"] == 1
+    assert captured == {"provider": "claude", "model": "claude-haiku-4-5"}
+    assert report["model"] == "claude-haiku-4-5"
+
+
+def test_categorize_uncategorized_user_context_openai_cap_routes_to_haiku(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+    captured: dict[str, Any] = {}
+    rules = UserRules(
+        keyword_rules=[],
+        split_rules=[],
+        category_overrides=[],
+        category_aliases={},
+        income_sources={},
+        ai_categorizer={
+            "provider": "openai",
+            "model": "gpt-4o-mini",
+            "batch_size": 10,
+            "available_categories": ["Dining"],
+        },
+        raw={},
+    )
+
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: rules)
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: {"id": user_id, "tier": "paid"},
+    )
+
+    def _fake_request(*args, **kwargs):
+        captured["provider"] = args[0]
+        captured["model"] = kwargs["model"]
+        captured["api_key"] = kwargs["api_key"]
+        return (
+            json.dumps(
+                [{"id": "txn_openai_ctx", "category": "Dining", "use_type": "Personal"}]
+            ),
+            {"input_tokens": 25, "output_tokens": 6},
+        )
+
+    monkeypatch.setattr("finance_cli.ai_categorizer._send_ai_request", _fake_request)
+
+    token = set_user_context(UserContext.from_paths(db_path, expected_user_id="user-ai"))
+    try:
+        with connect(db_path) as conn:
+            _set_claude_monthly_cap(conn, limit_usd6=0, system_limit_usd6=0)
+            _seed_category(conn, "Dining")
+            _seed_transaction(conn, "txn_openai_ctx", "JOE'S PIZZA")
+
+            report = categorize_uncategorized(
+                conn,
+                limit=10,
+                dry_run=False,
+                provider="openai",
+                api_key="openai-key",
+            )
+    finally:
+        reset_user_context(token)
+
+    assert report["blocked"] is False
+    assert captured == {
+        "provider": "claude",
+        "model": "claude-haiku-4-5",
+        "api_key": None,
+    }
+
+
+def test_categorize_uncategorized_user_context_lite_cap_blocks_with_credit_cta(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    monkeypatch.setenv("CASHNERD_PUBLIC_BASE_URL", "https://test.cashnerd.local")
+    monkeypatch.setenv("STRIPE_PRICE_LITE", "price_lite")
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: _claude_rules())
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: {
+            "id": user_id,
+            "tier": "paid",
+            "stripe_price_id": "price_lite",
+        },
+    )
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("AI call blocked")),
+    )
+
+    token = set_user_context(UserContext.from_paths(db_path, expected_user_id="user-ai"))
+    try:
+        with connect(db_path) as conn:
+            _set_claude_monthly_cap(conn, limit_usd6=0, system_limit_usd6=0)
+            _seed_category(conn, "Dining")
+            _seed_transaction(conn, "txn_block", "JOE'S PIZZA")
+
+            report = categorize_uncategorized(conn, limit=10, dry_run=False, provider="claude")
+    finally:
+        reset_user_context(token)
+
+    assert report["blocked"] is True
+    assert report["categorized"] == 0
+    assert "Buy credits in Billing settings: https://test.cashnerd.local/settings/billing" in report["error"]
+
+
+def test_categorize_uncategorized_user_context_redacted_blocks_before_ai_call(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: _claude_rules())
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: {
+            "id": user_id,
+            "tier": "paid",
+            "ai_egress_mode": "redacted",
+        },
+    )
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (_ for _ in ()).throw(AssertionError("AI request should be blocked")),
+    )
+
+    token = set_user_context(UserContext.from_paths(db_path, expected_user_id="user-ai"))
+    try:
+        with connect(db_path) as conn:
+            _seed_category(conn, "Dining")
+            _seed_transaction(conn, "txn_private", "JOE'S PIZZA")
+
+            with pytest.raises(AIEgressBlockedError, match="redacted"):
+                categorize_uncategorized(conn, limit=10, dry_run=False, provider="claude")
+    finally:
+        reset_user_context(token)
+
+
+def test_categorize_uncategorized_user_context_byok_records_byok_cost_row(
+    tmp_path: Path,
+    monkeypatch,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    initialize_database(db_path)
+
+    monkeypatch.setattr("finance_cli.ai_categorizer.load_rules", lambda: _claude_rules())
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._load_user_billing_snapshot",
+        lambda user_id: {
+            "id": user_id,
+            "tier": "paid",
+            "anthropic_api_key_secret_ref": "secret-ref",
+        },
+    )
+    monkeypatch.setattr(
+        "finance_cli.ai_categorizer._send_ai_request",
+        lambda *_args, **_kwargs: (
+            json.dumps(
+                [{"id": "txn_byok", "category": "Dining", "use_type": "Personal"}]
+            ),
+            {"input_tokens": 25, "output_tokens": 6},
+        ),
+    )
+
+    token = set_user_context(UserContext.from_paths(db_path, expected_user_id="user-ai"))
+    try:
+        with connect(db_path) as conn:
+            _set_claude_monthly_cap(conn, limit_usd6=0, system_limit_usd6=0)
+            _seed_category(conn, "Dining")
+            _seed_transaction(conn, "txn_byok", "JOE'S PIZZA")
+
+            report = categorize_uncategorized(conn, limit=10, dry_run=False, provider="claude")
+            row = conn.execute(
+                """
+                SELECT is_byok,
+                       allowance_debit_usd6,
+                       credits_debit_usd6,
+                       overflow_unattributed_usd6
+                  FROM cost_ledger
+                 ORDER BY created_at DESC
+                 LIMIT 1
+                """
+            ).fetchone()
+    finally:
+        reset_user_context(token)
+
+    assert report["blocked"] is False
+    assert row["is_byok"] == 1
+    assert row["allowance_debit_usd6"] == 0
+    assert row["credits_debit_usd6"] == 0
+    assert row["overflow_unattributed_usd6"] == 0
 
 
 def test_categorize_uncategorized_requires_provider_when_missing(tmp_path: Path, monkeypatch) -> None:

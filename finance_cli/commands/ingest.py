@@ -8,10 +8,15 @@ import sqlite3
 from pathlib import Path
 from typing import Any
 
-from ..ai_statement_parser import DEFAULT_MAX_TEXT_CHARS, DEFAULT_MAX_TOKENS, _default_model
+from ..ai_client import default_model as _default_model
+from ..ai_statement_parser import DEFAULT_MAX_TEXT_CHARS, DEFAULT_MAX_TOKENS
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..db import backup_database
+from ..error_capture import capture_error
 from ..extractors import EXTRACTOR_BACKENDS, ExtractOptions, get_extractor
 from ..importers import detect_csv_institution, import_normalized_rows, normalize_csv
+from ..importers.normalizers import normalize_registry_key
 from ..importers.pdf import import_extracted_statement
 from ..ingest_validation import validate_extract_result
 from ..user_rules import UserRules, load_rules
@@ -22,14 +27,28 @@ _DEFAULT_CONFIDENCE_WARN = 0.80
 _DEFAULT_CONFIDENCE_BLOCK = 0.60
 
 
+def _import_endpoint_for_institution(institution: str | None, fallback: str) -> str:
+    if institution:
+        return normalize_registry_key(institution)
+    return fallback
+
+
+def _import_endpoint_for_file(file_path: Path) -> str:
+    return "csv" if file_path.suffix.lower() == ".csv" else "pdf"
+
+
 def register(subparsers, format_parent) -> None:
-    ingest_parser = subparsers.add_parser("ingest", parents=[format_parent], help="Import statements and CSV exports")
+    ingest_parser = subparsers.add_parser(
+        "ingest",
+        parents=[format_parent],
+        help="Build transaction history from statements and CSV exports",
+    )
     ingest_sub = ingest_parser.add_subparsers(dest="ingest_command", required=True)
 
     p_stmt = ingest_sub.add_parser(
         "statement",
         parents=[format_parent],
-        help="Parse and import a PDF statement",
+        help="Add to transaction history from a PDF statement",
     )
     p_stmt.add_argument("--file", help="Path to a single PDF statement")
     p_stmt.add_argument("--dir", help="Directory of PDF statements to batch-process")
@@ -57,7 +76,7 @@ def register(subparsers, format_parent) -> None:
     p_csv = ingest_sub.add_parser(
         "csv",
         parents=[format_parent],
-        help="Import institution CSV export via normalizer",
+        help="Add to transaction history from a CSV bank export",
     )
     p_csv.add_argument("--file", required=True, help="Path to CSV export file")
     p_csv.add_argument(
@@ -71,7 +90,7 @@ def register(subparsers, format_parent) -> None:
     p_batch = ingest_sub.add_parser(
         "batch",
         parents=[format_parent],
-        help="Process a folder of mixed PDF and CSV files",
+        help="Build transaction history in bulk from a folder of statements",
     )
     p_batch.add_argument("--dir", required=True, help="Directory containing PDF/CSV files")
     p_batch.add_argument("--backend", choices=list(EXTRACTOR_BACKENDS), help="Extractor backend for PDFs")
@@ -194,6 +213,36 @@ def _assert_account_exists(conn: sqlite3.Connection, account_id: str | None) -> 
         raise ValueError(f"Account '{account_id}' not found")
 
 
+def _analytics_csv_account_type(rows: list[dict[str, str]]) -> str:
+    account_types = {
+        str(row.get("Account Type") or "").strip().lower()
+        for row in rows
+        if str(row.get("Account Type") or "").strip()
+    }
+    if len(account_types) != 1:
+        return "other"
+
+    account_type = next(iter(account_types))
+    if account_type == "investment":
+        return "brokerage"
+    if account_type in {"checking", "savings", "credit_card", "brokerage"}:
+        return account_type
+    return "other"
+
+
+def _analytics_pdf_page_count(file_path: Path) -> int | None:
+    try:
+        import pdfplumber  # type: ignore
+    except Exception:
+        return None
+
+    try:
+        with pdfplumber.open(str(file_path)) as pdf:
+            return len(pdf.pages)
+    except Exception:
+        return None
+
+
 def _process_statement_file(
     conn: sqlite3.Connection,
     *,
@@ -207,95 +256,117 @@ def _process_statement_file(
     institution_hint: str | None,
     card_ending_hint: str | None,
     account_id: str | None,
+    api_key: str | None = None,
+    ai_egress_mode: str | None = None,
     auto_commit: bool = True,
+    rules_path: Path | None = None,
 ) -> dict[str, Any]:
-    extractor = get_extractor(backend, extractor_config)
-    options = ExtractOptions(
-        allow_partial=allow_partial,
-        require_reconciled=require_reconciled,
-        institution_hint=institution_hint,
-        card_ending_hint=card_ending_hint,
-    )
-    output = extractor.extract(file_path, options)
+    db_path = _connected_main_db_path(conn)
+    try:
+        extractor = get_extractor(backend, extractor_config)
+        options = ExtractOptions(
+            allow_partial=allow_partial,
+            require_reconciled=require_reconciled,
+            institution_hint=institution_hint,
+            card_ending_hint=card_ending_hint,
+            db_path=db_path,
+            api_key=api_key,
+            ai_egress_mode=ai_egress_mode,
+        )
+        output = extractor.extract(file_path, options)
 
-    errors, warnings = validate_extract_result(output.result)
-    if errors:
-        raise ValueError(f"Extraction validation failed: {'; '.join(errors)}")
-    output.result.warnings.extend(warnings)
+        errors, warnings = validate_extract_result(output.result)
+        if errors:
+            raise ValueError(f"Extraction validation failed: {'; '.join(errors)}")
+        output.result.warnings.extend(warnings)
 
-    if require_reconciled and output.meta.reconcile_status != "matched":
-        raise ValueError(
-            f"reconciliation status is '{output.meta.reconcile_status}' and require_reconciled=True"
+        if require_reconciled and output.meta.reconcile_status != "matched":
+            raise ValueError(
+                f"reconciliation status is '{output.meta.reconcile_status}' and require_reconciled=True"
+            )
+
+        logger.info(
+            "Parsed statement file=%s backend=%s provider=%s model=%s transaction_count=%s reconcile_status=%s",
+            file_path,
+            output.meta.backend,
+            output.meta.provider,
+            output.meta.model_version,
+            len(output.result.transactions),
+            output.meta.reconcile_status,
         )
 
-    logger.info(
-        "Parsed statement file=%s backend=%s provider=%s model=%s transaction_count=%s reconcile_status=%s",
-        file_path,
-        output.meta.backend,
-        output.meta.provider,
-        output.meta.model_version,
-        len(output.result.transactions),
-        output.meta.reconcile_status,
-    )
+        validation_json = (
+            json.dumps(output.meta.validation_summary, ensure_ascii=True)
+            if output.meta.validation_summary is not None
+            else None
+        )
+        import_report = import_extracted_statement(
+            conn,
+            extracted=output.result,
+            file_path=file_path,
+            bank_parser=output.meta.bank_parser_label,
+            dry_run=not commit,
+            replace_existing_hash=replace_existing_hash,
+            account_id=account_id,
+            content_text=output.meta.content_text,
+            ai_raw_output_json=output.meta.raw_api_response,
+            ai_validation_json=validation_json,
+            ai_model=output.meta.model_version,
+            ai_prompt_version=output.meta.ai_prompt_version,
+            ai_prompt_hash=output.meta.ai_prompt_hash,
+            auto_commit=auto_commit,
+            rules_path=rules_path,
+        )
 
-    validation_json = (
-        json.dumps(output.meta.validation_summary, ensure_ascii=True)
-        if output.meta.validation_summary is not None
-        else None
-    )
-    import_report = import_extracted_statement(
-        conn,
-        extracted=output.result,
-        file_path=file_path,
-        bank_parser=output.meta.bank_parser_label,
-        dry_run=not commit,
-        replace_existing_hash=replace_existing_hash,
-        account_id=account_id,
-        content_text=output.meta.content_text,
-        ai_raw_output_json=output.meta.raw_api_response,
-        ai_validation_json=validation_json,
-        ai_model=output.meta.model_version,
-        ai_prompt_version=output.meta.ai_prompt_version,
-        ai_prompt_hash=output.meta.ai_prompt_hash,
-        auto_commit=auto_commit,
-    )
+        inserted = int(import_report.get("inserted", 0))
+        skipped_duplicates = int(import_report.get("skipped_duplicates", 0))
+        transaction_count = len(output.result.transactions)
 
-    inserted = int(import_report.get("inserted", 0))
-    skipped_duplicates = int(import_report.get("skipped_duplicates", 0))
-    transaction_count = len(output.result.transactions)
+        data: dict[str, Any] = {
+            "file": str(file_path),
+            "backend": output.meta.backend,
+            "provider": output.meta.provider,
+            "model": output.meta.model_version,
+            "validation": output.meta.validation_summary,
+            "transaction_count": transaction_count,
+            "reconciled": output.meta.reconcile_status == "matched",
+            "reconcile_status": output.meta.reconcile_status,
+            "inserted": inserted,
+            "skipped_duplicates": skipped_duplicates,
+            "dry_run": not commit,
+            "input_tokens": int(output.meta.input_tokens),
+            "output_tokens": int(output.meta.output_tokens),
+            "elapsed_ms": int(output.meta.elapsed_ms),
+            "warnings": list(import_report.get("warnings") or []),
+        }
 
-    data: dict[str, Any] = {
-        "file": str(file_path),
-        "backend": output.meta.backend,
-        "provider": output.meta.provider,
-        "model": output.meta.model_version,
-        "validation": output.meta.validation_summary,
-        "transaction_count": transaction_count,
-        "reconciled": output.meta.reconcile_status == "matched",
-        "reconcile_status": output.meta.reconcile_status,
-        "inserted": inserted,
-        "skipped_duplicates": skipped_duplicates,
-        "dry_run": not commit,
-        "input_tokens": int(output.meta.input_tokens),
-        "output_tokens": int(output.meta.output_tokens),
-        "elapsed_ms": int(output.meta.elapsed_ms),
-        "warnings": list(import_report.get("warnings") or []),
-    }
+        if bool(import_report.get("already_imported", False)):
+            data["already_imported"] = True
 
-    if bool(import_report.get("already_imported", False)):
-        data["already_imported"] = True
+        page_count = _analytics_pdf_page_count(file_path)
+        properties = {"page_count": int(page_count)} if page_count is not None else None
+        log_event(db_path, "import.pdf_completed", properties=properties)
 
-    return {
-        "data": data,
-        "summary": {"total_transactions": transaction_count, "total_amount": 0},
-        "cli_report": (
-            f"file={file_path.name} backend={output.meta.backend} provider={output.meta.provider} "
-            f"model={output.meta.model_version} txns={transaction_count} "
-            f"reconcile_status={output.meta.reconcile_status} inserted={inserted} dry_run={not commit} "
-            f"tokens=in:{int(output.meta.input_tokens)}/out:{int(output.meta.output_tokens)} "
-            f"elapsed={int(output.meta.elapsed_ms)}ms"
-        ),
-    }
+        return {
+            "data": data,
+            "summary": {"total_transactions": transaction_count, "total_amount": 0},
+            "cli_report": (
+                f"file={file_path.name} backend={output.meta.backend} provider={output.meta.provider} "
+                f"model={output.meta.model_version} txns={transaction_count} "
+                f"reconcile_status={output.meta.reconcile_status} inserted={inserted} dry_run={not commit} "
+                f"tokens=in:{int(output.meta.input_tokens)}/out:{int(output.meta.output_tokens)} "
+                f"elapsed={int(output.meta.elapsed_ms)}ms"
+            ),
+        }
+    except Exception as exc:
+        log_event(db_path, "import.pdf_completed", outcome="failed")
+        capture_error(
+            exc,
+            source="import",
+            endpoint="pdf",
+            db_path=db_path,
+        )
+        raise
 
 
 def _process_csv_file(
@@ -304,58 +375,85 @@ def _process_csv_file(
     file_path: Path,
     commit: bool,
     auto_commit: bool = True,
+    rules_path: Path | None = None,
 ) -> dict[str, Any]:
-    institution = detect_csv_institution(file_path)
-    if institution is None:
-        raise ValueError(
-            f"Could not detect institution for {file_path.name}. "
-            "Use ingest csv --institution for this file."
+    db_path = _connected_main_db_path(conn)
+    institution: str | None = None
+    try:
+        institution = detect_csv_institution(file_path)
+        if institution is None:
+            raise ValueError(
+                f"Could not detect institution for {file_path.name}. "
+                "Use ingest csv --institution for this file."
+            )
+        logger.info("Detected CSV institution file=%s institution=%s", file_path, institution)
+
+        normalized = normalize_csv(file_path, institution)
+        report = import_normalized_rows(
+            conn,
+            normalized.rows,
+            normalized.source_name,
+            dry_run=not commit,
+            file_path=file_path,
+            auto_commit=auto_commit,
+            rules_path=rules_path,
         )
-    logger.info("Detected CSV institution file=%s institution=%s", file_path, institution)
 
-    normalized = normalize_csv(file_path, institution)
-    report = import_normalized_rows(
-        conn,
-        normalized.rows,
-        normalized.source_name,
-        dry_run=not commit,
-        file_path=file_path,
-        auto_commit=auto_commit,
-    )
+        data = {
+            "file": str(file_path),
+            "institution": institution,
+            "source_name": normalized.source_name,
+            "raw_row_count": normalized.raw_row_count,
+            "skipped_row_count": normalized.skipped_row_count,
+            "inserted": report.inserted,
+            "skipped_duplicates": report.skipped_duplicates,
+            "errors": report.errors,
+            "dry_run": not commit,
+            "warnings": normalized.warnings,
+        }
 
-    data = {
-        "file": str(file_path),
-        "institution": institution,
-        "source_name": normalized.source_name,
-        "raw_row_count": normalized.raw_row_count,
-        "skipped_row_count": normalized.skipped_row_count,
-        "inserted": report.inserted,
-        "skipped_duplicates": report.skipped_duplicates,
-        "errors": report.errors,
-        "dry_run": not commit,
-        "warnings": normalized.warnings,
-    }
+        cli_lines = [
+            (
+                f"file={file_path.name} institution={institution} rows={normalized.raw_row_count} "
+                f"inserted={report.inserted} skipped_duplicates={report.skipped_duplicates} "
+                f"errors={report.errors} dry_run={not commit}"
+            )
+        ]
+        if normalized.warnings:
+            cli_lines.append(f"Warnings ({len(normalized.warnings)}):")
+            for warning in normalized.warnings:
+                cli_lines.append(f"  - {warning}")
 
-    cli_lines = [
-        (
-            f"file={file_path.name} institution={institution} rows={normalized.raw_row_count} "
-            f"inserted={report.inserted} skipped_duplicates={report.skipped_duplicates} "
-            f"errors={report.errors} dry_run={not commit}"
+        log_event(
+            db_path,
+            "import.csv_completed",
+            properties={
+                "row_count": int(normalized.raw_row_count),
+                "account_type": _analytics_csv_account_type(normalized.rows),
+            },
         )
-    ]
-    if normalized.warnings:
-        cli_lines.append(f"Warnings ({len(normalized.warnings)}):")
-        for warning in normalized.warnings:
-            cli_lines.append(f"  - {warning}")
 
-    return {
-        "data": data,
-        "summary": {"total_transactions": report.inserted, "total_amount": 0},
-        "cli_report": "\n".join(cli_lines),
-    }
+        return {
+            "data": data,
+            "summary": {"total_transactions": report.inserted, "total_amount": 0},
+            "cli_report": "\n".join(cli_lines),
+        }
+    except Exception as exc:
+        log_event(db_path, "import.csv_completed", outcome="failed")
+        capture_error(
+            exc,
+            source="import",
+            endpoint=_import_endpoint_for_institution(institution, "csv"),
+            db_path=db_path,
+        )
+        raise
 
 
-def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_ingest_statement(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     _validate_file_dir_args(args.file, args.dir)
     _assert_account_exists(conn, args.account_id)
 
@@ -363,9 +461,11 @@ def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if args.commit and args.replace:
         backup_path = str(backup_database(conn=conn))
 
-    rules = load_rules()
+    rules = load_rules(path=rules_path)
     backend = _resolve_backend(args, rules)
     extractor_config = _build_extractor_config(backend, args, rules)
+    api_key = getattr(args, "api_key", None)
+    ai_egress_mode = getattr(args, "ai_egress_mode", None)
 
     if args.dir:
         folder = Path(args.dir)
@@ -402,7 +502,10 @@ def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
                     institution_hint=args.institution,
                     card_ending_hint=args.card_ending,
                     account_id=args.account_id,
+                    api_key=api_key,
+                    ai_egress_mode=ai_egress_mode,
                     auto_commit=not args.commit,
+                    rules_path=rules_path,
                 )
                 if savepoint_active:
                     conn.execute("RELEASE SAVEPOINT file_ingest")
@@ -461,6 +564,9 @@ def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
         institution_hint=args.institution,
         card_ending_hint=args.card_ending,
         account_id=args.account_id,
+        api_key=api_key,
+        ai_egress_mode=ai_egress_mode,
+        rules_path=rules_path,
     )
     if backup_path:
         data = dict(result.get("data") or {})
@@ -480,6 +586,12 @@ def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
                     raise FileExistsError(f"destination already exists: {destination}")
                 file_path.rename(destination)
             except OSError as exc:
+                capture_error(
+                    exc,
+                    source="import",
+                    endpoint="pdf",
+                    db_path=_connected_main_db_path(conn),
+                )
                 logger.warning(
                     "Failed to move processed file source=%s destination=%s error=%s",
                     file_path,
@@ -490,10 +602,15 @@ def handle_ingest_statement(args, conn: sqlite3.Connection) -> dict[str, Any]:
     return result
 
 
-def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_ingest_batch(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     folder = Path(args.dir)
     if not folder.exists() or not folder.is_dir():
         raise FileNotFoundError(f"Directory not found: {folder}")
+    db_path = _connected_main_db_path(conn)
 
     pdf_files = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == ".pdf"]
     csv_files = [path for path in folder.iterdir() if path.is_file() and path.suffix.lower() == ".csv"]
@@ -520,6 +637,8 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
     processed_files: list[Path] = []
     move_error_files: list[dict[str, str]] = []
     backend_config: tuple[str, dict[str, Any]] | None = None
+    api_key = getattr(args, "api_key", None)
+    ai_egress_mode = getattr(args, "ai_egress_mode", None)
 
     for file_path in files:
         savepoint_active = False
@@ -530,7 +649,7 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
             logger.info("Processing ingest batch file=%s extension=%s", file_path, file_path.suffix.lower())
             if file_path.suffix.lower() == ".pdf":
                 if backend_config is None:
-                    rules = load_rules()
+                    rules = load_rules(path=rules_path)
                     backend = _resolve_backend(args, rules)
                     config = _build_extractor_config(backend, args, rules)
                     backend_config = (backend, config)
@@ -547,7 +666,10 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
                     institution_hint=args.institution,
                     card_ending_hint=args.card_ending,
                     account_id=None,
+                    api_key=api_key,
+                    ai_egress_mode=ai_egress_mode,
                     auto_commit=not args.commit,
+                    rules_path=rules_path,
                 )
             elif file_path.suffix.lower() == ".csv":
                 report = _process_csv_file(
@@ -555,6 +677,7 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
                     file_path=file_path,
                     commit=args.commit,
                     auto_commit=not args.commit,
+                    rules_path=rules_path,
                 )
             else:
                 if savepoint_active:
@@ -577,6 +700,12 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
                 conn.execute("ROLLBACK TO SAVEPOINT file_ingest")
                 conn.execute("RELEASE SAVEPOINT file_ingest")
                 logger.warning("Rolled back ingest batch savepoint file=%s error=%s", file_path, exc)
+            capture_error(
+                exc,
+                source="import",
+                endpoint=_import_endpoint_for_file(file_path),
+                db_path=db_path,
+            )
             failures += 1
             logger.warning("Ingest batch file failed file=%s error=%s", file_path, exc)
             reports.append({"file": str(file_path), "error": str(exc)})
@@ -591,6 +720,12 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
                     raise FileExistsError(f"destination already exists: {destination}")
                 fp.rename(destination)
             except OSError as exc:
+                capture_error(
+                    exc,
+                    source="import",
+                    endpoint=_import_endpoint_for_file(fp),
+                    db_path=db_path,
+                )
                 logger.warning(
                     "Failed to move processed ingest file source=%s destination=%s error=%s",
                     fp,
@@ -649,47 +784,71 @@ def handle_ingest_batch(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_ingest_csv(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_ingest_csv(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     file_path = Path(args.file)
     if not file_path.exists():
         raise FileNotFoundError(f"CSV not found: {file_path}")
-
-    normalized = normalize_csv(file_path, args.institution)
-    report = import_normalized_rows(
-        conn,
-        normalized.rows,
-        normalized.source_name,
-        dry_run=not args.commit,
-        file_path=file_path,
-    )
-
-    data = {
-        "file": str(file_path),
-        "institution": args.institution,
-        "source_name": normalized.source_name,
-        "raw_row_count": normalized.raw_row_count,
-        "skipped_row_count": normalized.skipped_row_count,
-        "inserted": report.inserted,
-        "skipped_duplicates": report.skipped_duplicates,
-        "errors": report.errors,
-        "dry_run": not args.commit,
-        "warnings": normalized.warnings,
-    }
-
-    cli_lines = [
-        (
-            f"file={file_path.name} institution={args.institution} rows={normalized.raw_row_count} "
-            f"inserted={report.inserted} skipped_duplicates={report.skipped_duplicates} "
-            f"errors={report.errors} dry_run={not args.commit}"
+    db_path = _connected_main_db_path(conn)
+    try:
+        normalized = normalize_csv(file_path, args.institution)
+        report = import_normalized_rows(
+            conn,
+            normalized.rows,
+            normalized.source_name,
+            dry_run=not args.commit,
+            file_path=file_path,
+            rules_path=rules_path,
         )
-    ]
-    if normalized.warnings:
-        cli_lines.append(f"Warnings ({len(normalized.warnings)}):")
-        for warning in normalized.warnings:
-            cli_lines.append(f"  - {warning}")
 
-    return {
-        "data": data,
-        "summary": {"total_transactions": report.inserted, "total_amount": 0},
-        "cli_report": "\n".join(cli_lines),
-    }
+        data = {
+            "file": str(file_path),
+            "institution": args.institution,
+            "source_name": normalized.source_name,
+            "raw_row_count": normalized.raw_row_count,
+            "skipped_row_count": normalized.skipped_row_count,
+            "inserted": report.inserted,
+            "skipped_duplicates": report.skipped_duplicates,
+            "errors": report.errors,
+            "dry_run": not args.commit,
+            "warnings": normalized.warnings,
+        }
+
+        cli_lines = [
+            (
+                f"file={file_path.name} institution={args.institution} rows={normalized.raw_row_count} "
+                f"inserted={report.inserted} skipped_duplicates={report.skipped_duplicates} "
+                f"errors={report.errors} dry_run={not args.commit}"
+            )
+        ]
+        if normalized.warnings:
+            cli_lines.append(f"Warnings ({len(normalized.warnings)}):")
+            for warning in normalized.warnings:
+                cli_lines.append(f"  - {warning}")
+
+        log_event(
+            db_path,
+            "import.csv_completed",
+            properties={
+                "row_count": int(normalized.raw_row_count),
+                "account_type": _analytics_csv_account_type(normalized.rows),
+            },
+        )
+
+        return {
+            "data": data,
+            "summary": {"total_transactions": report.inserted, "total_amount": 0},
+            "cli_report": "\n".join(cli_lines),
+        }
+    except Exception as exc:
+        log_event(db_path, "import.csv_completed", outcome="failed")
+        capture_error(
+            exc,
+            source="import",
+            endpoint=normalize_registry_key(args.institution),
+            db_path=db_path,
+        )
+        raise

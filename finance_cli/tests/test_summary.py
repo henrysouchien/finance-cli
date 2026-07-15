@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import uuid
 from argparse import Namespace
+from datetime import date as dt_date, timedelta
 from pathlib import Path
 
 import pytest
@@ -45,14 +46,22 @@ def _seed_category(conn, name="Dining") -> str:
     return cid
 
 
-def _seed_transaction(conn, *, account_id, amount_cents, category_id=None, date="2026-03-01",
+def _seed_transaction(conn, *, account_id, amount_cents, category_id=None, date=None,
                       is_payment=0, is_reviewed=1) -> str:
     tid = uuid.uuid4().hex
     conn.execute(
         """INSERT INTO transactions (id, account_id, amount_cents, date, description,
            category_id, is_payment, is_active, is_reviewed, source)
            VALUES (?, ?, ?, ?, 'test', ?, ?, 1, ?, 'manual')""",
-        (tid, account_id, amount_cents, date, category_id, is_payment, is_reviewed),
+        (
+            tid,
+            account_id,
+            amount_cents,
+            date or (dt_date.today() - timedelta(days=7)).isoformat(),
+            category_id,
+            is_payment,
+            is_reviewed,
+        ),
     )
     conn.commit()
     return tid

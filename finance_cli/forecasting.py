@@ -6,6 +6,7 @@ import calendar
 import sqlite3
 from datetime import date, timedelta
 from decimal import Decimal, ROUND_HALF_UP
+from pathlib import Path
 from typing import Any
 
 from .user_rules import load_rules
@@ -52,8 +53,12 @@ def _avg_cents(total_cents: int, periods: int) -> int:
     return int((Decimal(total_cents) / Decimal(periods)).quantize(Decimal("1"), rounding=ROUND_HALF_UP))
 
 
-def _normalized_revenue_streams() -> list[dict[str, Any]]:
-    raw_streams = load_rules().revenue_streams
+def _normalized_revenue_streams(rules_path: Path | None = None) -> list[dict[str, Any]]:
+    raw_streams = (
+        load_rules(path=rules_path).revenue_streams
+        if rules_path is not None
+        else load_rules().revenue_streams
+    )
     if not isinstance(raw_streams, list):
         return []
 
@@ -95,8 +100,8 @@ def _normalized_revenue_streams() -> list[dict[str, Any]]:
     return streams
 
 
-def _stream_case_expression() -> tuple[str, list[Any]]:
-    streams = _normalized_revenue_streams()
+def _stream_case_expression(rules_path: Path | None = None) -> tuple[str, list[Any]]:
+    streams = _normalized_revenue_streams(rules_path=rules_path)
     case_parts: list[str] = []
     params: list[Any] = []
 
@@ -147,11 +152,15 @@ def _trend_slope_projection(values: list[int]) -> tuple[float | None, int | None
     return slope, projection
 
 
-def revenue_by_stream(conn: sqlite3.Connection, months: int = 6) -> list[dict[str, Any]]:
+def revenue_by_stream(
+    conn: sqlite3.Connection,
+    months: int = 6,
+    rules_path: Path | None = None,
+) -> list[dict[str, Any]]:
     """Return business revenue grouped by month and configured stream."""
     normalized_months = _normalize_months(months)
     start_date, end_date = _lookback_bounds(normalized_months)
-    stream_expr, stream_params = _stream_case_expression()
+    stream_expr, stream_params = _stream_case_expression(rules_path=rules_path)
 
     rows = conn.execute(
         f"""
@@ -186,11 +195,15 @@ def revenue_by_stream(conn: sqlite3.Connection, months: int = 6) -> list[dict[st
     ]
 
 
-def revenue_trend(conn: sqlite3.Connection, months: int = 6) -> dict[str, Any]:
+def revenue_trend(
+    conn: sqlite3.Connection,
+    months: int = 6,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     """Return per-stream monthly totals and least-squares trend projections."""
     normalized_months = _normalize_months(months)
     month_labels = _lookback_month_labels(normalized_months)
-    grouped_rows = revenue_by_stream(conn, months=normalized_months)
+    grouped_rows = revenue_by_stream(conn, months=normalized_months, rules_path=rules_path)
 
     per_stream: dict[str, dict[str, int]] = {}
     total_by_month: dict[str, int] = {month: 0 for month in month_labels}

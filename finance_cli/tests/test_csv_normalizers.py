@@ -11,7 +11,6 @@ from finance_cli.importers import (
     import_csv,
     import_normalized_rows,
     normalize_csv,
-    supported_institutions,
 )
 
 
@@ -98,6 +97,7 @@ def test_apple_card_purchase_sign_negated(tmp_path: Path) -> None:
     assert result.rows[0]["Amount"] == "-20.00"
     assert result.rows[0]["Is Payment"] == "false"
     assert result.rows[0]["Account Type"] == "credit_card"
+    assert result.rows[0]["Card Ending"] == ""
 
 
 def test_apple_card_payment_sign_negated(tmp_path: Path) -> None:
@@ -363,6 +363,7 @@ def test_amex_expense_sign_negated(tmp_path: Path) -> None:
     assert result.rows[0]["Amount"] == "-10.82"
     assert result.rows[0]["Is Payment"] == "false"
     assert result.rows[0]["Account Type"] == "credit_card"
+    assert result.rows[0]["Card Ending"] == ""
 
 
 def test_amex_payment_detected_and_sign_negated(tmp_path: Path) -> None:
@@ -569,9 +570,6 @@ def test_file_not_found_raises(tmp_path: Path) -> None:
     with pytest.raises(FileNotFoundError):
         normalize_csv(tmp_path / "missing.csv", "apple_card")
 
-
-def test_supported_institutions_list() -> None:
-    assert supported_institutions() == ["american_express", "amex", "apple", "apple_card", "barclays", "bofa_checking", "chase_credit"]
 
 
 def test_detect_apple_card(tmp_path: Path) -> None:

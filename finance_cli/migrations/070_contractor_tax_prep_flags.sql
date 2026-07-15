@@ -1,0 +1,2 @@
+-- Special migration handled in finance_cli.db.
+-- Creates the synced contractor_tax_prep_flags table and its _sync_changelog triggers.

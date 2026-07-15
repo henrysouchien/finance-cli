@@ -8,6 +8,8 @@ import uuid
 from datetime import date
 from typing import Any
 
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..models import cents_to_dollars
 
 
@@ -25,6 +27,14 @@ def register(subparsers, format_parent) -> None:
 
     p_review = plan_sub.add_parser("review", parents=[format_parent], help="Review current month plan")
     p_review.set_defaults(func=handle_review, command_name="plan.review")
+
+    p_abandon = plan_sub.add_parser(
+        "abandon",
+        parents=[format_parent],
+        help="Record that a monthly plan was abandoned",
+    )
+    p_abandon.add_argument("--month", required=True)
+    p_abandon.set_defaults(func=handle_abandon, command_name="plan.abandon")
 
 
 def _month_end(month: str) -> str:
@@ -70,6 +80,7 @@ def _get_plan(conn: sqlite3.Connection, month: str):
 
 
 def handle_create(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     hist_months = _previous_months(args.month, count=3)
     incomes = []
     expenses = []
@@ -122,9 +133,7 @@ def handle_create(args, conn: sqlite3.Connection) -> dict[str, Any]:
         )
         created = True
 
-    conn.commit()
-
-    return {
+    result = {
         "data": {
             "plan_id": plan_id,
             "month": args.month,
@@ -133,10 +142,21 @@ def handle_create(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "expected_expenses_cents": expected_expenses,
             "savings_target_cents": savings_target,
             "investment_target_cents": investment_target,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {"total_plans": 1},
-        "cli_report": f"Plan ready for {args.month}",
+        "cli_report": (
+            f"[DRY RUN] Would prepare plan for {args.month}"
+            if dry_run
+            else f"Plan ready for {args.month}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+        log_event(_connected_main_db_path(conn), "feature.plan_created")
+    return result
 
 
 def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -193,3 +213,40 @@ def handle_review(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "summary": {"month": month},
         "cli_report": f"Savings delta: {review_out['savings_delta']:.2f}",
     }
+
+
+def handle_abandon(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    month = str(args.month).strip()
+    if not month:
+        raise ValueError("month is required")
+
+    row = _get_plan(conn, month)
+    if row is None:
+        raise ValueError(f"Plan for {month} not found")
+
+    result = {
+        "data": {
+            "plan_id": row["id"],
+            "month": month,
+            "abandoned": True,
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {"month": month, "abandoned": True},
+        "cli_report": (
+            f"[DRY RUN] Would mark plan {month} abandoned"
+            if dry_run
+            else f"Plan {month} marked abandoned"
+        ),
+    }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+        log_event(
+            _connected_main_db_path(conn),
+            "feature.plan_abandoned",
+            outcome="abandoned",
+            properties={"month": month},
+        )
+    return result

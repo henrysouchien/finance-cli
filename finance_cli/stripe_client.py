@@ -12,7 +12,14 @@ from dataclasses import dataclass
 from datetime import UTC, datetime
 from typing import Any
 
+from .exceptions import IntegrationError
 from .provider_routing import check_provider_allowed
+from .secrets_store import (
+    _is_secrets_manager_ref,
+    migrate_provider_ref_to_vault,
+    resolve_secret_ref,
+    store_user_api_key,
+)
 
 logger = logging.getLogger(__name__)
 
@@ -30,11 +37,11 @@ class StripeConfigStatus:
     connection_count: int
 
 
-class StripeUnavailableError(RuntimeError):
+class StripeUnavailableError(IntegrationError):
     """Raised when Stripe operations are requested but setup is incomplete."""
 
 
-class StripeSyncError(RuntimeError):
+class StripeSyncError(IntegrationError):
     """Raised when Stripe sync fails."""
 
 
@@ -185,6 +192,80 @@ def _connection_row(conn: sqlite3.Connection) -> sqlite3.Row | None:
         if "no such table" in str(exc).lower():
             raise StripeUnavailableError("Stripe schema missing. Run database migrations (021).") from exc
         raise
+
+
+def _tenant_marker_user_id(conn: sqlite3.Connection | None) -> str | None:
+    if conn is None:
+        return None
+    try:
+        row = conn.execute(
+            "SELECT user_id FROM tenant_marker WHERE singleton = 1"
+        ).fetchone()
+    except sqlite3.OperationalError:
+        return None
+    if not row:
+        return None
+    raw = row["user_id"] if isinstance(row, sqlite3.Row) else row[0]
+    value = str(raw or "").strip()
+    return value or None
+
+
+def _effective_user_id(conn: sqlite3.Connection | None, user_id: str | None) -> str | None:
+    value = str(user_id or "").strip()
+    if value:
+        return value
+    return _tenant_marker_user_id(conn)
+
+
+def _stored_api_key_ref(connection_row: sqlite3.Row | None) -> str | None:
+    if connection_row is None:
+        return None
+    value = str(connection_row["api_key_ref"] or "").strip()
+    return value or None
+
+
+def _resolve_stripe_api_key(
+    conn: sqlite3.Connection | None = None,
+    *,
+    user_id: str | None = None,
+    connection_row: sqlite3.Row | None = None,
+) -> tuple[str | None, str | None]:
+    effective_user_id = _effective_user_id(conn, user_id)
+    row = connection_row if connection_row is not None else (_connection_row(conn) if conn is not None else None)
+    stored_ref = _stored_api_key_ref(row)
+
+    if stored_ref and _is_secrets_manager_ref(stored_ref):
+        if effective_user_id:
+            api_key = resolve_secret_ref(stored_ref, effective_user_id, missing_ok=True)
+            if api_key and not stored_ref.startswith("vault://"):
+                new_ref = migrate_provider_ref_to_vault(
+                    effective_user_id,
+                    provider="stripe",
+                    path=("secret_key",),
+                    plaintext=api_key,
+                    old_sm_ref=stored_ref,
+                )
+                if conn is not None and row is not None:
+                    row_keys = set(row.keys()) if hasattr(row, "keys") else set()
+                    row_id = str(row["id"]) if "id" in row_keys else _STRIPE_CONNECTION_ID
+                    conn.execute(
+                        """
+                        UPDATE stripe_connections
+                           SET api_key_ref = ?,
+                               updated_at = datetime('now')
+                         WHERE id = ?
+                           AND api_key_ref = ?
+                        """,
+                        (new_ref, row_id, stored_ref),
+                    )
+                    conn.commit()
+                return api_key, new_ref
+            return api_key, stored_ref
+        return None, stored_ref
+
+    legacy_ref = stored_ref or _STRIPE_API_KEY_ENV
+    api_key = str(os.getenv(legacy_ref) or "").strip() or None
+    return api_key, legacy_ref
 
 
 def _upsert_connection(
@@ -370,12 +451,12 @@ def _iter_balance_transactions(stripe: Any, created_gte: int) -> list[Any]:
     return all_rows
 
 
-def config_status(conn: sqlite3.Connection | None = None) -> StripeConfigStatus:
-    missing = [name for name in (_STRIPE_API_KEY_ENV,) if not os.getenv(name)]
+def config_status(conn: sqlite3.Connection | None = None, user_id: str | None = None) -> StripeConfigStatus:
     has_sdk = _has_stripe_sdk()
 
     account_name: str | None = None
     connection_count = 0
+    connection_row: sqlite3.Row | None = None
 
     if conn is not None:
         try:
@@ -385,21 +466,31 @@ def config_status(conn: sqlite3.Connection | None = None) -> StripeConfigStatus:
             connection_count = int(connection_count_row["n"] or 0) if connection_count_row else 0
             account_row = conn.execute(
                 """
-                SELECT account_name
+                SELECT account_name, api_key_ref
                   FROM stripe_connections
                  WHERE status = 'active'
                  ORDER BY updated_at DESC
                  LIMIT 1
                 """
             ).fetchone()
-            if account_row:
-                account_name = str(account_row["account_name"] or "").strip() or None
+            connection_row = account_row
+            if connection_row:
+                account_name = str(connection_row["account_name"] or "").strip() or None
         except sqlite3.OperationalError as exc:
             if "no such table" not in str(exc).lower():
                 raise
 
+    api_key, api_key_ref = _resolve_stripe_api_key(
+        conn,
+        user_id=user_id,
+        connection_row=connection_row,
+    )
+    missing: list[str] = []
+    if not api_key and api_key_ref and not _is_secrets_manager_ref(api_key_ref):
+        missing.append(api_key_ref)
+
     return StripeConfigStatus(
-        configured=len(missing) == 0,
+        configured=api_key is not None,
         has_sdk=has_sdk,
         missing_env=missing,
         account_name=account_name,
@@ -407,25 +498,34 @@ def config_status(conn: sqlite3.Connection | None = None) -> StripeConfigStatus:
     )
 
 
-def link_connection(conn: sqlite3.Connection) -> dict[str, Any]:
-    status = config_status(conn)
+def link_connection(conn: sqlite3.Connection, user_id: str | None = None) -> dict[str, Any]:
+    effective_user_id = _effective_user_id(conn, user_id)
+    status = config_status(conn, user_id=effective_user_id)
     if not status.has_sdk:
         raise StripeUnavailableError("stripe package not installed")
     if not status.configured:
-        raise StripeUnavailableError("missing env: " + ",".join(status.missing_env))
+        if status.missing_env:
+            raise StripeUnavailableError("missing env: " + ",".join(status.missing_env))
+        raise StripeUnavailableError("missing Stripe API key")
 
     stripe = _import_stripe()
-    stripe.api_key = str(os.getenv(_STRIPE_API_KEY_ENV) or "")
+    api_key, _api_key_ref = _resolve_stripe_api_key(conn, user_id=effective_user_id)
+    if not api_key:
+        raise StripeUnavailableError("missing Stripe API key")
+    stripe.api_key = api_key
 
     account_payload = stripe.Account.retrieve()
     stripe_account_id = str(_stripe_get(account_payload, "id", "") or "").strip() or None
     account_name = _account_name_from_payload(account_payload)
+    api_key_ref = _STRIPE_API_KEY_ENV
+    if effective_user_id:
+        api_key_ref = store_user_api_key(effective_user_id, "stripe", api_key)
 
     _upsert_connection(
         conn,
         account_id=stripe_account_id,
         account_name=account_name,
-        api_key_ref=_STRIPE_API_KEY_ENV,
+        api_key_ref=api_key_ref,
     )
     local_account_id = _ensure_stripe_balance_account(conn)
     conn.commit()
@@ -434,7 +534,7 @@ def link_connection(conn: sqlite3.Connection) -> dict[str, Any]:
         "stripe_account_id": stripe_account_id,
         "account_name": account_name,
         "local_account_id": local_account_id,
-        "api_key_ref": _STRIPE_API_KEY_ENV,
+        "api_key_ref": api_key_ref,
     }
 
 
@@ -456,16 +556,24 @@ def unlink_connection(conn: sqlite3.Connection) -> dict[str, Any]:
     return {"updated": 1, "status": "disconnected", "id": str(row["id"])}
 
 
-def balance_status() -> dict[str, int]:
+def balance_status(
+    conn: sqlite3.Connection | None = None,
+    user_id: str | None = None,
+) -> dict[str, int]:
     """Fetch current Stripe balance (USD cents)."""
-    status = config_status()
+    status = config_status(conn, user_id=user_id)
     if not status.has_sdk:
         raise StripeUnavailableError("stripe package not installed")
     if not status.configured:
-        raise StripeUnavailableError("missing env: " + ",".join(status.missing_env))
+        if status.missing_env:
+            raise StripeUnavailableError("missing env: " + ",".join(status.missing_env))
+        raise StripeUnavailableError("missing Stripe API key")
 
     stripe = _import_stripe()
-    stripe.api_key = str(os.getenv(_STRIPE_API_KEY_ENV) or "")
+    api_key, _api_key_ref = _resolve_stripe_api_key(conn, user_id=user_id)
+    if not api_key:
+        raise StripeUnavailableError("missing Stripe API key")
+    stripe.api_key = api_key
     payload = stripe.Balance.retrieve()
 
     available_rows = _stripe_get(payload, "available", []) or []
@@ -561,15 +669,19 @@ def run_sync(
     days: int | None = None,
     force: bool = False,
     backfill: bool = False,
+    user_id: str | None = None,
 ) -> dict[str, Any]:
     """Sync Stripe balance transactions into local storage."""
-    status = config_status(conn)
+    effective_user_id = _effective_user_id(conn, user_id)
+    status = config_status(conn, user_id=effective_user_id)
     if not status.has_sdk or not status.configured:
         missing_parts: list[str] = []
         if not status.has_sdk:
             missing_parts.append("stripe package not installed")
         if status.missing_env:
             missing_parts.append("missing env: " + ",".join(status.missing_env))
+        if not status.missing_env and not status.configured:
+            missing_parts.append("missing Stripe API key")
         raise StripeUnavailableError("Stripe sync unavailable: " + "; ".join(missing_parts))
 
     allowed, designated = check_provider_allowed(conn, "Stripe", "stripe")
@@ -610,15 +722,25 @@ def run_sync(
 
     try:
         stripe = _import_stripe()
-        stripe.api_key = str(os.getenv(_STRIPE_API_KEY_ENV) or "")
-
         connection = _connection_row(conn)
+        api_key, api_key_ref = _resolve_stripe_api_key(
+            conn,
+            user_id=effective_user_id,
+            connection_row=connection,
+        )
+        if not api_key:
+            raise StripeUnavailableError("Stripe sync unavailable: missing Stripe API key")
+        stripe.api_key = api_key
+
         if not connection:
             account_payload = stripe.Account.retrieve()
+            if effective_user_id:
+                api_key_ref = store_user_api_key(effective_user_id, "stripe", api_key)
             _upsert_connection(
                 conn,
                 account_id=str(_stripe_get(account_payload, "id", "") or "").strip() or None,
                 account_name=_account_name_from_payload(account_payload),
+                api_key_ref=api_key_ref or _STRIPE_API_KEY_ENV,
             )
             connection = _connection_row(conn)
 

@@ -12,11 +12,11 @@ from collections import defaultdict
 from dataclasses import dataclass
 from decimal import Decimal, InvalidOperation
 from pathlib import Path
-from typing import Iterable
+from typing import Any, Iterable
 
-from ..categorizer import match_transaction, normalize_description
+from ..categorizer import normalize_description, match_transaction
 from ..institution_names import canonicalize as canonicalize_institution_name
-from ..institution_names import is_known
+from ..institution_names import is_known, user_registry_path
 from ..models import dollars_to_cents, normalize_date
 from ..user_rules import UserRules, _empty_rules, load_rules, resolve_category_alias
 
@@ -112,8 +112,8 @@ def _validate_institution_name(cli_source: str) -> None:
     if is_known(source):
         return
     raise ValueError(
-        f"Institution '{source}' not in CANONICAL_NAMES.\n"
-        "Add a mapping to finance_cli/institution_names.py before importing."
+        f"Institution '{source}' not in the institution registry.\n"
+        f"Add a mapping to finance_cli/institution_names.py or {user_registry_path()} before importing."
     )
 
 
@@ -198,6 +198,10 @@ def _upsert_account_alias(conn: sqlite3.Connection, *, hash_account_id: str, can
             created_at = datetime('now')
         """,
         (hash_account_id, canonical_id),
+    )
+    conn.execute(
+        "UPDATE account_aliases SET canonical_id = ? WHERE canonical_id = ?",
+        (canonical_id, hash_account_id),
     )
     conn.execute(
         "UPDATE transactions SET account_id = ?, updated_at = datetime('now') WHERE account_id = ?",
@@ -303,7 +307,14 @@ def _get_or_create_account(
             INSERT INTO accounts (id, institution_name, account_name, account_type, card_ending, source)
             VALUES (?, ?, ?, ?, ?, ?)
             """,
-            (account_id, canonical_source, account_name, effective_type, card_ending or None, cli_source_type),
+            (
+                account_id,
+                canonical_source,
+                account_name,
+                effective_type,
+                _scrub_card_ending(card_ending),
+                cli_source_type,
+            ),
         )
         logger.info(
             "Created account id=%s source=%s type=%s card_ending=%s",
@@ -382,11 +393,12 @@ def _get_or_create_category(
     conn: sqlite3.Connection,
     category_name: str,
     rules: UserRules | None = None,
+    rules_path: Path | None = None,
 ) -> str | None:
     effective_rules = rules
     if effective_rules is None:
         try:
-            effective_rules = load_rules()
+            effective_rules = load_rules(path=rules_path)
         except ValueError:
             effective_rules = _empty_rules()
 
@@ -409,17 +421,73 @@ def _get_or_create_category(
     return category_id
 
 
+def _count_existing_csv_matches(
+    conn: sqlite3.Connection,
+    account_id: str,
+    date_value: str,
+    amount_cents: int,
+    normalized_desc: str,
+) -> int:
+    """Count active csv_import transactions matching a content signature.
+
+    Fetches candidates by (account_id, amount_cents, source) from DB, then
+    filters by normalized date and normalized description in Python. Date
+    normalization is done in Python because legacy rows may use non-ISO formats.
+
+    Split children are excluded because they intentionally duplicate the parent
+    row's metadata and are not same-source reimport duplicates.
+    """
+    rows = conn.execute(
+        """
+        SELECT date, description
+          FROM transactions
+         WHERE account_id = ?
+           AND amount_cents = ?
+           AND source = 'csv_import'
+           AND is_active = 1
+           AND parent_transaction_id IS NULL
+        """,
+        (account_id, amount_cents),
+    ).fetchall()
+    norm_date = normalize_date(date_value)
+    return sum(
+        1
+        for row in rows
+        if normalize_date(str(row["date"])) == norm_date
+        and normalize_description(str(row["description"])) == normalized_desc
+    )
+
+
+def _resolve_guard_account_id(
+    conn: sqlite3.Connection,
+    effective_account_id: str,
+    dry_run: bool,
+) -> str:
+    """Resolve account IDs for same-source guard DB queries."""
+    if not dry_run:
+        return effective_account_id
+    alias_row = conn.execute(
+        "SELECT canonical_id FROM account_aliases WHERE hash_account_id = ?",
+        (effective_account_id,),
+    ).fetchone()
+    return str(alias_row["canonical_id"]) if alias_row else effective_account_id
+
+
 def _import_row_iter(
     conn: sqlite3.Connection,
     row_iter: Iterable[dict[str, str]],
     source_name: str,
     dry_run: bool = False,
+    rules_path: Path | None = None,
 ) -> ImportReport:
     report = ImportReport()
     occurrences: dict[str, int] = defaultdict(int)
+    _raw_existing: dict[tuple[str, str, int, str], int] = {}
+    _batch_ordinal: dict[tuple[str, str, int, str], int] = {}
+    _dedupe_consumed: dict[tuple[str, str, int, str], int] = {}
     rules_broken = False
     try:
-        load_rules()
+        load_rules(path=rules_path)
     except Exception as exc:
         logger.warning("rules.yaml invalid; skipping categorization pipeline during CSV import: %s", exc)
         rules_broken = True
@@ -466,6 +534,65 @@ def _import_row_iter(
             duplicate_ordinal = occurrences[base_fingerprint]
             dedupe_key = _sha256([base_fingerprint, str(duplicate_ordinal)])
 
+            existing_dk = conn.execute(
+                "SELECT 1 FROM transactions WHERE dedupe_key = ?",
+                (dedupe_key,),
+            ).fetchone()
+            norm_desc = normalize_description(description)
+            guard_acct = _resolve_guard_account_id(conn, effective_account_id, dry_run)
+            content_key = (guard_acct, date_value, amount_cents, norm_desc)
+
+            if existing_dk:
+                dk_row = conn.execute(
+                    """
+                    SELECT 1
+                      FROM transactions
+                     WHERE dedupe_key = ?
+                       AND is_active = 1
+                       AND source = 'csv_import'
+                       AND parent_transaction_id IS NULL
+                    """,
+                    (dedupe_key,),
+                ).fetchone()
+                if dk_row:
+                    _dedupe_consumed[content_key] = _dedupe_consumed.get(content_key, 0) + 1
+                report.skipped_duplicates += 1
+                logger.debug(
+                    "Skipped exact dedupe_key match source=%s row_index=%s dedupe_key=%s qualified=%s",
+                    source_name,
+                    row_idx,
+                    dedupe_key[:16],
+                    bool(dk_row),
+                )
+                continue
+
+            if content_key not in _raw_existing:
+                _raw_existing[content_key] = _count_existing_csv_matches(
+                    conn,
+                    guard_acct,
+                    date_value,
+                    amount_cents,
+                    norm_desc,
+                )
+            _batch_ordinal[content_key] = _batch_ordinal.get(content_key, 0) + 1
+            effective_existing = max(
+                0,
+                _raw_existing[content_key] - _dedupe_consumed.get(content_key, 0),
+            )
+            if _batch_ordinal[content_key] <= effective_existing:
+                report.skipped_duplicates += 1
+                logger.debug(
+                    "Skipped same-source duplicate source=%s row_index=%s batch_ordinal=%s "
+                    "effective_existing=%s (raw=%s consumed=%s)",
+                    source_name,
+                    row_idx,
+                    _batch_ordinal[content_key],
+                    effective_existing,
+                    _raw_existing[content_key],
+                    _dedupe_consumed.get(content_key, 0),
+                )
+                continue
+
             category_id = None
             source_category = category_name
             category_source = None
@@ -474,15 +601,24 @@ def _import_row_iter(
 
             if not dry_run and not rules_broken:
                 try:
+                    match_kwargs: dict[str, Any] = {}
+                    if rules_path is not None:
+                        match_kwargs["rules_path"] = rules_path
                     result = match_transaction(
                         conn,
                         description,
                         use_type,
                         source_category=source_category,
                         is_payment=bool(is_payment),
+                        **match_kwargs,
                     )
                 except Exception as exc:
-                    logger.warning("match_transaction() failed for %r: %s", description, exc)
+                    logger.warning(
+                        "match_transaction() failed for %s row %d: %s",
+                        source_name,
+                        row_idx,
+                        exc,
+                    )
                     rules_broken = True
                     result = None
 
@@ -592,6 +728,7 @@ def import_csv(
     source_name: str,
     dry_run: bool = False,
     validate_name: bool = True,
+    rules_path: Path | None = None,
 ) -> ImportReport:
     file_path = Path(file_path)
 
@@ -610,7 +747,13 @@ def import_csv(
 
     with file_path.open("r", newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
-        report = _import_row_iter(conn, reader, source_name=source_name, dry_run=dry_run)
+        report = _import_row_iter(
+            conn,
+            reader,
+            source_name=source_name,
+            dry_run=dry_run,
+            rules_path=rules_path,
+        )
 
     if not dry_run:
         if not existing_batch:
@@ -654,6 +797,7 @@ def import_normalized_rows(
     file_path: str | Path | None = None,
     validate_name: bool = True,
     auto_commit: bool = True,
+    rules_path: Path | None = None,
 ) -> ImportReport:
     if validate_name:
         _validate_institution_name(source_name)
@@ -680,7 +824,13 @@ def import_normalized_rows(
                     file_hash,
                 )
 
-    report = _import_row_iter(conn, rows, source_name=source_name, dry_run=dry_run)
+    report = _import_row_iter(
+        conn,
+        rows,
+        source_name=source_name,
+        dry_run=dry_run,
+        rules_path=rules_path,
+    )
 
     if not dry_run:
         if normalized_file_path is not None and file_hash and not existing_batch:
@@ -731,6 +881,7 @@ def import_income_csv(
     source_name: str,
     rules: UserRules | None = None,
     dry_run: bool = False,
+    rules_path: Path | None = None,
 ) -> ImportReport:
     report = ImportReport()
     file_path = Path(file_path)
@@ -739,7 +890,7 @@ def import_income_csv(
         raise FileNotFoundError(f"Income CSV not found: {file_path}")
 
     if rules is None:
-        rules = load_rules()
+        rules = load_rules(path=rules_path)
 
     source_cfg = rules.income_sources.get(source_name)
     if not source_cfg:
@@ -782,18 +933,21 @@ def import_income_csv(
             ).fetchone()
             category_id = existing_category["id"] if existing_category else "dryrun_category"
         else:
-            category_id = _get_or_create_category(conn, category_name)
+            category_id = _get_or_create_category(conn, category_name, rules_path=rules_path)
 
     effective_account_id = _account_id_for_source(platform, "")
     if not dry_run:
         effective_account_id, _ = _get_or_create_account(conn, platform, "")
 
     occurrences: dict[str, int] = defaultdict(int)
+    inc_raw_existing: dict[tuple[str, str, int, str], int] = {}
+    inc_batch_ordinal: dict[tuple[str, str, int, str], int] = {}
+    inc_dedupe_consumed: dict[tuple[str, str, int, str], int] = {}
 
     with file_path.open("r", newline="", encoding="utf-8-sig") as fh:
         reader = csv.DictReader(fh)
 
-        for raw_row in reader:
+        for row_idx, raw_row in enumerate(reader, start=1):
             row = {str(k).strip(): str(v).strip() for k, v in raw_row.items() if k is not None}
             try:
                 date_value = normalize_date(_row_value(row, date_col, date_col.lower()))
@@ -815,6 +969,65 @@ def import_income_csv(
                 )
                 occurrences[base_fingerprint] += 1
                 dedupe_key = _sha256([base_fingerprint, str(occurrences[base_fingerprint])])
+
+                inc_existing_dk = conn.execute(
+                    "SELECT 1 FROM transactions WHERE dedupe_key = ?",
+                    (dedupe_key,),
+                ).fetchone()
+                inc_norm_desc = normalize_description(description)
+                inc_guard_acct = _resolve_guard_account_id(conn, effective_account_id, dry_run)
+                inc_content_key = (inc_guard_acct, date_value, amount_cents, inc_norm_desc)
+
+                if inc_existing_dk:
+                    inc_dk_row = conn.execute(
+                        """
+                        SELECT 1
+                          FROM transactions
+                         WHERE dedupe_key = ?
+                           AND is_active = 1
+                           AND source = 'csv_import'
+                           AND parent_transaction_id IS NULL
+                        """,
+                        (dedupe_key,),
+                    ).fetchone()
+                    if inc_dk_row:
+                        inc_dedupe_consumed[inc_content_key] = inc_dedupe_consumed.get(inc_content_key, 0) + 1
+                    report.skipped_duplicates += 1
+                    logger.debug(
+                        "Skipped exact income dedupe_key match source=%s row_index=%s dedupe_key=%s qualified=%s",
+                        source_name,
+                        row_idx,
+                        dedupe_key[:16],
+                        bool(inc_dk_row),
+                    )
+                    continue
+
+                if inc_content_key not in inc_raw_existing:
+                    inc_raw_existing[inc_content_key] = _count_existing_csv_matches(
+                        conn,
+                        inc_guard_acct,
+                        date_value,
+                        amount_cents,
+                        inc_norm_desc,
+                    )
+                inc_batch_ordinal[inc_content_key] = inc_batch_ordinal.get(inc_content_key, 0) + 1
+                inc_effective = max(
+                    0,
+                    inc_raw_existing[inc_content_key] - inc_dedupe_consumed.get(inc_content_key, 0),
+                )
+                if inc_batch_ordinal[inc_content_key] <= inc_effective:
+                    report.skipped_duplicates += 1
+                    logger.debug(
+                        "Skipped same-source income duplicate source=%s row_index=%s batch_ordinal=%s "
+                        "effective_existing=%s (raw=%s consumed=%s)",
+                        source_name,
+                        row_idx,
+                        inc_batch_ordinal[inc_content_key],
+                        inc_effective,
+                        inc_raw_existing[inc_content_key],
+                        inc_dedupe_consumed.get(inc_content_key, 0),
+                    )
+                    continue
 
                 if dry_run:
                     existing = conn.execute(
@@ -985,8 +1198,8 @@ def import_vendor_memory_csv(
     return {"inserted": inserted, "updated": updated, "errors": errors}
 
 
-from .csv_normalizers import NormalizeResult, detect_csv_institution, normalize_csv, supported_institutions
-from .pdf import ExtractResult, extract_transactions, import_pdf_statement
+from .csv_normalizers import NormalizeResult, detect_csv_institution, normalize_csv, supported_institutions  # noqa: E402
+from .pdf import ExtractResult, extract_transactions, import_pdf_statement  # noqa: E402
 
 __all__ = [
     "ExtractResult",

@@ -58,7 +58,7 @@ def test_import_normalized_rows_unknown_name_blocks_before_writes(tmp_path: Path
     ]
 
     with connect(db_path) as conn:
-        with pytest.raises(ValueError, match="not in CANONICAL_NAMES"):
+        with pytest.raises(ValueError, match="institution registry"):
             import_normalized_rows(conn, rows, "Unknown Credit Union")
         txn_count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
         account_count = conn.execute("SELECT COUNT(*) AS n FROM accounts").fetchone()["n"]

@@ -377,7 +377,11 @@ def _is_excluded_subscription_keyword(vendor_name: str) -> bool:
     return any(keyword in lowered for keyword in SUBSCRIPTION_EXCLUDED_KEYWORDS)
 
 
-def detect_recurring_patterns(conn: sqlite3.Connection) -> list[RecurringPattern]:
+def _detect_recurring_patterns(
+    conn: sqlite3.Connection,
+    *,
+    mark_transactions: bool,
+) -> list[RecurringPattern]:
     rows = conn.execute(
         """
         SELECT id, account_id, date, description, amount_cents, category_id, use_type
@@ -451,16 +455,108 @@ def detect_recurring_patterns(conn: sqlite3.Connection) -> list[RecurringPattern
             )
         )
 
-    _apply_recurring_flags(conn, recurring_transaction_ids)
-    conn.commit()
+    if mark_transactions:
+        _apply_recurring_flags(conn, recurring_transaction_ids)
+        conn.commit()
     patterns.sort(key=lambda item: (item.vendor_name.lower(), item.account_id or "", item.frequency))
     return patterns
+
+
+def detect_recurring_patterns(conn: sqlite3.Connection) -> list[RecurringPattern]:
+    return _detect_recurring_patterns(conn, mark_transactions=True)
 
 
 def _build_category_name_map(conn: sqlite3.Connection) -> dict[str, str]:
     """Return {category_id: category_name} for all categories."""
     rows = conn.execute("SELECT id, name FROM categories").fetchall()
     return {row["id"]: row["name"] for row in rows}
+
+
+def _is_essential_category(category_name: str, essential_categories: frozenset[str]) -> bool:
+    normalized = (category_name or "").strip()
+    return any(normalized.casefold() == category.casefold() for category in essential_categories)
+
+
+def _add_history_amount(
+    *,
+    month: str,
+    amount_cents: int,
+    category_name: str,
+    totals: dict[str, int],
+    essentials: dict[str, int],
+    discretionaries: dict[str, int],
+    essential_categories: frozenset[str],
+) -> None:
+    if month not in totals:
+        return
+    totals[month] += int(amount_cents)
+    if _is_essential_category(category_name, essential_categories):
+        essentials[month] += int(amount_cents)
+    else:
+        discretionaries[month] += int(amount_cents)
+
+
+def _add_months(start: date, months: int) -> date:
+    current = start.replace(day=1)
+    for _ in range(max(0, int(months))):
+        if current.month == 12:
+            current = current.replace(year=current.year + 1, month=1)
+        else:
+            current = current.replace(month=current.month + 1)
+    return current
+
+
+def _subscription_fingerprint(
+    *,
+    vendor_name: str,
+    frequency: str,
+    amount_cents: int,
+    account_id: str | None,
+) -> tuple[str, str, str | None, int] | None:
+    normalized = normalize_description(vendor_name)
+    token = _first_significant_token(normalized)
+    if not token:
+        return None
+    monthly_cents = _monthly_equivalent(abs(int(amount_cents)), frequency)
+    return normalized, token, account_id, monthly_cents
+
+
+def _vendor_fingerprint_matches(left_normalized: str, right_normalized: str) -> bool:
+    if not left_normalized or not right_normalized:
+        return False
+    if left_normalized == right_normalized:
+        return True
+    shorter, longer = _canonical_pair(left_normalized, right_normalized)
+    if len(shorter) >= 6 and longer.startswith(shorter):
+        return True
+    return _jaccard_similarity(left_normalized, right_normalized) >= 0.8
+
+
+def _account_fingerprint_matches(left: str | None, right: str | None) -> bool:
+    return left is None or right is None or left == right
+
+
+def _amount_fingerprint_matches(left_cents: int, right_cents: int) -> bool:
+    if left_cents <= 0 or right_cents <= 0:
+        return left_cents == right_cents
+    tolerance_cents = max(500, int(round(min(left_cents, right_cents) * 0.15)))
+    return abs(left_cents - right_cents) <= tolerance_cents
+
+
+def _manual_subscription_matches_detected(
+    manual: tuple[str, str, str | None, int] | None,
+    detected: set[tuple[str, str, str | None, int]],
+) -> bool:
+    if manual is None:
+        return False
+    manual_normalized, manual_token, manual_account_id, manual_monthly_cents = manual
+    return any(
+        manual_token == detected_token
+        and _vendor_fingerprint_matches(manual_normalized, detected_normalized)
+        and _account_fingerprint_matches(manual_account_id, detected_account_id)
+        and _amount_fingerprint_matches(manual_monthly_cents, detected_monthly_cents)
+        for detected_normalized, detected_token, detected_account_id, detected_monthly_cents in detected
+    )
 
 
 def _detect_metered_subscriptions(
@@ -626,8 +722,15 @@ def _deactivate_stale_subscriptions(conn: sqlite3.Connection) -> int:
     return deactivated
 
 
-def detect_subscriptions(conn: sqlite3.Connection) -> dict[str, int]:
-    recurring_patterns = detect_recurring_patterns(conn)
+def _subscription_candidate_patterns(
+    conn: sqlite3.Connection,
+    *,
+    mark_recurring_transactions: bool,
+) -> tuple[list[tuple[RecurringPattern, str]], list[RecurringPattern]]:
+    recurring_patterns = _detect_recurring_patterns(
+        conn,
+        mark_transactions=mark_recurring_transactions,
+    )
     cat_names = _build_category_name_map(conn)
     fixed_patterns = [
         pattern
@@ -656,6 +759,14 @@ def detect_subscriptions(conn: sqlite3.Connection) -> dict[str, int]:
     subscription_patterns: list[tuple[RecurringPattern, str]] = (
         [(pattern, "fixed") for pattern in fixed_patterns]
         + [(pattern, "metered") for pattern in metered_patterns]
+    )
+    return subscription_patterns, recurring_patterns
+
+
+def detect_subscriptions(conn: sqlite3.Connection, dry_run: bool = False) -> dict[str, int]:
+    subscription_patterns, recurring_patterns = _subscription_candidate_patterns(
+        conn,
+        mark_recurring_transactions=True,
     )
 
     inserted = 0
@@ -757,7 +868,10 @@ def detect_subscriptions(conn: sqlite3.Connection) -> dict[str, int]:
 
     deactivated += _deactivate_stale_subscriptions(conn)
 
-    conn.commit()
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
     recurring_txn_count = len({txn_id for pattern in recurring_patterns for txn_id in pattern.transaction_ids})
     return {
         "inserted": inserted,
@@ -769,6 +883,271 @@ def detect_subscriptions(conn: sqlite3.Connection) -> dict[str, int]:
         "deactivated": deactivated,
         "recurring_patterns": len(recurring_patterns),
         "recurring_txns": recurring_txn_count,
+    }
+
+
+def _month_keys(months: int, *, as_of: date) -> list[str]:
+    months = max(1, int(months))
+    anchor = as_of.replace(day=1)
+    keys: list[str] = []
+    for offset in range(months - 1, -1, -1):
+        current = anchor
+        for _ in range(offset):
+            current = (current - timedelta(days=1)).replace(day=1)
+        keys.append(current.strftime("%Y-%m"))
+    return keys
+
+
+def _empty_history(month_keys: list[str]) -> dict[str, object]:
+    zero_months = {month: 0 for month in month_keys}
+    return {
+        "months": month_keys,
+        "totals_cents": zero_months,
+        "essential_cents": zero_months.copy(),
+        "discretionary_cents": zero_months.copy(),
+        "transaction_count": 0,
+    }
+
+
+def _add_manual_subscription_history(
+    conn: sqlite3.Connection,
+    *,
+    month_keys: list[str],
+    totals: dict[str, int],
+    essentials: dict[str, int],
+    discretionaries: dict[str, int],
+    essential_categories: frozenset[str],
+    detected_fingerprints: set[tuple[str, str, str | None, int]] | None = None,
+) -> int:
+    rows = conn.execute(
+        """
+        SELECT s.vendor_name,
+               s.amount_cents,
+               s.frequency,
+               s.account_id,
+               COALESCE(c.name, '') AS category_name
+          FROM subscriptions s
+          LEFT JOIN categories c ON c.id = s.category_id
+         WHERE s.is_active = 1
+           AND s.is_auto_detected = 0
+        """
+    ).fetchall()
+    added_count = 0
+    detected_fingerprints = detected_fingerprints or set()
+    for row in rows:
+        monthly_cents = _monthly_equivalent(
+            abs(int(row["amount_cents"] or 0)),
+            str(row["frequency"] or "monthly"),
+        )
+        manual_fingerprint = _subscription_fingerprint(
+            vendor_name=str(row["vendor_name"] or ""),
+            frequency=str(row["frequency"] or "monthly"),
+            amount_cents=abs(int(row["amount_cents"] or 0)),
+            account_id=None if row["account_id"] is None else str(row["account_id"]),
+        )
+        if _manual_subscription_matches_detected(manual_fingerprint, detected_fingerprints):
+            continue
+        for month in month_keys:
+            _add_history_amount(
+                month=month,
+                amount_cents=monthly_cents,
+                category_name=str(row["category_name"] or ""),
+                totals=totals,
+                essentials=essentials,
+                discretionaries=discretionaries,
+                essential_categories=essential_categories,
+            )
+        added_count += 1
+    return added_count
+
+
+def subscription_spend_history(
+    conn: sqlite3.Connection,
+    *,
+    months: int = 6,
+    as_of: date | None = None,
+    essential_categories: frozenset[str] = frozenset(),
+) -> dict[str, object]:
+    """Month-by-month subscription commitment from eligible recurring charges.
+
+    The stored ``subscriptions`` table is point-in-time, so drift detection must
+    read historical transactions. This helper reuses the subscription detector's
+    fixed and metered eligibility rules, normalizes non-monthly commitments to a
+    monthly equivalent, and keeps the read side effect-free.
+    """
+    resolved_as_of = as_of or date.today()
+    month_keys = _month_keys(months, as_of=resolved_as_of)
+    if not month_keys:
+        return _empty_history(month_keys)
+
+    subscription_patterns, _recurring_patterns = _subscription_candidate_patterns(
+        conn,
+        mark_recurring_transactions=False,
+    )
+    transaction_ids = sorted(
+        {
+            txn_id
+            for pattern, _sub_type in subscription_patterns
+            for txn_id in pattern.transaction_ids
+        }
+    )
+    detected_fingerprints = {
+        fingerprint
+        for fingerprint in (
+            _subscription_fingerprint(
+                vendor_name=pattern.vendor_name,
+                frequency=pattern.frequency,
+                amount_cents=pattern.median_amount_cents,
+                account_id=pattern.account_id,
+            )
+            for pattern, _sub_type in subscription_patterns
+        )
+        if fingerprint is not None
+    }
+    if not transaction_ids:
+        history = _empty_history(month_keys)
+        manual_count = _add_manual_subscription_history(
+            conn,
+            month_keys=month_keys,
+            totals=history["totals_cents"],
+            essentials=history["essential_cents"],
+            discretionaries=history["discretionary_cents"],
+            essential_categories=essential_categories,
+            detected_fingerprints=detected_fingerprints,
+        )
+        history["manual_subscription_count"] = manual_count
+        return history
+
+    totals = {month: 0 for month in month_keys}
+    essentials = {month: 0 for month in month_keys}
+    discretionaries = {month: 0 for month in month_keys}
+    month_set = set(month_keys)
+    end_date = resolved_as_of.isoformat()
+    seen_transaction_ids: set[str] = set()
+
+    rows_by_id: dict[str, sqlite3.Row] = {}
+    chunk_size = 800
+    for offset in range(0, len(transaction_ids), chunk_size):
+        chunk = transaction_ids[offset : offset + chunk_size]
+        placeholders = ", ".join("?" for _ in chunk)
+        rows = conn.execute(
+            f"""
+            SELECT t.id, t.date, t.amount_cents, COALESCE(c.name, '') AS category_name
+              FROM transactions t
+              LEFT JOIN categories c ON c.id = t.category_id
+             WHERE t.id IN ({placeholders})
+               AND t.is_active = 1
+               AND t.is_payment = 0
+               AND t.amount_cents < 0
+               AND t.date <= ?
+            """,
+            (*chunk, end_date),
+        ).fetchall()
+        for row in rows:
+            rows_by_id[str(row["id"])] = row
+
+    for pattern, sub_type in subscription_patterns:
+        pattern_rows = [
+            rows_by_id[txn_id]
+            for txn_id in pattern.transaction_ids
+            if txn_id in rows_by_id and txn_id not in seen_transaction_ids
+        ]
+        if not pattern_rows:
+            continue
+        for row in pattern_rows:
+            seen_transaction_ids.add(str(row["id"]))
+
+        if sub_type == "metered" or pattern.frequency == "monthly":
+            for row in pattern_rows:
+                month = str(row["date"] or "")[:7]
+                amount_cents = abs(int(row["amount_cents"] or 0))
+                _add_history_amount(
+                    month=month,
+                    amount_cents=amount_cents,
+                    category_name=str(row["category_name"] or ""),
+                    totals=totals,
+                    essentials=essentials,
+                    discretionaries=discretionaries,
+                    essential_categories=essential_categories,
+                )
+            continue
+
+        category_name = ""
+        category_id = pattern.category_id
+        if category_id:
+            category_row = conn.execute("SELECT name FROM categories WHERE id = ?", (category_id,)).fetchone()
+            category_name = "" if category_row is None else str(category_row["name"] or "")
+
+        if pattern.frequency in {"quarterly", "yearly"}:
+            coverage_months = 3 if pattern.frequency == "quarterly" else 12
+            for row in sorted(pattern_rows, key=lambda item: str(item["date"])):
+                amount_cents = _monthly_equivalent(
+                    abs(int(row["amount_cents"] or 0)),
+                    pattern.frequency,
+                )
+                row_category_name = category_name or str(row["category_name"] or "")
+                try:
+                    charge_month = date.fromisoformat(str(row["date"])[:10]).replace(day=1)
+                except ValueError:
+                    continue
+                for offset in range(coverage_months):
+                    month = _add_months(charge_month, offset).strftime("%Y-%m")
+                    _add_history_amount(
+                        month=month,
+                        amount_cents=amount_cents,
+                        category_name=row_category_name,
+                        totals=totals,
+                        essentials=essentials,
+                        discretionaries=discretionaries,
+                        essential_categories=essential_categories,
+                    )
+            continue
+
+        active_monthly_cents = _monthly_equivalent(
+            abs(int(pattern.median_amount_cents)),
+            pattern.frequency,
+        )
+        row_dates: list[date] = []
+        for row in pattern_rows:
+            try:
+                row_dates.append(date.fromisoformat(str(row["date"])[:10]).replace(day=1))
+            except ValueError:
+                continue
+        if not row_dates:
+            continue
+        first_month = min(row_dates)
+        last_month = max(row_dates)
+        while first_month <= last_month:
+            month = first_month.strftime("%Y-%m")
+            if month in month_set:
+                _add_history_amount(
+                    month=month,
+                    amount_cents=active_monthly_cents,
+                    category_name=category_name,
+                    totals=totals,
+                    essentials=essentials,
+                    discretionaries=discretionaries,
+                    essential_categories=essential_categories,
+                )
+            first_month = _add_months(first_month, 1)
+
+    manual_count = _add_manual_subscription_history(
+        conn,
+        month_keys=month_keys,
+        totals=totals,
+        essentials=essentials,
+        discretionaries=discretionaries,
+        essential_categories=essential_categories,
+        detected_fingerprints=detected_fingerprints,
+    )
+
+    return {
+        "months": month_keys,
+        "totals_cents": totals,
+        "essential_cents": essentials,
+        "discretionary_cents": discretionaries,
+        "transaction_count": len(seen_transaction_ids),
+        "manual_subscription_count": manual_count,
     }
 
 

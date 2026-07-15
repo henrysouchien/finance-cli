@@ -4,8 +4,13 @@ from __future__ import annotations
 
 import sqlite3
 from datetime import datetime
+from types import SimpleNamespace
 from typing import Any
 
+from finance_cli.exceptions import NotFoundError, ValidationError
+
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..budget_engine import (
     budget_alerts,
     delete_budget,
@@ -13,6 +18,7 @@ from ..budget_engine import (
     list_budgets,
     monthly_budget_forecast,
     monthly_budget_status,
+    reallocate_budget,
     set_budget,
     suggest_budget_cuts,
     update_budget,
@@ -39,6 +45,14 @@ def register(subparsers, format_parent) -> None:
     p_update.add_argument("--period", choices=["monthly", "weekly", "yearly"], default="monthly")
     p_update.add_argument("--view", choices=["personal", "business", "all"], default="personal")
     p_update.set_defaults(func=handle_update, command_name="budget.update")
+
+    p_reallocate = budget_sub.add_parser("reallocate", parents=[format_parent], help="Move budget room between categories")
+    p_reallocate.add_argument("--from-category", required=True)
+    p_reallocate.add_argument("--to-category", required=True)
+    p_reallocate.add_argument("--amount", required=True)
+    p_reallocate.add_argument("--period", choices=["monthly", "weekly", "yearly"], default="monthly")
+    p_reallocate.add_argument("--view", choices=["personal", "business", "all"], default="personal")
+    p_reallocate.set_defaults(func=handle_reallocate, command_name="budget.reallocate")
 
     p_delete = budget_sub.add_parser("delete", parents=[format_parent], help="Delete budget")
     p_delete.add_argument("--id")
@@ -74,13 +88,16 @@ def register(subparsers, format_parent) -> None:
 
 
 def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    if float(args.amount) < 0:
+        raise ValidationError("Budget amount cannot be negative")
     category_id = get_category_id_by_name(conn, args.category)
     if not category_id:
-        raise ValueError(f"Category '{args.category}' not found")
+        raise NotFoundError(f"Category '{args.category}' not found")
 
     view = getattr(args, "view", "personal")
     if view == "all":
-        raise ValueError("budget set requires --view personal or --view business")
+        raise ValidationError("budget set requires --view personal or --view business")
     use_type = "Business" if view == "business" else "Personal"
     existing = find_budget(conn, category_id=category_id, period=args.period, use_type=use_type)
 
@@ -90,9 +107,12 @@ def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
         amount_dollars=args.amount,
         period=args.period,
         use_type=use_type,
+        dry_run=dry_run,
     )
     created = existing is None
     action = "created" if created else "updated"
+    if not dry_run:
+        log_event(_connected_main_db_path(conn), "feature.budget_set")
     return {
         "data": {
             "budget_id": budget_id,
@@ -102,9 +122,14 @@ def handle_set(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "use_type": use_type,
             "action": action,
             "created": created,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {"total_budgets": 1},
-        "cli_report": f"{action.title()} {args.period} budget for {args.category} [{use_type}]",
+        "cli_report": (
+            f"[DRY RUN] Would {action} {args.period} budget for {args.category} [{use_type}]"
+            if dry_run
+            else f"{action.title()} {args.period} budget for {args.category} [{use_type}]"
+        ),
     }
 
 
@@ -116,35 +141,43 @@ def _resolve_active_budget_by_category(
 ) -> tuple[str, str, str, str]:
     category_name = getattr(args, "category", None)
     if not category_name:
-        raise ValueError(f"budget {action} requires --id or --category")
+        raise ValidationError(f"budget {action} requires --id or --category")
 
     view = getattr(args, "view", "personal")
     if view == "all":
-        raise ValueError(f"budget {action} requires --view personal or --view business")
+        raise ValidationError(f"budget {action} requires --view personal or --view business")
     use_type = "Business" if view == "business" else "Personal"
 
     period = getattr(args, "period", "monthly")
     category_id = get_category_id_by_name(conn, category_name)
     if not category_id:
-        raise ValueError(f"Category '{category_name}' not found")
+        raise NotFoundError(f"Category '{category_name}' not found")
 
     budget_row = find_budget(conn, category_id=category_id, period=period, use_type=use_type)
     if not budget_row:
-        raise ValueError(f"no budget found for {category_name} ({use_type}, {period})")
+        raise NotFoundError(f"no budget found for {category_name} ({use_type}, {period})")
 
     return str(budget_row["id"]), category_name, period, use_type
 
 
 def handle_update(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    if float(args.amount) < 0:
+        raise ValidationError("Budget amount cannot be negative")
     if getattr(args, "id", None):
-        budget_id = update_budget(conn, budget_id=args.id, amount_dollars=args.amount)
+        budget_id = update_budget(conn, budget_id=args.id, amount_dollars=args.amount, dry_run=dry_run)
         return {
             "data": {
                 "budget_id": budget_id,
                 "amount": float(args.amount),
+                **({"dry_run": True} if dry_run else {}),
             },
             "summary": {"total_budgets": 1},
-            "cli_report": f"Updated budget {budget_id}",
+            "cli_report": (
+                f"[DRY RUN] Would update budget {budget_id}"
+                if dry_run
+                else f"Updated budget {budget_id}"
+            ),
         }
 
     budget_id, category_name, period, use_type = _resolve_active_budget_by_category(
@@ -152,7 +185,7 @@ def handle_update(args, conn: sqlite3.Connection) -> dict[str, Any]:
         conn,
         action="update",
     )
-    update_budget(conn, budget_id=budget_id, amount_dollars=args.amount)
+    update_budget(conn, budget_id=budget_id, amount_dollars=args.amount, dry_run=dry_run)
     return {
         "data": {
             "budget_id": budget_id,
@@ -160,22 +193,82 @@ def handle_update(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "period": period,
             "amount": float(args.amount),
             "use_type": use_type,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {"total_budgets": 1},
-        "cli_report": f"Updated {period} budget for {category_name} [{use_type}]",
+        "cli_report": (
+            f"[DRY RUN] Would update {period} budget for {category_name} [{use_type}]"
+            if dry_run
+            else f"Updated {period} budget for {category_name} [{use_type}]"
+        ),
+    }
+
+
+def handle_reallocate(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    if float(args.amount) <= 0:
+        raise ValidationError("Reallocation amount must be positive")
+
+    period = getattr(args, "period", "monthly")
+    from_budget_id, from_category, _from_period, use_type = _resolve_active_budget_by_category(
+        SimpleNamespace(category=args.from_category, period=period, view=args.view),
+        conn,
+        action="reallocate",
+    )
+    to_budget_id, to_category, _to_period, to_use_type = _resolve_active_budget_by_category(
+        SimpleNamespace(category=args.to_category, period=period, view=args.view),
+        conn,
+        action="reallocate",
+    )
+    if use_type != to_use_type:
+        raise ValidationError("Budget reallocation requires source and target budgets in the same view")
+
+    result = reallocate_budget(
+        conn,
+        from_budget_id=from_budget_id,
+        to_budget_id=to_budget_id,
+        amount_dollars=args.amount,
+        dry_run=dry_run,
+    )
+    return {
+        "data": {
+            **result,
+            "from_category": from_category,
+            "to_category": to_category,
+            "period": period,
+            "amount": cents_to_dollars(int(result["transfer_cents"])),
+            "use_type": use_type,
+            "from_amount": cents_to_dollars(int(result["from_after_cents"])),
+            "to_amount": cents_to_dollars(int(result["to_after_cents"])),
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {"total_budgets": 2},
+        "cli_report": (
+            f"[DRY RUN] Would move {fmt_dollars(cents_to_dollars(int(result['transfer_cents'])))} "
+            f"from {from_category} to {to_category} [{use_type}]"
+            if dry_run
+            else f"Moved {fmt_dollars(cents_to_dollars(int(result['transfer_cents'])))} "
+            f"from {from_category} to {to_category} [{use_type}]"
+        ),
     }
 
 
 def handle_delete(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     if getattr(args, "id", None):
-        budget_id = delete_budget(conn, budget_id=args.id)
+        budget_id = delete_budget(conn, budget_id=args.id, dry_run=dry_run)
         return {
             "data": {
                 "budget_id": budget_id,
                 "deleted": True,
+                **({"dry_run": True} if dry_run else {}),
             },
             "summary": {"total_budgets": 1},
-            "cli_report": f"Deleted budget {budget_id}",
+            "cli_report": (
+                f"[DRY RUN] Would delete budget {budget_id}"
+                if dry_run
+                else f"Deleted budget {budget_id}"
+            ),
         }
 
     budget_id, category_name, period, use_type = _resolve_active_budget_by_category(
@@ -183,7 +276,7 @@ def handle_delete(args, conn: sqlite3.Connection) -> dict[str, Any]:
         conn,
         action="delete",
     )
-    delete_budget(conn, budget_id=budget_id)
+    delete_budget(conn, budget_id=budget_id, dry_run=dry_run)
     return {
         "data": {
             "budget_id": budget_id,
@@ -191,9 +284,14 @@ def handle_delete(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "period": period,
             "use_type": use_type,
             "deleted": True,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {"total_budgets": 1},
-        "cli_report": f"Deleted {period} budget for {category_name} [{use_type}]",
+        "cli_report": (
+            f"[DRY RUN] Would delete {period} budget for {category_name} [{use_type}]"
+            if dry_run
+            else f"Deleted {period} budget for {category_name} [{use_type}]"
+        ),
     }
 
 

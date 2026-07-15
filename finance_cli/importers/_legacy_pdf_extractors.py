@@ -15,7 +15,7 @@ To use any of these, import the helpers they depend on from pdf.py:
 from __future__ import annotations
 
 import re
-from datetime import datetime
+from datetime import UTC, datetime
 from pathlib import Path
 
 from .pdf import (
@@ -97,7 +97,7 @@ def _extract_bofa_checking(pdf_path: Path) -> ExtractResult:
         match = re.match(r"^(\d{2}/\d{2}/\d{2})\s+(.+?)\s+(-?\$?\(?\d[\d,]*\.\d{2}\)?)$", line)
         if match and section in {"deposit", "withdrawal"}:
             date_token, description, amount_token = match.groups()
-            iso_date = _to_iso_date(date_token, datetime.utcnow().year)
+            iso_date = _to_iso_date(date_token, datetime.now(UTC).year)
             if not iso_date:
                 continue
             amount_cents = _parse_amount_to_cents(amount_token)
@@ -119,7 +119,7 @@ def _extract_bofa_checking(pdf_path: Path) -> ExtractResult:
         check_match = re.match(r"^(\d{2}/\d{2}/\d{2})\s+(\d+)\s+(-?\$?\(?\d[\d,]*\.\d{2}\)?)$", line)
         if check_match and section == "check":
             date_token, check_num, amount_token = check_match.groups()
-            iso_date = _to_iso_date(date_token, datetime.utcnow().year)
+            iso_date = _to_iso_date(date_token, datetime.now(UTC).year)
             if not iso_date:
                 continue
             amount_cents = -abs(_parse_amount_to_cents(amount_token))

@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+import base64
 import json
 import sqlite3
 import uuid
+from pathlib import Path
 from typing import Any
+
+from finance_cli.exceptions import NotFoundError, ValidationError
 
 from ..ai_categorizer import categorize_uncategorized
 from ..categorizer import MatchResult, _apply_split_rule, apply_match, match_transaction, normalize_description
@@ -20,8 +24,29 @@ from ..user_rules import (
 from .common import get_category_id_by_name
 
 
+def _make_restore_token(payload: dict[str, Any]) -> str:
+    token_payload = {"version": 1, **payload}
+    raw = json.dumps(token_payload, separators=(",", ":"), sort_keys=True).encode("utf-8")
+    return base64.urlsafe_b64encode(raw).decode("ascii")
+
+
+def _parse_restore_token(restore_token: str) -> dict[str, Any]:
+    try:
+        raw = base64.urlsafe_b64decode(restore_token.encode("ascii"))
+        payload = json.loads(raw.decode("utf-8"))
+    except Exception as exc:
+        raise ValidationError("Invalid restore_token") from exc
+    if not isinstance(payload, dict) or payload.get("version") != 1:
+        raise ValidationError("Invalid restore_token")
+    return payload
+
+
 def register(subparsers, format_parent) -> None:
-    parser = subparsers.add_parser("cat", parents=[format_parent], help="Category commands")
+    parser = subparsers.add_parser(
+        "cat",
+        parents=[format_parent],
+        help="Categorization knowledge: vendor memory, rules, and auto-categorize",
+    )
     cat_sub = parser.add_subparsers(dest="cat_command", required=True)
 
     p_list = cat_sub.add_parser("list", parents=[format_parent], help="List categories")
@@ -58,6 +83,10 @@ def register(subparsers, format_parent) -> None:
     p_m_delete = memory_sub.add_parser("delete", parents=[format_parent], help="Delete memory rule")
     p_m_delete.add_argument("id")
     p_m_delete.set_defaults(func=handle_memory_delete, command_name="cat.memory.delete")
+
+    p_m_restore = memory_sub.add_parser("restore", parents=[format_parent], help="Restore a soft-deleted memory rule")
+    p_m_restore.add_argument("restore_token")
+    p_m_restore.set_defaults(func=handle_memory_restore, command_name="cat.memory.restore")
 
     p_m_undo = memory_sub.add_parser("undo", parents=[format_parent], help="Undo memory from transaction")
     p_m_undo.add_argument("txn_id")
@@ -169,19 +198,28 @@ def handle_tree(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     existing = conn.execute("SELECT id FROM categories WHERE name = ?", (args.name,)).fetchone()
     if existing:
         return {
-            "data": {"category_id": existing["id"], "created": False},
+            "data": {
+                "category_id": existing["id"],
+                "created": False,
+                **({"dry_run": True} if dry_run else {}),
+            },
             "summary": {"total_categories": 1},
-            "cli_report": f"Category '{args.name}' already exists",
+            "cli_report": (
+                f"[DRY RUN] Category '{args.name}' already exists"
+                if dry_run
+                else f"Category '{args.name}' already exists"
+            ),
         }
 
     parent_id = None
     if args.parent:
         parent = conn.execute("SELECT id FROM categories WHERE name = ?", (args.parent,)).fetchone()
         if not parent:
-            raise ValueError(f"Parent category '{args.parent}' not found")
+            raise NotFoundError(f"Parent category '{args.parent}' not found")
         parent_id = parent["id"]
 
     category_id = uuid.uuid4().hex
@@ -189,13 +227,24 @@ def handle_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "INSERT INTO categories (id, name, parent_id, is_system) VALUES (?, ?, ?, 0)",
         (category_id, args.name, parent_id),
     )
-    conn.commit()
-
-    return {
-        "data": {"category_id": category_id, "created": True},
+    result = {
+        "data": {
+            "category_id": category_id,
+            "created": True,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_categories": 1},
-        "cli_report": f"Added category '{args.name}'",
+        "cli_report": (
+            f"[DRY RUN] Would add category '{args.name}'"
+            if dry_run
+            else f"Added category '{args.name}'"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_memory_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
@@ -234,13 +283,14 @@ def handle_memory_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_memory_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     category_id = get_category_id_by_name(conn, args.category)
     if not category_id:
-        raise ValueError(f"Category '{args.category}' not found")
+        raise NotFoundError(f"Category '{args.category}' not found")
 
     pattern = normalize_description(args.pattern)
     if not pattern:
-        raise ValueError("Pattern cannot be empty after normalization")
+        raise ValidationError("Pattern cannot be empty after normalization")
 
     existing = conn.execute(
         "SELECT id FROM vendor_memory WHERE description_pattern = ? AND use_type = ?",
@@ -281,31 +331,57 @@ def handle_memory_add(args, conn: sqlite3.Connection) -> dict[str, Any]:
         )
         created = True
 
-    conn.commit()
-    return {
-        "data": {"rule_id": rule_id, "created": created},
+    result = {
+        "data": {
+            "rule_id": rule_id,
+            "created": created,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_rules": 1},
-        "cli_report": f"Saved vendor memory rule {rule_id}",
+        "cli_report": (
+            f"[DRY RUN] Would save vendor memory rule {rule_id}"
+            if dry_run
+            else f"Saved vendor memory rule {rule_id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_memory_disable(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     cursor = conn.execute(
         "UPDATE vendor_memory SET is_enabled = 0 WHERE id = ?",
         (args.id,),
     )
-    conn.commit()
     if cursor.rowcount == 0:
-        raise ValueError(f"Rule {args.id} not found")
+        raise NotFoundError(f"Rule {args.id} not found")
 
-    return {
-        "data": {"rule_id": args.id, "is_enabled": False},
+    result = {
+        "data": {
+            "rule_id": args.id,
+            "is_enabled": False,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_rules": 1},
-        "cli_report": f"Disabled rule {args.id}",
+        "cli_report": (
+            f"[DRY RUN] Would disable rule {args.id}"
+            if dry_run
+            else f"Disabled rule {args.id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_memory_confirm(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     cursor = conn.execute(
         """
         UPDATE vendor_memory
@@ -315,63 +391,217 @@ def handle_memory_confirm(args, conn: sqlite3.Connection) -> dict[str, Any]:
         """,
         (args.id,),
     )
-    conn.commit()
     if cursor.rowcount == 0:
-        raise ValueError(f"Rule {args.id} not found")
+        raise NotFoundError(f"Rule {args.id} not found")
 
-    return {
-        "data": {"rule_id": args.id, "is_confirmed": True},
+    result = {
+        "data": {
+            "rule_id": args.id,
+            "is_confirmed": True,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_rules": 1},
-        "cli_report": f"Confirmed rule {args.id}",
+        "cli_report": (
+            f"[DRY RUN] Would confirm rule {args.id}"
+            if dry_run
+            else f"Confirmed rule {args.id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_memory_delete(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    rule = conn.execute(
+        """
+        SELECT id, description_pattern, canonical_name, category_id, use_type,
+               confidence, priority, is_enabled, is_confirmed, match_count, last_matched
+          FROM vendor_memory
+         WHERE id = ?
+        """,
+        (args.id,),
+    ).fetchone()
+    if rule is None:
+        raise NotFoundError(f"Rule {args.id} not found")
+
+    linked_txn_ids = [
+        row["id"]
+        for row in conn.execute(
+            "SELECT id FROM transactions WHERE category_rule_id = ?",
+            (args.id,),
+        ).fetchall()
+    ]
     conn.execute(
         "UPDATE transactions SET category_rule_id = NULL WHERE category_rule_id = ?",
         (args.id,),
     )
-    cursor = conn.execute("DELETE FROM vendor_memory WHERE id = ?", (args.id,))
-    conn.commit()
-    if cursor.rowcount == 0:
-        raise ValueError(f"Rule {args.id} not found")
+    conn.execute("UPDATE vendor_memory SET is_enabled = 0 WHERE id = ?", (args.id,))
+    restore_token = _make_restore_token(
+        {
+            "operation": "cat_memory_delete",
+            "rule": dict(rule),
+            "linked_txn_ids": linked_txn_ids,
+        }
+    )
 
-    return {
-        "data": {"rule_id": args.id, "deleted": True},
+    result = {
+        "data": {
+            "rule_id": args.id,
+            "deleted": True,
+            "soft_deleted": True,
+            "linked_transaction_count": len(linked_txn_ids),
+            "restore_token": restore_token,
+            "undo_tool": "cat_memory_restore",
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_rules": 1},
-        "cli_report": f"Deleted rule {args.id}",
+        "cli_report": (
+            f"[DRY RUN] Would soft-delete rule {args.id}"
+            if dry_run
+            else f"Soft-deleted rule {args.id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
+
+
+def handle_memory_restore(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
+    payload = _parse_restore_token(args.restore_token)
+    if payload.get("operation") != "cat_memory_delete":
+        raise ValidationError("restore_token operation is not supported by cat memory restore")
+
+    rule = payload.get("rule")
+    if not isinstance(rule, dict) or not rule.get("id"):
+        raise ValidationError("restore_token is missing vendor memory rule data")
+    linked_txn_ids = [
+        str(txn_id)
+        for txn_id in payload.get("linked_txn_ids", [])
+        if isinstance(txn_id, str) and txn_id
+    ]
+
+    conn.execute(
+        """
+        INSERT INTO vendor_memory (
+            id,
+            description_pattern,
+            canonical_name,
+            category_id,
+            use_type,
+            confidence,
+            priority,
+            is_enabled,
+            is_confirmed,
+            match_count,
+            last_matched
+        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+            description_pattern = excluded.description_pattern,
+            canonical_name = excluded.canonical_name,
+            category_id = excluded.category_id,
+            use_type = excluded.use_type,
+            confidence = excluded.confidence,
+            priority = excluded.priority,
+            is_enabled = excluded.is_enabled,
+            is_confirmed = excluded.is_confirmed,
+            match_count = excluded.match_count,
+            last_matched = excluded.last_matched
+        """,
+        (
+            rule["id"],
+            rule.get("description_pattern"),
+            rule.get("canonical_name"),
+            rule.get("category_id"),
+            rule.get("use_type") or "Any",
+            float(rule.get("confidence", 1.0)),
+            int(rule.get("priority", 0)),
+            int(rule.get("is_enabled", 1)),
+            int(rule.get("is_confirmed", 1)),
+            int(rule.get("match_count", 0)),
+            rule.get("last_matched"),
+        ),
+    )
+    restored_links = 0
+    for txn_id in linked_txn_ids:
+        cursor = conn.execute(
+            "UPDATE transactions SET category_rule_id = ? WHERE id = ?",
+            (rule["id"], txn_id),
+        )
+        restored_links += int(cursor.rowcount or 0)
+
+    result = {
+        "data": {
+            "rule_id": rule["id"],
+            "restored": True,
+            "restored_transaction_links": restored_links,
+            **({"dry_run": True} if dry_run else {}),
+        },
+        "summary": {"total_rules": 1},
+        "cli_report": (
+            f"[DRY RUN] Would restore rule {rule['id']}"
+            if dry_run
+            else f"Restored rule {rule['id']}"
+        ),
+    }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_memory_undo(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     txn = conn.execute(
         "SELECT category_rule_id FROM transactions WHERE id = ?",
         (args.txn_id,),
     ).fetchone()
     if not txn:
-        raise ValueError(f"Transaction {args.txn_id} not found")
+        raise NotFoundError(f"Transaction {args.txn_id} not found")
     rule_id = txn["category_rule_id"]
     if not rule_id:
-        raise ValueError(f"Transaction {args.txn_id} has no category rule")
+        raise ValidationError(f"Transaction {args.txn_id} has no category rule")
 
     conn.execute(
         "UPDATE transactions SET category_rule_id = NULL, category_id = NULL, category_source = NULL, category_confidence = NULL WHERE category_rule_id = ?",
         (rule_id,),
     )
     conn.execute("DELETE FROM vendor_memory WHERE id = ?", (rule_id,))
-    conn.commit()
-
-    return {
-        "data": {"transaction_id": args.txn_id, "removed_rule_id": rule_id},
+    result = {
+        "data": {
+            "transaction_id": args.txn_id,
+            "removed_rule_id": rule_id,
+            **({"dry_run": True} if dry_run else {}),
+        },
         "summary": {"total_rules": 1},
-        "cli_report": f"Removed rule {rule_id}",
+        "cli_report": (
+            f"[DRY RUN] Would remove rule {rule_id}"
+            if dry_run
+            else f"Removed rule {rule_id}"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
-def handle_auto_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_auto_categorize(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     rows = conn.execute(
         """
-        SELECT id, description, use_type, source_category, is_payment
+        SELECT id, description, use_type, source_category, is_payment, amount_cents
           FROM transactions
          WHERE is_active = 1
            AND is_reviewed = 0
@@ -384,15 +614,20 @@ def handle_auto_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     updated = 0
     ambiguous = 0
+    total_cents = 0
     by_source: dict[str, int] = {}
 
     for row in rows:
+        match_kwargs: dict[str, Any] = {}
+        if rules_path is not None:
+            match_kwargs["rules_path"] = rules_path
         result: MatchResult | None = match_transaction(
             conn,
             row["description"],
             row["use_type"],
             source_category=row["source_category"],
             is_payment=bool(row["is_payment"]),
+            **match_kwargs,
         )
         if not result:
             continue
@@ -402,19 +637,29 @@ def handle_auto_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
             continue
         if result.category_source == "ambiguous":
             ambiguous += 1
-        if apply_match(conn, row["id"], result, dry_run=args.dry_run):
+        apply_kwargs: dict[str, Any] = {}
+        if rules_path is not None:
+            apply_kwargs["rules_path"] = rules_path
+        if apply_match(conn, row["id"], result, dry_run=args.dry_run, **apply_kwargs):
             updated += 1
+            total_cents += int(row["amount_cents"] or 0)
             source = result.category_source or "none"
             by_source[source] = by_source.get(source, 0) + 1
 
     ai_report: dict[str, Any] | None = None
     if args.ai:
+        ai_kwargs: dict[str, Any] = {}
+        if rules_path is not None:
+            ai_kwargs["rules_path"] = rules_path
+        api_key = getattr(args, "api_key", None)
         ai_report = categorize_uncategorized(
             conn,
             limit=max(len(rows), 1),
             dry_run=args.dry_run,
             provider=args.provider,
             batch_size=args.batch_size,
+            api_key=api_key,
+            **ai_kwargs,
         )
         if ai_report.get("categorized"):
             updated += int(ai_report["categorized"])
@@ -424,7 +669,13 @@ def handle_auto_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
     if args.dry_run:
         conn.rollback()
 
-    cli_lines = [f"Auto-categorized {updated} transactions"]
+    cli_lines = [
+        (
+            f"[DRY RUN] Would auto-categorize {updated} transactions"
+            if args.dry_run
+            else f"Auto-categorized {updated} transactions"
+        )
+    ]
     if args.ai and ai_report is not None:
         cli_lines.append(
             "ai: categorized={categorized} failed={failed} batches={batches} "
@@ -437,10 +688,12 @@ def handle_auto_categorize(args, conn: sqlite3.Connection) -> dict[str, Any]:
                 elapsed_ms=int(ai_report.get("elapsed_ms", 0)),
             )
         )
+        if ai_report.get("error"):
+            cli_lines.append(str(ai_report["error"]))
 
     return {
         "data": {"updated": updated, "ambiguous": ambiguous, "by_source": by_source, "ai": ai_report},
-        "summary": {"total_transactions": updated, "total_amount": 0},
+        "summary": {"total_transactions": updated, "total_amount": total_cents / 100},
         "cli_report": "\n".join(cli_lines),
     }
 
@@ -453,8 +706,13 @@ def _category_name_exists(conn: sqlite3.Connection, category_name: str) -> bool:
     return bool(row)
 
 
-def _find_split_candidates(conn: sqlite3.Connection, *, backfill: bool) -> list[dict[str, Any]]:
-    rules = load_rules()
+def _find_split_candidates(
+    conn: sqlite3.Connection,
+    *,
+    backfill: bool,
+    rules_path: Path | None = None,
+) -> list[dict[str, Any]]:
+    rules = load_rules(path=rules_path)
     where = [
         "t.is_active = 1",
         "t.parent_transaction_id IS NULL",
@@ -504,11 +762,15 @@ def _find_split_candidates(conn: sqlite3.Connection, *, backfill: bool) -> list[
     return matches
 
 
-def handle_apply_splits(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    matches = _find_split_candidates(conn, backfill=bool(args.backfill))
+def handle_apply_splits(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    matches = _find_split_candidates(conn, backfill=bool(args.backfill), rules_path=rules_path)
     split_count = 0
     if args.commit:
-        rules = load_rules()
+        rules = load_rules(path=rules_path)
         for match in matches:
             txn_id = str(match["transaction_id"])
             _apply_split_rule(conn, txn_id, rules)
@@ -547,8 +809,12 @@ def handle_apply_splits(args, conn: sqlite3.Connection) -> dict[str, Any]:
     }
 
 
-def handle_classify_use_type(args, conn: sqlite3.Connection) -> dict[str, Any]:
-    rules = load_rules()
+def handle_classify_use_type(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    rules = load_rules(path=rules_path)
     rows = conn.execute(
         """
         SELECT t.id, t.description, t.category_source, c.name AS category_name
@@ -699,8 +965,11 @@ def _backfill_source_category(conn: sqlite3.Connection) -> tuple[int, int]:
     return plaid_backfilled, csv_pdf_backfilled
 
 
-def _seed_category_mappings(conn: sqlite3.Connection) -> int:
-    rules = load_rules()
+def _seed_category_mappings(
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> int:
+    rules = load_rules(path=rules_path)
     seeded = 0
     for source_category, target_category in rules.category_aliases.items():
         category_id = None
@@ -741,8 +1010,11 @@ def _seed_category_mappings(conn: sqlite3.Connection) -> int:
     return seeded
 
 
-def _remap_non_canonical_categories(conn: sqlite3.Connection) -> dict[str, Any]:
-    rules = load_rules()
+def _remap_non_canonical_categories(
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    rules = load_rules(path=rules_path)
     categories = conn.execute("SELECT id, name FROM categories ORDER BY name ASC").fetchall()
 
     categories_remapped = 0
@@ -813,10 +1085,14 @@ def _mark_canonical_categories_as_system(conn: sqlite3.Connection) -> int:
     return marked
 
 
-def handle_normalize(args, conn: sqlite3.Connection) -> dict[str, Any]:
+def handle_normalize(
+    args,
+    conn: sqlite3.Connection,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     plaid_backfilled, csv_pdf_backfilled = _backfill_source_category(conn)
-    seeded_mappings = _seed_category_mappings(conn)
-    remap_report = _remap_non_canonical_categories(conn)
+    seeded_mappings = _seed_category_mappings(conn, rules_path=rules_path)
+    remap_report = _remap_non_canonical_categories(conn, rules_path=rules_path)
     canonical_marked = _mark_canonical_categories_as_system(conn)
 
     if args.dry_run:
@@ -838,8 +1114,9 @@ def handle_normalize(args, conn: sqlite3.Connection) -> dict[str, Any]:
         "unmapped_categories": remap_report["unmapped_categories"],
         "canonical_marked": canonical_marked,
     }
+    report_action = "[DRY RUN] Would normalize categories" if args.dry_run else "Normalized categories"
     cli_lines = [
-        f"Normalized categories dry_run={bool(args.dry_run)}",
+        report_action,
         f"backfilled source_category={data['source_category_backfilled']['total']}",
         f"seeded mappings={seeded_mappings}",
         f"categories remapped={remap_report['categories_remapped']}",

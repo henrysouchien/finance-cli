@@ -4,37 +4,17 @@ from __future__ import annotations
 
 import os
 import shutil
-import uuid
 import webbrowser
 from pathlib import Path
 from typing import Any
 
-from ..config import DEFAULT_DATA_DIR, DEFAULT_ENV_PATH, get_db_path
-from ..plaid_client import (
-    PlaidConfigStatus,
-    PlaidUnavailableError,
-    complete_link_session,
-    config_status,
-    create_hosted_link_session,
-    refresh_balances,
-    run_sync,
-    sanitize_client_user_id,
-)
-from ..user_rules import CANONICAL_CATEGORIES, _CATEGORY_HIERARCHY as USER_RULES_CATEGORY_HIERARCHY, resolve_rules_path
+from ..category_seed import seed_canonical_categories as _seed_canonical_categories
+from ..config import PACKAGE_TEMPLATE_DIR, DEFAULT_ENV_PATH, get_db_path
+from ..db import _connected_main_db_path
+from ..user_rules import CANONICAL_CATEGORIES, resolve_rules_path
 from . import db_cmd, plaid_cmd
 
 _ENV_DISABLE_VALUES = {"1", "true", "yes"}
-
-_CATEGORY_HIERARCHY: dict[str, list[str]] = USER_RULES_CATEGORY_HIERARCHY
-
-_INCOME_NAMES: frozenset[str] = frozenset(
-    {
-        "Income",
-        "Income: Salary",
-        "Income: Business",
-        "Income: Other",
-    }
-)
 
 _ENV_TEMPLATE = """# finance_cli environment configuration
 # Fill in your values below.
@@ -43,8 +23,8 @@ _ENV_TEMPLATE = """# finance_cli environment configuration
 PLAID_CLIENT_ID=
 PLAID_SECRET=
 PLAID_ENV=sandbox
-# Replace example.com with your production callback domain.
-PLAID_COMPLETION_REDIRECT_URI=https://example.com/plaid/complete
+# After Plaid hosted link completes, user is redirected here.
+PLAID_COMPLETION_REDIRECT_URI=https://cashnerd.ai/plaid/complete
 
 # --- AWS (for Plaid token storage) ---
 # boto3 credential chain is used (env vars, profile, or IAM role).
@@ -66,18 +46,110 @@ AWS_DEFAULT_REGION=us-east-1
 """
 
 
+def _plaid_client_attr(name: str):
+    from .. import plaid_client
+
+    return getattr(plaid_client, name)
+
+
+def _plaid_unavailable_error() -> type[Exception]:
+    return _plaid_client_attr("PlaidUnavailableError")
+
+
+def complete_link_session(*args, **kwargs):
+    return _plaid_client_attr("complete_link_session")(*args, **kwargs)
+
+
+def config_status(*args, **kwargs):
+    return _plaid_client_attr("config_status")(*args, **kwargs)
+
+
+def create_hosted_link_session(*args, **kwargs):
+    return _plaid_client_attr("create_hosted_link_session")(*args, **kwargs)
+
+
+def refresh_balances(*args, **kwargs):
+    return _plaid_client_attr("refresh_balances")(*args, **kwargs)
+
+
+def run_sync(*args, **kwargs):
+    return _plaid_client_attr("run_sync")(*args, **kwargs)
+
+
+def sanitize_client_user_id(*args, **kwargs):
+    return _plaid_client_attr("sanitize_client_user_id")(*args, **kwargs)
+
+
+def _sanitize_plaid_status_for_setup(plaid_status: dict[str, Any]) -> dict[str, Any]:
+    sanitized = dict(plaid_status)
+    items = plaid_status.get("items") or []
+    sanitized_items: list[Any] = []
+    for item in items:
+        if isinstance(item, dict):
+            sanitized_items.append(
+                {
+                    key: value
+                    for key, value in item.items()
+                    if key not in {"access_token_ref", "sync_cursor"}
+                }
+            )
+        else:
+            sanitized_items.append(item)
+    sanitized["items"] = sanitized_items
+    sanitized["token_missing_count"] = int(
+        plaid_status.get("token_missing_count")
+        or sum(1 for item in sanitized_items if isinstance(item, dict) and bool(item.get("token_missing")))
+    )
+    return sanitized
+
+
+def _plaid_token_missing_next_step(plaid_status: dict[str, Any]) -> str | None:
+    token_missing_count = int(plaid_status.get("token_missing_count") or 0)
+    if token_missing_count <= 0:
+        return None
+
+    missing_items = [
+        item
+        for item in plaid_status.get("items") or []
+        if isinstance(item, dict) and bool(item.get("token_missing"))
+    ]
+    if len(missing_items) == 1:
+        plaid_item_id = str(missing_items[0].get("plaid_item_id") or "").strip()
+        if plaid_item_id:
+            return (
+                "One Plaid item is active but missing its token reference; "
+                f"run `finance_cli plaid unlink --item {plaid_item_id}` and reconnect."
+            )
+    return (
+        f"{token_missing_count} Plaid items are active but missing token references; "
+        "remove the stale local items and reconnect."
+    )
+
+
 def register(subparsers, format_parent) -> None:
-    parser = subparsers.add_parser("setup", parents=[format_parent], help="Environment setup and onboarding")
+    parser = subparsers.add_parser(
+        "setup",
+        parents=[format_parent],
+        help="Establish and verify your financial foundation",
+    )
     setup_sub = parser.add_subparsers(dest="setup_command", required=True)
 
-    p_check = setup_sub.add_parser("check", parents=[format_parent], help="Validate setup readiness")
+    p_check = setup_sub.add_parser("check", parents=[format_parent], help="Verify financial foundation readiness")
     p_check.set_defaults(func=handle_check, command_name="setup.check")
 
-    p_init = setup_sub.add_parser("init", parents=[format_parent], help="Initialize categories and config templates")
+    p_init = setup_sub.add_parser(
+        "init",
+        parents=[format_parent],
+        help="Establish financial foundation: categories and config",
+    )
     p_init.add_argument("--dry-run", action="store_true")
     p_init.set_defaults(func=handle_init, command_name="setup.init")
 
-    p_connect = setup_sub.add_parser("connect", parents=[format_parent], help="Link a Plaid institution and sync")
+    p_connect = setup_sub.add_parser(
+        "connect",
+        parents=[format_parent],
+        help="Connect a bank to start building financial history",
+    )
     p_connect.add_argument("--user-id", default="default")
     p_connect.add_argument("--include-liabilities", action="store_true")
     p_connect.add_argument("--timeout", type=int, default=300)
@@ -85,7 +157,7 @@ def register(subparsers, format_parent) -> None:
     p_connect.add_argument("--open-browser", action="store_true")
     p_connect.set_defaults(func=handle_connect, command_name="setup.connect")
 
-    p_status = setup_sub.add_parser("status", parents=[format_parent], help="Show overall setup dashboard")
+    p_status = setup_sub.add_parser("status", parents=[format_parent], help="Show financial foundation health dashboard")
     p_status.set_defaults(func=handle_status, command_name="setup.status")
 
 
@@ -182,9 +254,13 @@ def _category_coverage(conn) -> dict[str, Any]:
     }
 
 
-def _run_env_checks(conn) -> dict[str, Any]:
+def _run_env_checks(
+    conn,
+    db_path: Path | None = None,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
     checks: list[dict[str, Any]] = []
-    db_path = get_db_path().expanduser().resolve()
+    db_path = (db_path or _connected_main_db_path(conn) or get_db_path()).expanduser().resolve()
     try:
         conn.execute("SELECT 1").fetchone()
         checks.append(
@@ -328,14 +404,14 @@ def _run_env_checks(conn) -> dict[str, Any]:
             )
         )
 
-    rules_path = resolve_rules_path()
-    if rules_path.exists():
+    resolved_rules_path = resolve_rules_path(rules_path)
+    if resolved_rules_path.exists():
         checks.append(
             _build_check(
                 "rules",
                 "Rules File",
                 "OK",
-                f"rules.yaml found at {rules_path}",
+                f"rules.yaml found at {resolved_rules_path}",
             )
         )
     else:
@@ -344,7 +420,7 @@ def _run_env_checks(conn) -> dict[str, Any]:
                 "rules",
                 "Rules File",
                 "FAIL",
-                f"rules.yaml missing at {rules_path}",
+                f"rules.yaml missing at {resolved_rules_path}",
                 "Run `finance_cli setup init` to bootstrap rules.yaml.",
             )
         )
@@ -379,8 +455,13 @@ def _format_checks_cli(payload: dict[str, Any]) -> str:
     return "\n".join(lines)
 
 
-def handle_check(args, conn) -> dict[str, Any]:
-    payload = _run_env_checks(conn)
+def handle_check(
+    args,
+    conn,
+    db_path: Path | None = None,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    payload = _run_env_checks(conn, db_path=db_path, rules_path=rules_path)
     return {
         "data": payload,
         "summary": {
@@ -389,137 +470,6 @@ def handle_check(args, conn) -> dict[str, Any]:
             "warn_count": payload["counts"]["warn"],
         },
         "cli_report": _format_checks_cli(payload),
-    }
-
-
-def _fetch_category_row(conn, name: str):
-    return conn.execute(
-        """
-        SELECT id, name, parent_id, level, is_income, is_system
-          FROM categories
-         WHERE lower(trim(name)) = lower(trim(?))
-         ORDER BY rowid ASC
-         LIMIT 1
-        """,
-        (name,),
-    ).fetchone()
-
-
-def _normalize_parent_id(value: Any) -> str | None:
-    text = str(value or "").strip()
-    return text or None
-
-
-def _category_updates(row, *, expected_parent_id: str | None, expected_level: int, expected_is_income: int) -> dict[str, Any]:
-    updates: dict[str, Any] = {}
-    if _normalize_parent_id(row["parent_id"]) != _normalize_parent_id(expected_parent_id):
-        updates["parent_id"] = expected_parent_id
-    if int(row["level"] or 0) != int(expected_level):
-        updates["level"] = int(expected_level)
-    if int(row["is_income"] or 0) != int(expected_is_income):
-        updates["is_income"] = int(expected_is_income)
-    if int(row["is_system"] or 0) != 1:
-        updates["is_system"] = 1
-    return updates
-
-
-def _reconcile_single_category(
-    conn,
-    *,
-    name: str,
-    expected_parent_id: str | None,
-    expected_level: int,
-    expected_is_income: int,
-    dry_run: bool,
-) -> tuple[str, str]:
-    row = _fetch_category_row(conn, name)
-    if row is None:
-        new_id = uuid.uuid4().hex
-        if not dry_run:
-            conn.execute(
-                """
-                INSERT INTO categories (id, name, parent_id, level, is_income, is_system, sort_order)
-                VALUES (?, ?, ?, ?, ?, 1, 0)
-                """,
-                (new_id, name, expected_parent_id, expected_level, expected_is_income),
-            )
-        return "created", new_id
-
-    updates = _category_updates(
-        row,
-        expected_parent_id=expected_parent_id,
-        expected_level=expected_level,
-        expected_is_income=expected_is_income,
-    )
-    category_id = str(row["id"])
-    if updates:
-        if not dry_run:
-            assignments = ", ".join(f"{column} = ?" for column in updates)
-            conn.execute(
-                f"UPDATE categories SET {assignments} WHERE id = ?",
-                (*updates.values(), category_id),
-            )
-        return "updated", category_id
-    return "already_correct", category_id
-
-
-def _seed_canonical_categories(conn, *, dry_run: bool) -> dict[str, Any]:
-    expected_names = set(_CATEGORY_HIERARCHY.keys())
-    for children in _CATEGORY_HIERARCHY.values():
-        expected_names.update(children)
-    if expected_names != set(CANONICAL_CATEGORIES):
-        raise ValueError("Canonical category hierarchy is out of sync with CANONICAL_CATEGORIES")
-
-    created = 0
-    updated = 0
-    already_correct = 0
-    parent_ids: dict[str, str] = {}
-
-    for parent_name in _CATEGORY_HIERARCHY:
-        status, category_id = _reconcile_single_category(
-            conn,
-            name=parent_name,
-            expected_parent_id=None,
-            expected_level=0,
-            expected_is_income=int(parent_name in _INCOME_NAMES),
-            dry_run=dry_run,
-        )
-        parent_ids[parent_name] = category_id
-        if status == "created":
-            created += 1
-        elif status == "updated":
-            updated += 1
-        else:
-            already_correct += 1
-
-    for parent_name, children in _CATEGORY_HIERARCHY.items():
-        for child_name in children:
-            status, _ = _reconcile_single_category(
-                conn,
-                name=child_name,
-                expected_parent_id=parent_ids[parent_name],
-                expected_level=1,
-                expected_is_income=int(child_name in _INCOME_NAMES),
-                dry_run=dry_run,
-            )
-            if status == "created":
-                created += 1
-            elif status == "updated":
-                updated += 1
-            else:
-                already_correct += 1
-
-    if not dry_run:
-        conn.commit()
-
-    return {
-        "dry_run": dry_run,
-        "created": 0 if dry_run else created,
-        "updated": 0 if dry_run else updated,
-        "already_correct": already_correct,
-        "would_create": created if dry_run else 0,
-        "would_update": updated if dry_run else 0,
-        "expected_total": len(CANONICAL_CATEGORIES),
     }
 
 
@@ -564,7 +514,7 @@ def _bootstrap_rules_file(*, dry_run: bool) -> dict[str, Any]:
             "dry_run": dry_run,
         }
 
-    source = DEFAULT_DATA_DIR / "rules.yaml"
+    source = PACKAGE_TEMPLATE_DIR / "rules_template.yaml"
     if not source.exists():
         raise ValueError(f"Packaged rules template missing at {source}")
 
@@ -589,9 +539,32 @@ def _bootstrap_rules_file(*, dry_run: bool) -> dict[str, Any]:
 
 
 def handle_init(args, conn) -> dict[str, Any]:
-    env_template = _ensure_env_template(dry_run=bool(args.dry_run))
+    gateway = getattr(args, "gateway", False)
+
+    if gateway:
+        env_template = {
+            "path": None,
+            "created": False,
+            "would_create": False,
+            "dry_run": bool(args.dry_run),
+            "skipped": True,
+        }
+    else:
+        env_template = _ensure_env_template(dry_run=bool(args.dry_run))
+
     categories = _seed_canonical_categories(conn, dry_run=bool(args.dry_run))
-    rules_file = _bootstrap_rules_file(dry_run=bool(args.dry_run))
+
+    if gateway:
+        rules_file = {
+            "path": None,
+            "created": False,
+            "source_path": None,
+            "would_create": False,
+            "dry_run": bool(args.dry_run),
+            "skipped": True,
+        }
+    else:
+        rules_file = _bootstrap_rules_file(dry_run=bool(args.dry_run))
 
     cli_lines = [f"setup init ({'dry-run' if args.dry_run else 'apply'})"]
     if args.dry_run:
@@ -600,15 +573,20 @@ def handle_init(args, conn) -> dict[str, Any]:
         )
     else:
         cli_lines.append(f"categories: created={categories['created']} updated={categories['updated']}")
-    cli_lines.append(
-        f".env template: {'created' if env_template['created'] else 'unchanged'} ({env_template['path']})"
-    )
-    if rules_file["created"]:
-        cli_lines.append(f"rules.yaml: created ({rules_file['path']})")
-    elif rules_file["would_create"]:
-        cli_lines.append(f"rules.yaml: would_create ({rules_file['path']})")
+
+    if gateway:
+        cli_lines.append(".env template: skipped (server-managed)")
+        cli_lines.append("rules.yaml: skipped (provisioned)")
     else:
-        cli_lines.append(f"rules.yaml: unchanged ({rules_file['path']})")
+        cli_lines.append(
+            f".env template: {'created' if env_template['created'] else 'unchanged'} ({env_template['path']})"
+        )
+        if rules_file["created"]:
+            cli_lines.append(f"rules.yaml: created ({rules_file['path']})")
+        elif rules_file["would_create"]:
+            cli_lines.append(f"rules.yaml: would_create ({rules_file['path']})")
+        else:
+            cli_lines.append(f"rules.yaml: unchanged ({rules_file['path']})")
 
     return {
         "data": {
@@ -627,13 +605,13 @@ def handle_init(args, conn) -> dict[str, Any]:
     }
 
 
-def _connect_preflight() -> tuple[PlaidConfigStatus, dict[str, Any]]:
+def _connect_preflight() -> tuple[Any, dict[str, Any]]:
     plaid = config_status()
     aws = _aws_readiness()
     return plaid, aws
 
 
-def _connect_preflight_error(plaid: PlaidConfigStatus, aws: dict[str, Any]) -> str | None:
+def _connect_preflight_error(plaid: Any, aws: dict[str, Any]) -> str | None:
     errors: list[str] = []
     if not plaid.has_sdk:
         errors.append("Plaid SDK missing: install plaid-python")
@@ -660,7 +638,7 @@ def handle_connect(args, conn) -> dict[str, Any]:
             include_balance=True,
             include_liabilities=bool(args.include_liabilities),
         )
-    except PlaidUnavailableError as exc:
+    except _plaid_unavailable_error() as exc:
         raise ValueError(str(exc)) from exc
 
     hosted_link_url = str(session.get("hosted_link_url") or "").strip()
@@ -748,14 +726,21 @@ def handle_connect(args, conn) -> dict[str, Any]:
     }
 
 
-def handle_status(args, conn) -> dict[str, Any]:
-    env = _run_env_checks(conn)
+def handle_status(
+    args,
+    conn,
+    db_path: Path | None = None,
+    rules_path: Path | None = None,
+) -> dict[str, Any]:
+    env = _run_env_checks(conn, db_path=db_path, rules_path=rules_path)
     db_status = db_cmd.handle_status(args, conn).get("data", {})
-    plaid_status = plaid_cmd.handle_status(args, conn).get("data", {})
+    plaid_status = _sanitize_plaid_status_for_setup(
+        plaid_cmd.handle_status(args, conn).get("data", {})
+    )
     coverage = _category_coverage(conn)
 
-    rules_path = resolve_rules_path()
-    rules_exists = rules_path.exists()
+    resolved_rules_path = resolve_rules_path(rules_path)
+    rules_exists = resolved_rules_path.exists()
 
     vendor_memory_row = conn.execute(
         "SELECT COUNT(*) AS enabled_count FROM vendor_memory WHERE is_enabled = 1"
@@ -767,6 +752,9 @@ def handle_status(args, conn) -> dict[str, Any]:
         suggestion = "Run `finance_cli setup connect --open-browser` to link your first institution."
         if suggestion not in next_steps:
             next_steps.append(suggestion)
+    token_missing_suggestion = _plaid_token_missing_next_step(plaid_status)
+    if token_missing_suggestion and token_missing_suggestion not in next_steps:
+        next_steps.append(token_missing_suggestion)
     if int(db_status.get("transaction_counts", {}).get("active") or 0) == 0:
         suggestion = "No active transactions yet; run `setup connect` or import statements."
         if suggestion not in next_steps:
@@ -787,7 +775,7 @@ def handle_status(args, conn) -> dict[str, Any]:
         "plaid": plaid_status,
         "categories": coverage,
         "vendor_memory": {"enabled_count": vendor_memory_enabled},
-        "rules": {"path": str(rules_path), "exists": rules_exists},
+        "rules": {"path": str(resolved_rules_path), "exists": rules_exists},
         "next_steps": next_steps,
     }
 
@@ -795,15 +783,19 @@ def handle_status(args, conn) -> dict[str, Any]:
     plaid_items = plaid_status.get("items") or []
     plaid_total = len(plaid_items)
     plaid_active = int(plaid_status.get("active_count") or 0)
+    plaid_token_missing = int(plaid_status.get("token_missing_count") or 0)
     env_total = env["counts"]["ok"] + env["counts"]["warn"] + env["counts"]["fail"]
 
     ready_label = "Ready" if env["ready"] else "Not Ready"
+    plaid_line = f"  Plaid Items:   {plaid_total} total, {plaid_active} active"
+    if plaid_token_missing:
+        plaid_line += f", {plaid_token_missing} token missing"
     cli_lines = [
         f"System Status: {ready_label}",
         "",
         f"  Environment:   {env['counts']['ok']}/{env_total} checks passed",
         f"  Transactions:  {active_txns:,} active",
-        f"  Plaid Items:   {plaid_total} total, {plaid_active} active",
+        plaid_line,
         f"  Categories:    {coverage['present_count']}/{coverage['expected_total']} canonical",
         f"  Vendor Memory: {vendor_memory_enabled:,} enabled rules",
         f"  Rules File:    {'rules.yaml found' if rules_exists else 'rules.yaml missing'}",
@@ -823,6 +815,7 @@ def handle_status(args, conn) -> dict[str, Any]:
             "ready": env["ready"],
             "warn_count": env["counts"]["warn"],
             "fail_count": env["counts"]["fail"],
+            "plaid_token_missing_count": plaid_token_missing,
         },
         "cli_report": "\n".join(cli_lines),
     }

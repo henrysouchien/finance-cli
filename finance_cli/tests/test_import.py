@@ -1,5 +1,8 @@
 from __future__ import annotations
 
+import csv
+import hashlib
+import logging
 import uuid
 from pathlib import Path
 from textwrap import dedent
@@ -15,7 +18,9 @@ from finance_cli.importers import (
     import_csv,
     import_income_csv,
     import_vendor_memory_csv,
+    upsert_account_alias,
 )
+from finance_cli.institution_names import canonicalize as canonicalize_institution_name
 from finance_cli.importers.pdf import ExtractResult, import_extracted_statement
 from finance_cli.plaid_client import PlaidConfigStatus, fetch_liabilities
 from finance_cli.user_rules import UserRules
@@ -32,6 +37,81 @@ def _write_csv(path: Path, content: str) -> Path:
     return path
 
 
+def _write_dict_csv(path: Path, fieldnames: list[str], rows: list[dict[str, str]]) -> Path:
+    with path.open("w", newline="", encoding="utf-8") as fh:
+        writer = csv.DictWriter(fh, fieldnames=fieldnames)
+        writer.writeheader()
+        for row in rows:
+            writer.writerow({name: row.get(name, "") for name in fieldnames})
+    return path
+
+
+def _csv_row(
+    *,
+    date: str,
+    description: str,
+    amount: str,
+    card_ending: str = "1234",
+    source: str = "Test Source",
+    account_type: str = "credit_card",
+    use_type: str = "Personal",
+    category: str = "Misc",
+    is_payment: str = "false",
+    transaction_id: str = "",
+) -> dict[str, str]:
+    return {
+        "Date": date,
+        "Description": description,
+        "Amount": amount,
+        "Card Ending": card_ending,
+        "Source": source,
+        "Account Type": account_type,
+        "Use Type": use_type,
+        "Category": category,
+        "Is Payment": is_payment,
+        "Transaction ID": transaction_id,
+    }
+
+
+_TXN_CSV_FIELDS = [
+    "Date",
+    "Description",
+    "Amount",
+    "Card Ending",
+    "Source",
+    "Account Type",
+    "Use Type",
+    "Category",
+    "Is Payment",
+    "Transaction ID",
+]
+
+
+def _csv_dedupe_key(
+    *,
+    cli_source: str,
+    card_ending: str,
+    date_value: str,
+    description: str,
+    amount_cents: int,
+    external_ref: str | None = None,
+    duplicate_ordinal: int = 1,
+) -> str:
+    source_feed = canonicalize_institution_name(cli_source)
+    hash_account_id = _account_id_for_source(cli_source, card_ending)
+    base_payload = [
+        source_feed,
+        hash_account_id,
+        date_value,
+        normalize_description(description),
+        str(amount_cents),
+        card_ending or "null",
+        external_ref or "null",
+    ]
+    base_fingerprint = hashlib.sha256("|".join(base_payload).encode("utf-8")).hexdigest()
+    return hashlib.sha256(f"{base_fingerprint}|{duplicate_ordinal}".encode("utf-8")).hexdigest()
+
+
 def _income_rules(income_sources: dict[str, dict]) -> UserRules:
     return UserRules(
         keyword_rules=[],
@@ -41,6 +121,23 @@ def _income_rules(income_sources: dict[str, dict]) -> UserRules:
         income_sources=income_sources,
         ai_categorizer={},
         raw={},
+    )
+
+
+def _same_source_income_rules() -> UserRules:
+    return _income_rules(
+        {
+            "kartra": {
+                "platform": "Kartra",
+                "category": "Income: Business",
+                "use_type": "Business",
+                "csv_columns": {
+                    "date": "Date",
+                    "amount": "Revenue (USD)",
+                    "description": "Product",
+                },
+            }
+        }
     )
 
 
@@ -77,6 +174,52 @@ def _seed_category(conn, name: str) -> str:
         (category_id, name),
     )
     return category_id
+
+
+def _insert_transaction(
+    conn,
+    *,
+    txn_id: str,
+    account_id: str | None,
+    date: str,
+    amount_cents: int,
+    description: str,
+    source: str = "csv_import",
+    dedupe_key: str | None = None,
+    is_active: int = 1,
+    parent_transaction_id: str | None = None,
+) -> None:
+    columns = [
+        "id",
+        "account_id",
+        "dedupe_key",
+        "date",
+        "description",
+        "amount_cents",
+        "source",
+        "is_active",
+    ]
+    values: list[object] = [
+        txn_id,
+        account_id,
+        dedupe_key or f"dedupe:{txn_id}",
+        date,
+        description,
+        amount_cents,
+        source,
+        is_active,
+    ]
+    if parent_transaction_id is not None:
+        columns.append("parent_transaction_id")
+        values.append(parent_transaction_id)
+    placeholders = ", ".join("?" for _ in values)
+    conn.execute(
+        f"""
+        INSERT INTO transactions ({", ".join(columns)})
+        VALUES ({placeholders})
+        """,
+        tuple(values),
+    )
 
 
 def _seed_plaid_liabilities_item(conn, *, plaid_item_id: str = "item_liab_test") -> None:
@@ -396,6 +539,539 @@ def test_import_income_csv_missing_date_or_amount_mapping_raises(tmp_path: Path)
 
 
 # -----------------------------------------------------------------------------
+# Same-source CSV dedup guard
+# -----------------------------------------------------------------------------
+
+
+class TestSameSourceCsvDedup:
+    @staticmethod
+    def _kartra_rules() -> UserRules:
+        return _income_rules(
+            {
+                "kartra": {
+                    "platform": "Kartra",
+                    "category": "Income: Business",
+                    "use_type": "Business",
+                    "csv_columns": {
+                        "date": "Date",
+                        "amount": "Revenue (USD)",
+                        "description": "Product",
+                    },
+                }
+            }
+        )
+
+    def test_overlapping_csv_dedup(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "overlap_a.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-01", description="ALPHA", amount="-10.00"),
+                _csv_row(date="2026-01-02", description="BETA", amount="-20.00"),
+                _csv_row(date="2026-01-03", description="GAMMA", amount="-30.00"),
+            ],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "overlap_b.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-02", description="BETA", amount="-20.00"),
+                _csv_row(date="2026-01-03", description="GAMMA", amount="-30.00"),
+                _csv_row(date="2026-01-04", description="DELTA", amount="-40.00"),
+            ],
+        )
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 3
+        assert first.skipped_duplicates == 0
+        assert second.inserted == 1
+        assert second.skipped_duplicates == 2
+        assert count == 4
+
+    def test_overlapping_csv_same_day_multiples(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        rows_a = [
+            _csv_row(date="2026-01-05", description="MTA*NYCT PAYGO", amount="-2.90")
+            for _ in range(3)
+        ]
+        rows_b = [
+            _csv_row(date="2026-01-05", description="MTA*NYCT PAYGO", amount="-2.90")
+            for _ in range(5)
+        ]
+        csv_a = _write_dict_csv(tmp_path / "mta_a.csv", _TXN_CSV_FIELDS, rows_a)
+        csv_b = _write_dict_csv(tmp_path / "mta_b.csv", _TXN_CSV_FIELDS, rows_b)
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 3
+        assert second.inserted == 2
+        assert second.skipped_duplicates == 3
+        assert count == 5
+
+    def test_overlapping_csv_exact_subset(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        rows = [
+            _csv_row(date="2026-01-01", description="ONE", amount="-10.00"),
+            _csv_row(date="2026-01-02", description="TWO", amount="-20.00"),
+            _csv_row(date="2026-01-03", description="THREE", amount="-30.00"),
+        ]
+        csv_a = _write_dict_csv(tmp_path / "subset_a.csv", _TXN_CSV_FIELDS, rows)
+        csv_b = _write_dict_csv(tmp_path / "subset_b.csv", _TXN_CSV_FIELDS, rows)
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+
+        assert first.inserted == 3
+        assert second.inserted == 0
+        assert second.skipped_duplicates == 3
+
+    def test_overlapping_csv_no_overlap(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "no_overlap_a.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-01", description="A", amount="-10.00"),
+                _csv_row(date="2026-01-02", description="B", amount="-20.00"),
+            ],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "no_overlap_b.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-03", description="C", amount="-30.00"),
+                _csv_row(date="2026-01-04", description="D", amount="-40.00"),
+            ],
+        )
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 2
+        assert second.inserted == 2
+        assert second.skipped_duplicates == 0
+        assert count == 4
+
+    def test_overlapping_csv_same_amount_different_desc(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "same_amount_a.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-10", description="COFFEE SHOP", amount="-5.00")],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "same_amount_b.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-10", description="BAGEL SHOP", amount="-5.00")],
+        )
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 1
+        assert second.inserted == 1
+        assert second.skipped_duplicates == 0
+        assert count == 2
+
+    def test_overlapping_csv_with_external_ref(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "external_ref_a.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-11", description="DELTA", amount="-88.40")],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "external_ref_b.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-11", description="DELTA", amount="-88.40", transaction_id="AAA")],
+        )
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 1
+        assert second.inserted == 0
+        assert second.skipped_duplicates == 1
+        assert count == 1
+
+    def test_overlapping_csv_within_batch_multiples(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_path = _write_dict_csv(
+            tmp_path / "within_batch.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-12", description="MTA*NYCT PAYGO", amount="-2.90"),
+                _csv_row(date="2026-01-12", description="MTA*NYCT PAYGO", amount="-2.90"),
+                _csv_row(date="2026-01-12", description="MTA*NYCT PAYGO", amount="-2.90"),
+            ],
+        )
+
+        with connect(db_path) as conn:
+            report = import_csv(conn, csv_path, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert report.inserted == 3
+        assert report.skipped_duplicates == 0
+        assert count == 3
+
+    def test_overlapping_csv_dry_run_truthful(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "dry_run_alias_a.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-13", description="SPOTIFY", amount="-11.99", source="Chase", account_type="credit_card")],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "dry_run_alias_b.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-13", description="SPOTIFY", amount="-11.99", source="Chase", account_type="credit_card")],
+        )
+        hash_account_id = _account_id_for_source("Chase", "1234")
+
+        with connect(db_path) as conn:
+            _insert_account(
+                conn,
+                account_id="plaid_chase_1234",
+                plaid_account_id="plaid_ext_chase_1234",
+                institution_name="Chase",
+                account_type="credit_card",
+                card_ending="1234",
+            )
+            conn.commit()
+
+            first = import_csv(conn, csv_a, source_name="Chase", validate_name=False)
+            alias = conn.execute(
+                "SELECT canonical_id FROM account_aliases WHERE hash_account_id = ?",
+                (hash_account_id,),
+            ).fetchone()
+            dry_run = import_csv(conn, csv_b, source_name="Chase", dry_run=True, validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 1
+        assert alias is not None
+        assert alias["canonical_id"] == "plaid_chase_1234"
+        assert dry_run.inserted == 0
+        assert dry_run.skipped_duplicates == 1
+        assert count == 1
+
+    def test_overlapping_csv_alias_resolved(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "alias_commit_a.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-14", description="SPOTIFY", amount="-11.99", source="Chase", account_type="credit_card")],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "alias_commit_b.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-14", description="SPOTIFY", amount="-11.99", source="Chase", account_type="credit_card")],
+        )
+        hash_account_id = _account_id_for_source("Chase", "1234")
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Chase", validate_name=False)
+            _insert_account(
+                conn,
+                account_id="plaid_chase_1234",
+                plaid_account_id="plaid_ext_chase_1234",
+                institution_name="Chase",
+                account_type="credit_card",
+                card_ending="1234",
+            )
+            upsert_account_alias(conn, hash_account_id=hash_account_id, canonical_id="plaid_chase_1234")
+            conn.commit()
+
+            second = import_csv(conn, csv_b, source_name="Chase", validate_name=False)
+            row = conn.execute(
+                "SELECT account_id FROM transactions WHERE description = 'SPOTIFY'"
+            ).fetchone()
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 1
+        assert second.inserted == 0
+        assert second.skipped_duplicates == 1
+        assert row["account_id"] == "plaid_chase_1234"
+        assert count == 1
+
+    def test_overlapping_income_csv_dedup(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        rules = self._kartra_rules()
+        csv_a = _write_dict_csv(
+            tmp_path / "income_overlap_a.csv",
+            ["Date", "Revenue (USD)", "Product"],
+            [
+                {"Date": "2026-01-01", "Revenue (USD)": "100.00", "Product": "Course A"},
+                {"Date": "2026-01-02", "Revenue (USD)": "25.00", "Product": "Course B"},
+            ],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "income_overlap_b.csv",
+            ["Date", "Revenue (USD)", "Product"],
+            [
+                {"Date": "2026-01-02", "Revenue (USD)": "25.00", "Product": "Course B"},
+                {"Date": "2026-01-03", "Revenue (USD)": "50.00", "Product": "Course C"},
+            ],
+        )
+
+        with connect(db_path) as conn:
+            first = import_income_csv(conn, csv_a, source_name="kartra", rules=rules, dry_run=False)
+            second = import_income_csv(conn, csv_b, source_name="kartra", rules=rules, dry_run=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 2
+        assert second.inserted == 1
+        assert second.skipped_duplicates == 1
+        assert count == 3
+
+    def test_overlapping_csv_legacy_date_format(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_path = _write_dict_csv(
+            tmp_path / "legacy_date.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-05", description="LEGACY DATE DUP", amount="-12.50")],
+        )
+        account_id = _account_id_for_source("Test Source", "1234")
+
+        with connect(db_path) as conn:
+            _insert_account(
+                conn,
+                account_id=account_id,
+                institution_name="Test Source",
+                account_type="credit_card",
+                card_ending="1234",
+            )
+            _insert_transaction(
+                conn,
+                txn_id="legacy_txn",
+                account_id=account_id,
+                date="01/05/2026",
+                amount_cents=-1250,
+                description="LEGACY DATE DUP",
+                dedupe_key="legacy-dedupe",
+            )
+            conn.commit()
+
+            report = import_csv(conn, csv_path, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert report.inserted == 0
+        assert report.skipped_duplicates == 1
+        assert count == 1
+
+    def test_overlapping_income_csv_dry_run(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        rules = self._kartra_rules()
+        csv_a = _write_dict_csv(
+            tmp_path / "income_dry_a.csv",
+            ["Date", "Revenue (USD)", "Product"],
+            [{"Date": "2026-01-01", "Revenue (USD)": "100.00", "Product": "Course A"}],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "income_dry_b.csv",
+            ["Date", "Revenue (USD)", "Product"],
+            [{"Date": "2026-01-01", "Revenue (USD)": "100.00", "Product": "Course A"}],
+        )
+        platform_hash_id = _account_id_for_source("Kartra", "")
+
+        with connect(db_path) as conn:
+            first = import_income_csv(conn, csv_a, source_name="kartra", rules=rules, dry_run=False)
+            _insert_account(
+                conn,
+                account_id="plaid_kartra",
+                plaid_account_id="plaid_ext_kartra",
+                institution_name="Kartra",
+                account_type="checking",
+            )
+            upsert_account_alias(conn, hash_account_id=platform_hash_id, canonical_id="plaid_kartra")
+            conn.commit()
+
+            dry_run = import_income_csv(conn, csv_b, source_name="kartra", rules=rules, dry_run=True)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+            row = conn.execute("SELECT account_id FROM transactions").fetchone()
+
+        assert first.inserted == 1
+        assert dry_run.inserted == 0
+        assert dry_run.skipped_duplicates == 1
+        assert count == 1
+        assert row["account_id"] == "plaid_kartra"
+
+    def test_overlapping_csv_dedupe_key_precheck(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_a = _write_dict_csv(
+            tmp_path / "precheck_a.csv",
+            _TXN_CSV_FIELDS,
+            [_csv_row(date="2026-01-20", description="DELTA", amount="-88.40")],
+        )
+        csv_b = _write_dict_csv(
+            tmp_path / "precheck_b.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-20", description="DELTA", amount="-88.40"),
+                _csv_row(date="2026-01-20", description="DELTA", amount="-88.40", transaction_id="AAA"),
+            ],
+        )
+
+        with connect(db_path) as conn:
+            first = import_csv(conn, csv_a, source_name="Test Source", validate_name=False)
+            second = import_csv(conn, csv_b, source_name="Test Source", validate_name=False)
+            count = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+
+        assert first.inserted == 1
+        assert second.inserted == 1
+        assert second.skipped_duplicates == 1
+        assert count == 2
+
+    def test_overlapping_csv_dedupe_key_inactive_match(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_path = _write_dict_csv(
+            tmp_path / "inactive_match.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-30", description="MATCH TEST", amount="-50.00"),
+                _csv_row(date="2026-01-30", description="MATCH TEST", amount="-50.00", transaction_id="BBB"),
+            ],
+        )
+        account_id = _account_id_for_source("Test Source", "1234")
+
+        with connect(db_path) as conn:
+            _insert_account(
+                conn,
+                account_id=account_id,
+                institution_name="Test Source",
+                account_type="credit_card",
+                card_ending="1234",
+            )
+            _insert_transaction(
+                conn,
+                txn_id="inactive_exact",
+                account_id=account_id,
+                date="2026-01-30",
+                amount_cents=-5000,
+                description="MATCH TEST",
+                dedupe_key=_csv_dedupe_key(
+                    cli_source="Test Source",
+                    card_ending="1234",
+                    date_value="2026-01-30",
+                    description="MATCH TEST",
+                    amount_cents=-5000,
+                ),
+                is_active=0,
+            )
+            _insert_transaction(
+                conn,
+                txn_id="active_existing",
+                account_id=account_id,
+                date="2026-01-30",
+                amount_cents=-5000,
+                description="MATCH TEST",
+                dedupe_key=_csv_dedupe_key(
+                    cli_source="Test Source",
+                    card_ending="1234",
+                    date_value="2026-01-30",
+                    description="MATCH TEST",
+                    amount_cents=-5000,
+                    external_ref="AAA",
+                ),
+            )
+            conn.commit()
+
+            report = import_csv(conn, csv_path, source_name="Test Source", validate_name=False)
+            total = conn.execute("SELECT COUNT(*) AS n FROM transactions").fetchone()["n"]
+            active = conn.execute("SELECT COUNT(*) AS n FROM transactions WHERE is_active = 1").fetchone()["n"]
+
+        assert report.inserted == 0
+        assert report.skipped_duplicates == 2
+        assert total == 2
+        assert active == 1
+
+    def test_overlapping_csv_dedupe_key_split_child_match(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        csv_path = _write_dict_csv(
+            tmp_path / "split_child_match.csv",
+            _TXN_CSV_FIELDS,
+            [
+                _csv_row(date="2026-01-31", description="MATCH TEST", amount="-50.00"),
+                _csv_row(date="2026-01-31", description="MATCH TEST", amount="-50.00", transaction_id="BBB"),
+            ],
+        )
+        account_id = _account_id_for_source("Test Source", "1234")
+
+        with connect(db_path) as conn:
+            _insert_account(
+                conn,
+                account_id=account_id,
+                institution_name="Test Source",
+                account_type="credit_card",
+                card_ending="1234",
+            )
+            _insert_transaction(
+                conn,
+                txn_id="parent_txn",
+                account_id=account_id,
+                date="2026-01-31",
+                amount_cents=-10000,
+                description="PARENT",
+            )
+            _insert_transaction(
+                conn,
+                txn_id="split_child",
+                account_id=account_id,
+                date="2026-01-31",
+                amount_cents=-5000,
+                description="MATCH TEST",
+                dedupe_key=_csv_dedupe_key(
+                    cli_source="Test Source",
+                    card_ending="1234",
+                    date_value="2026-01-31",
+                    description="MATCH TEST",
+                    amount_cents=-5000,
+                ),
+                parent_transaction_id="parent_txn",
+            )
+            _insert_transaction(
+                conn,
+                txn_id="active_parentless",
+                account_id=account_id,
+                date="2026-01-31",
+                amount_cents=-5000,
+                description="MATCH TEST",
+                dedupe_key=_csv_dedupe_key(
+                    cli_source="Test Source",
+                    card_ending="1234",
+                    date_value="2026-01-31",
+                    description="MATCH TEST",
+                    amount_cents=-5000,
+                    external_ref="AAA",
+                ),
+            )
+            conn.commit()
+
+            report = import_csv(conn, csv_path, source_name="Test Source", validate_name=False)
+            matching_rows = conn.execute(
+                "SELECT COUNT(*) AS n FROM transactions WHERE amount_cents = -5000"
+            ).fetchone()["n"]
+
+        assert report.inserted == 0
+        assert report.skipped_duplicates == 2
+        assert matching_rows == 2
+
+
+# -----------------------------------------------------------------------------
 # Core row parsing and tolerance in import_csv/_import_row_iter
 # -----------------------------------------------------------------------------
 
@@ -615,6 +1291,46 @@ def test_import_csv_dry_run_skips_match_transaction(tmp_path: Path, monkeypatch)
     assert report.inserted == 1
     assert report.errors == 0
     assert txn_count == 0
+
+
+def test_import_csv_redacts_description_when_match_transaction_fails(
+    tmp_path: Path,
+    monkeypatch,
+    caplog,
+) -> None:
+    db_path = _setup_db(tmp_path)
+    csv_path = _write_csv(
+        tmp_path / "redacted_match_failure.csv",
+        """
+        Date,Description,Amount,Card Ending,Source,Use Type,Category,Is Payment
+        2026-01-01,VERY PRIVATE MERCHANT,-5.00,0001,Private Import,Personal,Bank Label,false
+        """,
+    )
+
+    def _boom(*_args, **_kwargs):
+        raise RuntimeError("categorizer boom")
+
+    monkeypatch.setattr("finance_cli.importers.match_transaction", _boom)
+    logger = logging.getLogger("finance_cli.importers")
+    original_level = logger.level
+    original_propagate = logger.propagate
+    logger.addHandler(caplog.handler)
+    logger.setLevel(logging.WARNING)
+    logger.propagate = False
+
+    try:
+        with connect(db_path) as conn:
+            report = import_csv(conn, csv_path, source_name="Private Import", dry_run=False, validate_name=False)
+    finally:
+        logger.propagate = original_propagate
+        logger.setLevel(original_level)
+        logger.removeHandler(caplog.handler)
+
+    messages = [record.getMessage() for record in caplog.records]
+
+    assert report.inserted == 1
+    assert any("match_transaction() failed for Private Import row 1: categorizer boom" in message for message in messages)
+    assert all("VERY PRIVATE MERCHANT" not in message for message in messages)
 
 
 def test_import_csv_invalid_rules_skips_pipeline_and_continues(tmp_path: Path, monkeypatch) -> None:
@@ -1240,7 +1956,7 @@ def test_pdf_apr_survives_later_plaid_sync_with_null_apr(tmp_path: Path, monkeyp
             lambda: PlaidConfigStatus(configured=True, has_sdk=True, missing_env=[], env="sandbox"),
         )
         monkeypatch.setattr("finance_cli.plaid_client._create_plaid_api_client", lambda: _Client())
-        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None: "access-token")
+        monkeypatch.setattr("finance_cli.plaid_client._get_access_token_for_item", lambda item, region_name=None, **kwargs: "access-token")
 
         fetch_liabilities(conn, item_id=plaid_item_id, force_refresh=True)
         after = conn.execute(

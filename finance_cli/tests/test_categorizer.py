@@ -25,6 +25,22 @@ def _seed_category(conn, name: str) -> str:
     return category_id
 
 
+def _category_id_for_name(conn, name: str) -> str:
+    row = conn.execute(
+        "SELECT id FROM categories WHERE lower(name) = lower(?) ORDER BY rowid ASC LIMIT 1",
+        (name,),
+    ).fetchone()
+    if row:
+        return str(row["id"])
+    return _seed_category(conn, name)
+
+
+def _write_rules(path: Path, content: str) -> Path:
+    rules_path = path / "rules.yaml"
+    rules_path.write_text(content, encoding="utf-8")
+    return rules_path
+
+
 def _seed_rule(
     conn,
     pattern: str,
@@ -209,14 +225,24 @@ def test_unconfirmed_vendor_memory_confidence_is_capped(tmp_path: Path) -> None:
 
 def test_match_transaction_payment_keyword_short_circuits_vendor_memory(tmp_path: Path) -> None:
     db_path = tmp_path / "finance.db"
+    rules_path = _write_rules(
+        tmp_path,
+        "payment_keywords:\n"
+        "- CREDIT CARD BILL PAYMENT\n",
+    )
     initialize_database(db_path)
 
     with connect(db_path) as conn:
-        payments_id = _seed_category(conn, "Payments & Transfers")
+        payments_id = _category_id_for_name(conn, "Payments & Transfers")
         dining_id = _seed_category(conn, "Dining")
         _seed_rule(conn, "credit card bill payment", dining_id, use_type="Any")
 
-        result = match_transaction(conn, "BANK OF AMERICA CREDIT CARD BILL PAYMENT", use_type="Personal")
+        result = match_transaction(
+            conn,
+            "BANK OF AMERICA CREDIT CARD BILL PAYMENT",
+            use_type="Personal",
+            rules_path=rules_path,
+        )
 
     assert result is not None
     assert result.category_id == payments_id
@@ -227,19 +253,60 @@ def test_match_transaction_payment_keyword_short_circuits_vendor_memory(tmp_path
 
 def test_match_transaction_auto_pymt_keyword_marks_payment(tmp_path: Path) -> None:
     db_path = tmp_path / "finance.db"
+    rules_path = _write_rules(
+        tmp_path,
+        "payment_keywords:\n"
+        "- AUTO PYMT\n",
+    )
     initialize_database(db_path)
 
     with connect(db_path) as conn:
-        payments_row = conn.execute(
-            "SELECT id FROM categories WHERE name = 'Payments & Transfers'"
-        ).fetchone()
-        payments_id = str(payments_row["id"]) if payments_row else _seed_category(conn, "Payments & Transfers")
-        result = match_transaction(conn, "BLOOMINGDALES DES:AUTO PYMT", use_type="Personal")
+        payments_id = _category_id_for_name(conn, "Payments & Transfers")
+        result = match_transaction(
+            conn,
+            "BLOOMINGDALES DES:AUTO PYMT",
+            use_type="Personal",
+            rules_path=rules_path,
+        )
 
     assert result is not None
     assert result.category_id == payments_id
     assert result.category_source == "keyword_rule"
     assert result.is_payment is True
+
+
+def test_match_transaction_uses_explicit_rules_path(tmp_path: Path, monkeypatch) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    monkeypatch.setenv("FINANCE_CLI_DISABLE_DOTENV", "1")
+    initialize_database(db_path)
+
+    (tmp_path / "rules.yaml").write_text(
+        'keyword_rules:\n  - keywords: ["AMZN"]\n    category: "Workspace Category"\n    priority: 0\n',
+        encoding="utf-8",
+    )
+    explicit_rules_path = tmp_path / "web_rules.yaml"
+    explicit_rules_path.write_text(
+        'keyword_rules:\n  - keywords: ["AMZN"]\n    category: "Explicit Category"\n    priority: 0\n',
+        encoding="utf-8",
+    )
+
+    with connect(db_path) as conn:
+        workspace_category_id = _seed_category(conn, "Workspace Category")
+        explicit_category_id = _seed_category(conn, "Explicit Category")
+
+        default_result = match_transaction(conn, "AMZN MARKET", use_type="Personal")
+        explicit_result = match_transaction(
+            conn,
+            "AMZN MARKET",
+            use_type="Personal",
+            rules_path=explicit_rules_path,
+        )
+
+    assert default_result is not None
+    assert explicit_result is not None
+    assert default_result.category_id == workspace_category_id
+    assert explicit_result.category_id == explicit_category_id
 
 
 def test_match_transaction_is_payment_input_short_circuits_before_normalize(tmp_path: Path) -> None:

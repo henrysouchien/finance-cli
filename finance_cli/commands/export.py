@@ -4,7 +4,13 @@ from __future__ import annotations
 
 from typing import Any
 
+from ..analytics import log_event
+from ..db import _connected_main_db_path
 from ..exporters import export_monthly_summary_csv, export_transactions_csv, export_wave
+
+
+def _analytics_db_path(conn) -> str | None:
+    return _connected_main_db_path(conn) if conn is not None else None
 
 
 def register(subparsers, format_parent) -> None:
@@ -47,6 +53,7 @@ def handle_csv(args, conn) -> dict[str, Any]:
         date_to=args.date_to,
         category_name=args.category,
     )
+    log_event(_analytics_db_path(conn), "feature.export_generated", properties={"format": "csv"})
     return {
         "data": {"output": args.output, "rows": count},
         "summary": {"total_transactions": count},
@@ -56,6 +63,7 @@ def handle_csv(args, conn) -> dict[str, Any]:
 
 def handle_summary(args, conn) -> dict[str, Any]:
     count = export_monthly_summary_csv(conn, month=args.month, output_path=args.output)
+    log_event(_analytics_db_path(conn), "feature.export_generated", properties={"format": "csv"})
     return {
         "data": {"output": args.output, "rows": count, "month": args.month},
         "summary": {"total_categories": count},
@@ -65,6 +73,7 @@ def handle_summary(args, conn) -> dict[str, Any]:
 
 def handle_wave(args, conn) -> dict[str, Any]:
     report = export_wave(conn, month=args.month, output_dir=args.output)
+    log_event(_analytics_db_path(conn), "feature.export_generated", properties={"format": "wave"})
     return {
         "data": report,
         "summary": {"total_transactions": int(report.get("rows", 0)), "total_files": len(report.get("files", []))},
@@ -92,6 +101,8 @@ def handle_sheets(args, conn) -> dict[str, Any]:
             "summary": {"auth_configured": True},
             "cli_report": "Google Sheets auth setup completed.",
         }
+
+    log_event(_analytics_db_path(conn), "feature.export_generated", properties={"format": "sheets"})
 
     successful_tabs = report.get("tabs", [])
     skipped_tabs = report.get("skipped_tabs", [])

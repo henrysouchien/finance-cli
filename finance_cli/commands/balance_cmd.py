@@ -2,10 +2,14 @@
 
 from __future__ import annotations
 
+from datetime import date
 import sqlite3
 from typing import Any
+import uuid
 
-from ..models import cents_to_dollars
+from finance_cli.exceptions import NotFoundError, ValidationError
+
+from ..models import cents_to_dollars, dollars_to_cents
 from .common import fmt_dollars, use_type_filter
 
 
@@ -34,6 +38,72 @@ def register(subparsers, format_parent) -> None:
     p_hist.add_argument("--view", choices=["personal", "business", "all"], default="all")
     p_hist.set_defaults(func=handle_history, command_name="balance.history")
 
+    p_update = balance_sub.add_parser("update", parents=[format_parent], help="Record a manual balance snapshot")
+    p_update.add_argument("--account", required=True, help="Account ID to update")
+    p_update.add_argument("--current", help="Current balance in dollars")
+    p_update.add_argument("--available", help="Available balance in dollars")
+    p_update.add_argument("--limit", dest="balance_limit", help="Credit limit in dollars")
+    p_update.add_argument("--date", dest="snapshot_date", help="Snapshot date (YYYY-MM-DD); defaults to today")
+    p_update.add_argument("--dry-run", action="store_true", help="Preview without writing")
+    p_update.set_defaults(func=handle_update, command_name="balance.update")
+
+
+def _arg(args: Any, name: str, default: Any = None) -> Any:
+    if isinstance(args, dict):
+        return args.get(name, default)
+    return getattr(args, name, default)
+
+
+def _parse_optional_cents(value: Any, field_name: str) -> int | None:
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text:
+        raise ValidationError(f"{field_name} cannot be blank")
+    try:
+        return dollars_to_cents(text)
+    except Exception as exc:
+        raise ValidationError(f"{field_name} must be a dollar amount") from exc
+
+
+def _normalize_snapshot_date(value: Any) -> str:
+    if value is None or str(value).strip() == "":
+        return date.today().isoformat()
+    text = str(value).strip()
+    try:
+        return date.fromisoformat(text).isoformat()
+    except ValueError as exc:
+        raise ValidationError("snapshot_date must be YYYY-MM-DD") from exc
+
+
+def _fetch_active_canonical_account(conn: sqlite3.Connection, account_id: str) -> sqlite3.Row:
+    row = conn.execute(
+        """
+        SELECT *
+          FROM accounts
+         WHERE id = ?
+        """,
+        (account_id,),
+    ).fetchone()
+    if row is None:
+        raise NotFoundError(f"Account {account_id} not found")
+    if int(row["is_active"] or 0) != 1:
+        raise ValidationError(f"Account {account_id} is inactive")
+
+    alias_row = conn.execute(
+        """
+        SELECT canonical_id
+          FROM account_aliases
+         WHERE hash_account_id = ?
+        """,
+        (account_id,),
+    ).fetchone()
+    if alias_row is not None:
+        raise ValidationError(
+            f"Account {account_id} is an alias source; update canonical account "
+            f"{alias_row['canonical_id']} instead"
+        )
+    return row
 
 def _is_liability_account_type(account_type: str | None) -> bool:
     return (account_type or "") in {"credit_card", "loan"}
@@ -153,6 +223,7 @@ _ACCOUNT_TYPE_DISPLAY = {
     "credit_card": "Credit Card",
     "investment": "Investment",
     "loan": "Loan",
+    "manual_loans": "Manual Loans",
     "unknown": "Other",
 }
 
@@ -173,14 +244,19 @@ def _build_net_worth_cli_report(
 
 def handle_net_worth(args, conn: sqlite3.Connection) -> dict[str, Any]:
     """Compute net worth from current account balances."""
-    view = getattr(args, "view", "all")
+    view = args.get("view", "all") if isinstance(args, dict) else getattr(args, "view", "all")
+    exclude_investments = (
+        bool(args.get("exclude_investments", False))
+        if isinstance(args, dict)
+        else bool(getattr(args, "exclude_investments", False))
+    )
     view_clause = use_type_filter(view)
     where = [
         "a.is_active = 1",
         "a.balance_current_cents IS NOT NULL",
         "a.id NOT IN (SELECT hash_account_id FROM account_aliases)",
     ]
-    if getattr(args, "exclude_investments", False):
+    if exclude_investments:
         where.append("a.account_type != 'investment'")
     if view != "all":
         where.append(
@@ -215,6 +291,25 @@ def handle_net_worth(args, conn: sqlite3.Connection) -> dict[str, Any]:
         else:
             assets_cents += cents
 
+    loan_view_clause = ""
+    if view == "personal":
+        loan_view_clause = "AND use_type = 'Personal'"
+    elif view == "business":
+        loan_view_clause = "AND use_type = 'Business'"
+
+    manual_loan_row = conn.execute(
+        f"""
+        SELECT COALESCE(SUM(current_balance_cents), 0) AS total_cents
+          FROM manual_loans
+         WHERE is_active = 1
+           {loan_view_clause}
+        """
+    ).fetchone()
+    manual_loan_total_cents = int(manual_loan_row["total_cents"])
+    liabilities_cents += manual_loan_total_cents
+    if manual_loan_total_cents > 0:
+        by_type["manual_loans"] = -manual_loan_total_cents
+
     net_worth_cents = assets_cents - liabilities_cents
     breakdown = [
         {"account_type": account_type, "balance_cents": cents, "balance": cents_to_dollars(cents)}
@@ -223,9 +318,11 @@ def handle_net_worth(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
     return {
         "data": {
-            "exclude_investments": bool(getattr(args, "exclude_investments", False)),
+            "exclude_investments": exclude_investments,
             "assets_cents": assets_cents,
             "liabilities_cents": liabilities_cents,
+            "manual_loans_cents": manual_loan_total_cents,
+            "manual_loans": cents_to_dollars(manual_loan_total_cents),
             "net_worth_cents": net_worth_cents,
             "assets": cents_to_dollars(assets_cents),
             "liabilities": cents_to_dollars(liabilities_cents),
@@ -310,6 +407,156 @@ def handle_history(args, conn: sqlite3.Connection) -> dict[str, Any]:
         },
         "summary": {"total_points": len(history)},
         "cli_report": _build_history_cli_report(dict(account), history),
+    }
+
+
+def handle_update(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    """Record a manual balance update and matching daily snapshot."""
+    dry_run = bool(_arg(args, "dry_run", default=False))
+    account_id = str(_arg(args, "account", default="") or "").strip()
+    if not account_id:
+        raise ValidationError("account is required")
+
+    provided = {
+        "balance_current_cents": _parse_optional_cents(_arg(args, "current"), "current"),
+        "balance_available_cents": _parse_optional_cents(_arg(args, "available"), "available"),
+        "balance_limit_cents": _parse_optional_cents(_arg(args, "balance_limit"), "limit"),
+    }
+    if all(value is None for value in provided.values()):
+        raise ValidationError("Provide at least one of current, available, or limit")
+
+    snapshot_date = _normalize_snapshot_date(_arg(args, "snapshot_date"))
+    account_before = _fetch_active_canonical_account(conn, account_id)
+    old_values = {
+        key: account_before[key]
+        for key in ("balance_current_cents", "balance_available_cents", "balance_limit_cents")
+    }
+    new_values = {
+        key: (value if value is not None else old_values[key])
+        for key, value in provided.items()
+    }
+    snapshot_values = dict(provided)
+
+    existing_snapshot = conn.execute(
+        """
+        SELECT id
+          FROM balance_snapshots
+         WHERE account_id = ?
+           AND snapshot_date = ?
+           AND source = 'manual'
+        """,
+        (account_id, snapshot_date),
+    ).fetchone()
+    snapshot_id = str(existing_snapshot["id"]) if existing_snapshot is not None else uuid.uuid4().hex
+
+    conn.execute(
+        """
+        UPDATE accounts
+           SET balance_current_cents = ?,
+               balance_available_cents = ?,
+               balance_limit_cents = ?,
+               balance_updated_at = datetime('now'),
+               updated_at = datetime('now')
+         WHERE id = ?
+        """,
+        (
+            new_values["balance_current_cents"],
+            new_values["balance_available_cents"],
+            new_values["balance_limit_cents"],
+            account_id,
+        ),
+    )
+    conn.execute(
+        """
+        INSERT INTO balance_snapshots (
+            id, account_id, balance_current_cents, balance_available_cents,
+            balance_limit_cents, source, snapshot_date
+        ) VALUES (?, ?, ?, ?, ?, 'manual', ?)
+        ON CONFLICT(account_id, snapshot_date, source) DO UPDATE SET
+            balance_current_cents = COALESCE(
+                excluded.balance_current_cents,
+                balance_snapshots.balance_current_cents
+            ),
+            balance_available_cents = COALESCE(
+                excluded.balance_available_cents,
+                balance_snapshots.balance_available_cents
+            ),
+            balance_limit_cents = COALESCE(
+                excluded.balance_limit_cents,
+                balance_snapshots.balance_limit_cents
+            ),
+            created_at = datetime('now')
+        """,
+        (
+            snapshot_id,
+            account_id,
+            snapshot_values["balance_current_cents"],
+            snapshot_values["balance_available_cents"],
+            snapshot_values["balance_limit_cents"],
+            snapshot_date,
+        ),
+    )
+    persisted_snapshot = conn.execute(
+        """
+        SELECT id, account_id, snapshot_date, source,
+               balance_current_cents, balance_available_cents, balance_limit_cents
+          FROM balance_snapshots
+         WHERE account_id = ?
+           AND snapshot_date = ?
+           AND source = 'manual'
+        """,
+        (account_id, snapshot_date),
+    ).fetchone()
+    snapshot_record = dict(persisted_snapshot) if persisted_snapshot is not None else {
+        "id": snapshot_id,
+        "account_id": account_id,
+        "snapshot_date": snapshot_date,
+        "source": "manual",
+        **snapshot_values,
+    }
+
+    changed_fields = [
+        key.removeprefix("balance_").removesuffix("_cents")
+        for key, value in provided.items()
+        if value is not None and value != old_values[key]
+    ]
+    account_after = dict(account_before)
+    account_after.update(new_values)
+    for cents_key, amount_key in [
+        ("balance_current_cents", "balance_current"),
+        ("balance_available_cents", "balance_available"),
+        ("balance_limit_cents", "balance_limit"),
+    ]:
+        cents_value = account_after.get(cents_key)
+        account_after[amount_key] = cents_to_dollars(int(cents_value)) if cents_value is not None else None
+
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+
+    data = {
+        "account": account_after,
+        "account_id": account_id,
+        "snapshot": snapshot_record,
+        "changed_fields": changed_fields,
+        "updated_existing_snapshot": existing_snapshot is not None,
+        **({"dry_run": True} if dry_run else {}),
+    }
+    current_text = (
+        fmt_dollars(cents_to_dollars(int(new_values["balance_current_cents"])))
+        if new_values["balance_current_cents"] is not None
+        else "n/a"
+    )
+    prefix = "[DRY RUN] Would update" if dry_run else "Updated"
+    return {
+        "data": data,
+        "summary": {
+            "total_accounts": 1,
+            "snapshots_upserted": 1,
+            "changed_fields": len(changed_fields),
+        },
+        "cli_report": f"{prefix} balance for {account_id} on {snapshot_date}: current={current_text}",
     }
 
 

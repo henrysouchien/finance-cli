@@ -1,14 +1,22 @@
 from __future__ import annotations
 
+from argparse import Namespace
 import json
 import logging
 import uuid
 from pathlib import Path
 
 import finance_cli.commands.dedup_cmd as dedup_cmd_module
+import pytest
 from finance_cli.__main__ import main
+from finance_cli.categorizer import normalize_description
 from finance_cli.db import connect, initialize_database
-from finance_cli.dedup import apply_dedup, find_cross_format_duplicates
+from finance_cli.dedup import (
+    apply_dedup,
+    apply_same_source_dedup,
+    find_cross_format_duplicates,
+    find_same_source_duplicates,
+)
 
 
 def _setup_db(tmp_path: Path) -> Path:
@@ -66,25 +74,514 @@ def _insert_txn(
     source: str,
     is_active: int = 1,
     notes: str | None = None,
+    dedupe_key: str | None = None,
+    parent_transaction_id: str | None = None,
+    created_at: str | None = None,
 ) -> None:
+    columns = [
+        "id",
+        "account_id",
+        "dedupe_key",
+        "date",
+        "description",
+        "amount_cents",
+        "source",
+        "is_active",
+        "notes",
+    ]
+    values: list[object] = [
+        txn_id,
+        account_id,
+        dedupe_key or f"dedupe:{txn_id}",
+        date,
+        description,
+        amount_cents,
+        source,
+        is_active,
+        notes,
+    ]
+    if parent_transaction_id is not None:
+        columns.append("parent_transaction_id")
+        values.append(parent_transaction_id)
+    if created_at is not None:
+        columns.append("created_at")
+        values.append(created_at)
+    placeholders = ", ".join("?" for _ in values)
     conn.execute(
-        """
-        INSERT INTO transactions (
-            id, account_id, dedupe_key, date, description, amount_cents, source, is_active, notes
-        ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        f"""
+        INSERT INTO transactions ({", ".join(columns)})
+        VALUES ({placeholders})
         """,
-        (
-            txn_id,
-            account_id,
-            f"dedupe:{txn_id}",
-            date,
-            description,
-            amount_cents,
-            source,
-            is_active,
-            notes,
-        ),
+        tuple(values),
     )
+
+
+class TestSameSourceDetection:
+    def test_find_same_source_groups_basic(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_named_account(
+                conn,
+                account_id="acct_same",
+                institution_name="American Express",
+                account_type="credit_card",
+                card_ending="4001",
+            )
+            _insert_txn(
+                conn,
+                txn_id="same_keep_1",
+                account_id="acct_same",
+                date="2026-01-05",
+                amount_cents=-10800,
+                description="BANK OF AMERICA CREDIT CARD Bill Payment",
+                source="csv_import",
+                created_at="2026-02-22 17:05:00",
+            )
+            _insert_txn(
+                conn,
+                txn_id="same_dup_1",
+                account_id="acct_same",
+                date="2026-01-05",
+                amount_cents=-10800,
+                description="BANK OF AMERICA CREDIT CARD Bill Payment",
+                source="csv_import",
+                created_at="2026-02-22 17:06:00",
+            )
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.account_id == "acct_same"
+        assert group.institution_name == "American Express"
+        assert group.card_ending == "4001"
+        assert group.date == "2026-01-05"
+        assert group.amount_cents == -10800
+        assert group.normalized_desc == normalize_description("BANK OF AMERICA CREDIT CARD Bill Payment")
+        assert group.count == 2
+        assert group.excess == 1
+        assert group.suspicion == "high"
+        assert [row.transaction_id for row in group.rows] == ["same_keep_1", "same_dup_1"]
+        assert [row.keep for row in group.rows] == [True, False]
+
+    def test_same_source_preserves_different_descriptions(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(
+                conn,
+                txn_id="csv_a",
+                account_id="acct_a",
+                date="2026-01-10",
+                amount_cents=-500,
+                description="STARBUCKS",
+                source="csv_import",
+            )
+            _insert_txn(
+                conn,
+                txn_id="csv_b",
+                account_id="acct_a",
+                date="2026-01-10",
+                amount_cents=-500,
+                description="MCDONALDS",
+                source="csv_import",
+            )
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+
+        assert groups == []
+
+    def test_same_source_min_amount_filter(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            for txn_id, amount_cents, description in (
+                ("low_a", -900, "LOW DUP"),
+                ("low_b", -900, "LOW DUP"),
+                ("high_a", -1500, "HIGH DUP"),
+                ("high_b", -1500, "HIGH DUP"),
+            ):
+                _insert_txn(
+                    conn,
+                    txn_id=txn_id,
+                    account_id="acct_a",
+                    date="2026-01-11",
+                    amount_cents=amount_cents,
+                    description=description,
+                    source="csv_import",
+                )
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn, min_amount_cents=1000)
+
+        assert len(groups) == 1
+        assert groups[0].amount_cents == -1500
+        assert groups[0].normalized_desc == normalize_description("HIGH DUP")
+
+    def test_same_source_flags_paired_travel_as_ambiguous(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_named_account(
+                conn,
+                account_id="acct_delta",
+                institution_name="American Express",
+                account_type="credit_card",
+                card_ending="4001",
+            )
+            _insert_txn(
+                conn,
+                txn_id="delta_pax_1",
+                account_id="acct_delta",
+                date="2026-02-17",
+                amount_cents=-45300,
+                description="DELTA AIR LINES TICKET",
+                source="csv_import",
+                created_at="2026-02-20 08:00:00",
+            )
+            _insert_txn(
+                conn,
+                txn_id="delta_pax_2",
+                account_id="acct_delta",
+                date="2026-02-17",
+                amount_cents=-45300,
+                description="DELTA AIR LINES TICKET",
+                source="csv_import",
+                created_at="2026-02-20 08:01:00",
+            )
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+            result = dedup_cmd_module.handle_same_source(
+                Namespace(account_id=None, min_amount=0, commit=False, ids=None, format="json"),
+                conn,
+            )
+
+        assert len(groups) == 1
+        group = groups[0]
+        assert group.suspicion == "medium"
+        assert group.review_flags == ("possible_multi_passenger_travel",)
+        assert group.as_dict()["review_flags"] == ["possible_multi_passenger_travel"]
+        assert "possible multi-passenger travel" in result["cli_report"]
+        assert "confirm duplicate import before deactivating" in result["cli_report"]
+
+    def test_apply_same_source_dedup_by_ids(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(conn, txn_id="keep_id", account_id="acct_a", date="2026-01-12", amount_cents=-2500, description="GOOGLE WORKSPACE", source="csv_import", created_at="2026-02-01 09:00:00")
+            _insert_txn(conn, txn_id="dup_id", account_id="acct_a", date="2026-01-12", amount_cents=-2500, description="GOOGLE WORKSPACE", source="csv_import", created_at="2026-02-01 09:01:00")
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+            candidate_ids = {row.transaction_id for group in groups for row in group.rows}
+            deactivated, rejected = apply_same_source_dedup(conn, ["dup_id"], candidate_ids, groups)
+            states = conn.execute(
+                "SELECT id, is_active, notes FROM transactions WHERE id IN ('keep_id', 'dup_id') ORDER BY id"
+            ).fetchall()
+
+        assert deactivated == 1
+        assert rejected == []
+        assert [(row["id"], row["is_active"]) for row in states] == [("dup_id", 0), ("keep_id", 1)]
+        assert "same-source-dedup" in str(states[0]["notes"])
+
+    def test_apply_same_source_rejects_non_csv(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(
+                conn,
+                txn_id="plaid_id",
+                account_id="acct_a",
+                date="2026-01-13",
+                amount_cents=-1200,
+                description="PLAID ONLY",
+                source="plaid",
+            )
+            conn.commit()
+
+            deactivated, rejected = apply_same_source_dedup(conn, ["plaid_id"], {"plaid_id"}, [])
+            state = conn.execute("SELECT is_active FROM transactions WHERE id = 'plaid_id'").fetchone()
+
+        assert deactivated == 0
+        assert rejected == [("plaid_id", "not active csv_import")]
+        assert state["is_active"] == 1
+
+    def test_apply_same_source_rejects_non_candidate(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(conn, txn_id="csv_a", account_id="acct_a", date="2026-01-14", amount_cents=-1200, description="DESC A", source="csv_import")
+            _insert_txn(conn, txn_id="csv_b", account_id="acct_a", date="2026-01-14", amount_cents=-1200, description="DESC B", source="csv_import")
+            conn.commit()
+
+            deactivated, rejected = apply_same_source_dedup(conn, ["csv_a"], set(), [])
+
+        assert deactivated == 0
+        assert rejected == [("csv_a", "not in candidate set")]
+
+    def test_apply_same_source_last_row_protection(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(conn, txn_id="keep_row", account_id="acct_a", date="2026-01-15", amount_cents=-1829, description="GOOGLE WORKSPACE", source="csv_import", created_at="2026-02-01 08:00:00")
+            _insert_txn(conn, txn_id="dup_row", account_id="acct_a", date="2026-01-15", amount_cents=-1829, description="GOOGLE WORKSPACE", source="csv_import", created_at="2026-02-01 08:01:00")
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+            candidate_ids = {row.transaction_id for group in groups for row in group.rows}
+            deactivated, rejected = apply_same_source_dedup(
+                conn,
+                ["keep_row", "dup_row"],
+                candidate_ids,
+                groups,
+            )
+            states = conn.execute(
+                "SELECT id, is_active FROM transactions WHERE id IN ('keep_row', 'dup_row') ORDER BY id"
+            ).fetchall()
+
+        assert deactivated == 1
+        assert rejected == [("keep_row", "would remove last surviving row from group")]
+        assert [(row["id"], row["is_active"]) for row in states] == [("dup_row", 0), ("keep_row", 1)]
+
+    def test_same_source_account_id_alias_filter(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_named_account(
+                conn,
+                account_id="plaid_a",
+                institution_name="Merrill",
+                account_type="checking",
+                plaid_account_id="plaid_ext_a",
+            )
+            _insert_named_account(
+                conn,
+                account_id="hash_a",
+                institution_name="Bank of America",
+                account_type="checking",
+            )
+            _insert_named_account(
+                conn,
+                account_id="acct_b",
+                institution_name="Other Bank",
+                account_type="checking",
+                plaid_account_id="plaid_ext_b",
+            )
+            conn.execute(
+                "INSERT INTO account_aliases (hash_account_id, canonical_id) VALUES (?, ?)",
+                ("hash_a", "plaid_a"),
+            )
+            _insert_txn(conn, txn_id="alias_keep", account_id="plaid_a", date="2026-01-16", amount_cents=-999, description="ALIAS DUP", source="csv_import")
+            _insert_txn(conn, txn_id="alias_dup", account_id="plaid_a", date="2026-01-16", amount_cents=-999, description="ALIAS DUP", source="csv_import")
+            _insert_txn(conn, txn_id="other_keep", account_id="acct_b", date="2026-01-16", amount_cents=-999, description="OTHER DUP", source="csv_import")
+            _insert_txn(conn, txn_id="other_dup", account_id="acct_b", date="2026-01-16", amount_cents=-999, description="OTHER DUP", source="csv_import")
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn, account_id="hash_a")
+
+        assert len(groups) == 1
+        assert groups[0].account_id == "plaid_a"
+        assert groups[0].normalized_desc == normalize_description("ALIAS DUP")
+
+    def test_same_source_excludes_split_children(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(
+                conn,
+                txn_id="parent",
+                account_id="acct_a",
+                date="2026-01-17",
+                amount_cents=-10000,
+                description="SPLIT PURCHASE",
+                source="csv_import",
+                is_active=0,
+            )
+            _insert_txn(
+                conn,
+                txn_id="child_a",
+                account_id="acct_a",
+                date="2026-01-17",
+                amount_cents=-5000,
+                description="SPLIT PURCHASE",
+                source="csv_import",
+                parent_transaction_id="parent",
+            )
+            _insert_txn(
+                conn,
+                txn_id="child_b",
+                account_id="acct_a",
+                date="2026-01-17",
+                amount_cents=-5000,
+                description="SPLIT PURCHASE",
+                source="csv_import",
+                parent_transaction_id="parent",
+            )
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+
+        assert groups == []
+
+    def test_handle_same_source_cli(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_named_account(
+                conn,
+                account_id="acct_cli",
+                institution_name="American Express",
+                account_type="credit_card",
+                card_ending="4001",
+            )
+            _insert_txn(conn, txn_id="cli_keep", account_id="acct_cli", date="2026-01-18", amount_cents=-10800, description="BANK OF AMERICA CREDIT CARD Bill Payment", source="csv_import", created_at="2026-02-22 17:05:00")
+            _insert_txn(conn, txn_id="cli_dup", account_id="acct_cli", date="2026-01-18", amount_cents=-10800, description="BANK OF AMERICA CREDIT CARD Bill Payment", source="csv_import", created_at="2026-02-22 17:06:00")
+            _insert_txn(conn, txn_id="cli_other", account_id="acct_cli", date="2026-01-18", amount_cents=-500, description="UNRELATED", source="csv_import")
+            conn.commit()
+
+            detection = dedup_cmd_module.handle_same_source(
+                Namespace(account_id=None, min_amount=0, commit=False, ids=None, format="json"),
+                conn,
+            )
+            commit_result = dedup_cmd_module.handle_same_source(
+                Namespace(account_id=None, min_amount=0, commit=True, ids="cli_dup,cli_other", format="json"),
+                conn,
+            )
+            states = conn.execute(
+                "SELECT id, is_active FROM transactions WHERE id IN ('cli_keep', 'cli_dup', 'cli_other') ORDER BY id"
+            ).fetchall()
+
+        assert detection["data"]["dry_run"] is True
+        assert detection["data"]["total_groups"] == 1
+        assert detection["data"]["total_excess"] == 1
+        assert detection["data"]["account_id"] is None
+        assert detection["data"]["min_amount"] == 0
+        assert "=== Same-Source Duplicate Candidates ===" in detection["cli_report"]
+        assert "To deactivate: dedup same-source --commit --ids" in detection["cli_report"]
+
+        assert commit_result["data"]["deactivated"] == 1
+        assert commit_result["data"]["dry_run"] is False
+        assert Path(commit_result["data"]["backup_path"]).exists()
+        assert commit_result["data"]["rejected"] == [
+            {"id": "cli_other", "reason": "not in candidate set"}
+        ]
+        assert "cli_other: not in candidate set" in commit_result["cli_report"]
+        assert [(row["id"], row["is_active"]) for row in states] == [
+            ("cli_dup", 0),
+            ("cli_keep", 1),
+            ("cli_other", 1),
+        ]
+
+    def test_handle_same_source_flag_validation(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            with pytest.raises(ValueError, match="--commit requires --ids"):
+                dedup_cmd_module.handle_same_source(
+                    Namespace(account_id=None, min_amount=0, commit=True, ids=None, format="json"),
+                    conn,
+                )
+            with pytest.raises(ValueError, match="--ids requires --commit"):
+                dedup_cmd_module.handle_same_source(
+                    Namespace(account_id=None, min_amount=0, commit=False, ids="abc", format="json"),
+                    conn,
+                )
+            with pytest.raises(ValueError, match="--ids cannot contain empty transaction ids"):
+                dedup_cmd_module.handle_same_source(
+                    Namespace(account_id=None, min_amount=0, commit=True, ids="abc, ,def", format="json"),
+                    conn,
+                )
+
+    def test_same_source_cli_report_truncation(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            for idx in range(55):
+                amount_cents = -(2000 + idx)
+                description = f"DUP GROUP {idx}"
+                _insert_txn(conn, txn_id=f"keep_{idx}", account_id="acct_a", date="2026-01-19", amount_cents=amount_cents, description=description, source="csv_import")
+                _insert_txn(conn, txn_id=f"dup_{idx}", account_id="acct_a", date="2026-01-19", amount_cents=amount_cents, description=description, source="csv_import")
+            conn.commit()
+
+            result = dedup_cmd_module.handle_same_source(
+                Namespace(account_id=None, min_amount=0, commit=False, ids=None, format="json"),
+                conn,
+            )
+
+        assert result["data"]["total_groups"] == 55
+        assert result["cli_report"].count("[HIGH]") == 50
+        assert "... 5 more (use --format json for full output)" in result["cli_report"]
+
+    def test_same_source_keeper_ordering(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            _insert_account(conn, "acct_a")
+            _insert_txn(conn, txn_id="txn_old", account_id="acct_a", date="2026-01-20", amount_cents=-1410, description="JUICE GENERATION", source="csv_import", created_at="2026-02-01 08:00:00")
+            _insert_txn(conn, txn_id="txn_b", account_id="acct_a", date="2026-01-20", amount_cents=-1410, description="JUICE GENERATION", source="csv_import", created_at="2026-02-01 09:00:00")
+            _insert_txn(conn, txn_id="txn_c", account_id="acct_a", date="2026-01-20", amount_cents=-1410, description="JUICE GENERATION", source="csv_import", created_at="2026-02-01 09:00:00")
+            conn.commit()
+
+            groups = find_same_source_duplicates(conn)
+
+        assert [row.transaction_id for row in groups[0].rows] == ["txn_old", "txn_b", "txn_c"]
+        assert [row.keep for row in groups[0].rows] == [True, False, False]
+
+    def test_apply_same_source_noop_no_commit(self, tmp_path: Path) -> None:
+        db_path = _setup_db(tmp_path)
+        with connect(db_path) as conn:
+            conn.execute(
+                """
+                INSERT INTO accounts (id, institution_name, account_name, account_type, card_ending)
+                VALUES ('staged_account', 'Stage Bank', 'Stage Bank 1111', 'credit_card', '1111')
+                """
+            )
+            assert conn.in_transaction is True
+
+            deactivated, rejected = apply_same_source_dedup(conn, ["missing"], set(), [])
+
+            assert deactivated == 0
+            assert rejected == [("missing", "not in candidate set")]
+            assert conn.in_transaction is True
+
+            conn.rollback()
+            row = conn.execute("SELECT 1 FROM accounts WHERE id = 'staged_account'").fetchone()
+
+        assert row is None
+
+    def test_handle_same_source_main_integration(self, tmp_path: Path, monkeypatch, capsys) -> None:
+        db_path = _setup_db(tmp_path)
+        monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+        with connect(db_path) as conn:
+            _insert_named_account(
+                conn,
+                account_id="acct_main",
+                institution_name="American Express",
+                account_type="credit_card",
+                card_ending="4001",
+            )
+            _insert_txn(conn, txn_id="main_keep_12345678", account_id="acct_main", date="2026-01-21", amount_cents=-10800, description="BANK OF AMERICA CREDIT CARD Bill Payment", source="csv_import", created_at="2026-02-22 17:05:00")
+            _insert_txn(conn, txn_id="main_dup_12345678", account_id="acct_main", date="2026-01-21", amount_cents=-10800, description="BANK OF AMERICA CREDIT CARD Bill Payment", source="csv_import", created_at="2026-02-22 17:06:00")
+            conn.commit()
+
+        code_cli = main(["dedup", "same-source", "--format", "cli"])
+        cli_output = capsys.readouterr().out
+        assert code_cli == 0
+        assert "Same-Source Duplicate Candidates" in cli_output
+        assert "main_keep_12345678" in cli_output
+        assert "main_dup_12345678" in cli_output
+
+        code_json = main(["dedup", "same-source", "--format", "json"])
+        json_payload = json.loads(capsys.readouterr().out)
+        assert code_json == 0
+        assert json_payload["status"] == "success"
+        assert json_payload["command"] == "dedup.same-source"
+        assert json_payload["data"]["dry_run"] is True
+        assert json_payload["data"]["total_groups"] == 1
+
+        code_err = main(["dedup", "same-source", "--commit"])
+        err_payload = json.loads(capsys.readouterr().out)
+        assert code_err == 1
+        assert err_payload["status"] == "error"
+        assert "--commit requires --ids" in err_payload["error"]
 
 
 def test_exact_match(tmp_path: Path) -> None:
@@ -1887,7 +2384,7 @@ def test_fuzzy_date_no_match_different_description(tmp_path: Path) -> None:
     assert len(report.matches) == 0
 
 
-def test_fuzzy_date_no_match_2_day_gap(tmp_path: Path) -> None:
+def test_fuzzy_date_2_day_gap_matches(tmp_path: Path) -> None:
     db_path = _setup_db(tmp_path)
     with connect(db_path) as conn:
         _insert_account(conn, "acct_a")
@@ -1905,6 +2402,37 @@ def test_fuzzy_date_no_match_2_day_gap(tmp_path: Path) -> None:
             txn_id="pdf_far",
             account_id="acct_a",
             date="2025-01-18",
+            amount_cents=-5000,
+            description="REGUS MANAGEMENT GROUP BCIWGPLC TX",
+            source="pdf_import",
+        )
+
+        report = find_cross_format_duplicates(conn)
+
+    assert len(report.matches) == 1
+    assert report.matches[0].keep_id == "plaid_far"
+    assert report.matches[0].remove_id == "pdf_far"
+    assert report.matches[0].match_type == "substring"
+
+
+def test_fuzzy_date_no_match_3_day_gap(tmp_path: Path) -> None:
+    db_path = _setup_db(tmp_path)
+    with connect(db_path) as conn:
+        _insert_account(conn, "acct_a")
+        _insert_txn(
+            conn,
+            txn_id="plaid_far",
+            account_id="acct_a",
+            date="2025-01-20",
+            amount_cents=-5000,
+            description="REGUS MANAGEMENT GROUP",
+            source="plaid",
+        )
+        _insert_txn(
+            conn,
+            txn_id="pdf_far",
+            account_id="acct_a",
+            date="2025-01-17",
             amount_cents=-5000,
             description="REGUS MANAGEMENT GROUP BCIWGPLC TX",
             source="pdf_import",

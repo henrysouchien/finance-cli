@@ -5,6 +5,8 @@ from __future__ import annotations
 import sqlite3
 from typing import Any
 
+from finance_cli.exceptions import NotFoundError, ValidationError
+
 from ..models import cents_to_dollars
 from .common import fmt_dollars
 
@@ -67,14 +69,14 @@ def _normalize_account_type(value: Any) -> str:
     normalized = str(value or "").strip().lower()
     if normalized not in _ACCOUNT_TYPE_SET:
         allowed = ", ".join(_ACCOUNT_TYPES)
-        raise ValueError(f"Invalid account type '{value}'. Allowed: {allowed}")
+        raise ValidationError(f"Invalid account type '{value}'. Allowed: {allowed}")
     return normalized
 
 
 def _normalize_status(value: Any) -> str:
     status = str(value or "active").strip().lower() or "active"
     if status not in _STATUS_CHOICES:
-        raise ValueError("status must be one of: active, inactive, all")
+        raise ValidationError("status must be one of: active, inactive, all")
     return status
 
 
@@ -97,8 +99,14 @@ def _account_to_dict(row: sqlite3.Row) -> dict[str, Any]:
 def _fetch_account_or_raise(conn: sqlite3.Connection, account_id: str) -> sqlite3.Row:
     row = conn.execute("SELECT * FROM accounts WHERE id = ?", (account_id,)).fetchone()
     if not row:
-        raise ValueError(f"Account {account_id} not found")
+        raise NotFoundError(f"Account {account_id} not found")
     return row
+
+
+def _account_preview(row: sqlite3.Row | dict[str, Any], **updates: Any) -> dict[str, Any]:
+    preview = dict(row)
+    preview.update(updates)
+    return _account_to_dict(preview)
 
 
 def _linked_subscriptions(conn: sqlite3.Connection, account_id: str) -> list[dict[str, Any]]:
@@ -162,7 +170,7 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
             elif normalized_flag in {"0", "false", "no"}:
                 is_business = False
             else:
-                raise ValueError("is_business must be true/false when provided")
+                raise ValidationError("is_business must be true/false when provided")
 
     if status == "active":
         where.append("a.is_active = 1")
@@ -255,7 +263,7 @@ def handle_list(args, conn: sqlite3.Connection) -> dict[str, Any]:
 def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
     account_id = str(_arg(args, "id", default="") or "").strip()
     if not account_id:
-        raise ValueError("id is required")
+        raise ValidationError("id is required")
 
     account_row = _fetch_account_or_raise(conn, account_id)
     account = _account_to_dict(account_row)
@@ -312,9 +320,10 @@ def handle_show(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_set_type(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     account_id = str(_arg(args, "id", default="") or "").strip()
     if not account_id:
-        raise ValueError("id is required")
+        raise ValidationError("id is required")
 
     new_type = _normalize_account_type(_arg(args, "type", "account_type"))
     row = _fetch_account_or_raise(conn, account_id)
@@ -331,10 +340,9 @@ def handle_set_type(args, conn: sqlite3.Connection) -> dict[str, Any]:
         """,
         (new_type, new_type, account_id),
     )
-    conn.commit()
 
     changed = (old_type != new_type) or (old_override != new_type)
-    return {
+    result = {
         "data": {
             "account_id": account_id,
             "old_type": old_type,
@@ -343,24 +351,35 @@ def handle_set_type(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "account_type_override": new_type,
             "override_set": True,
             "changed": changed,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {
             "total_accounts": 1,
             "changed": int(changed),
         },
-        "cli_report": f"Account {account_id} type set to {new_type} (override set)",
+        "cli_report": (
+            f"[DRY RUN] Would set account {account_id} type to {new_type} (override set)"
+            if dry_run
+            else f"Account {account_id} type set to {new_type} (override set)"
+        ),
     }
+    if dry_run:
+        conn.rollback()
+    else:
+        conn.commit()
+    return result
 
 
 def handle_set_business(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     account_id = str(_arg(args, "id", default="") or "").strip()
     if not account_id:
-        raise ValueError("id is required")
+        raise ValidationError("id is required")
 
     as_business = bool(_arg(args, "business", default=False))
     as_personal = bool(_arg(args, "personal", default=False))
     if as_business == as_personal:
-        raise ValueError("Specify exactly one of --business or --personal")
+        raise ValidationError("Specify exactly one of --business or --personal")
 
     backfill = bool(_arg(args, "backfill", default=False))
     new_flag = 1 if as_business else 0
@@ -410,12 +429,21 @@ def handle_set_business(args, conn: sqlite3.Connection) -> dict[str, Any]:
             or 0
         )
 
-    conn.commit()
-    account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
     changed = old_flag != new_flag
 
     mode = "business" if new_flag else "personal"
-    cli_report = f"Account {account_id} set {mode} (backfilled={backfilled_transactions})"
+    cli_report = (
+        f"[DRY RUN] Would set account {account_id} {mode} (backfilled={backfilled_transactions})"
+        if dry_run
+        else f"Account {account_id} set {mode} (backfilled={backfilled_transactions})"
+    )
+
+    if dry_run:
+        account = _account_preview(row, is_business=new_flag)
+        conn.rollback()
+    else:
+        conn.commit()
+        account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
 
     return {
         "data": {
@@ -424,6 +452,7 @@ def handle_set_business(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "old_is_business": old_flag,
             "new_is_business": new_flag,
             "changed": changed,
+            **({"dry_run": True} if dry_run else {}),
             "backfill": {
                 "enabled": backfill,
                 "transactions_updated": backfilled_transactions,
@@ -439,9 +468,10 @@ def handle_set_business(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     account_id = str(_arg(args, "id", default="") or "").strip()
     if not account_id:
-        raise ValueError("id is required")
+        raise ValidationError("id is required")
 
     cascade = bool(_arg(args, "cascade", default=False))
     force = bool(_arg(args, "force", default=False))
@@ -460,7 +490,7 @@ def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
     ).fetchall()
     alias_ids = [str(alias_row["hash_account_id"]) for alias_row in alias_rows]
     if alias_ids and not force:
-        raise ValueError(
+        raise ValidationError(
             f"Account {account_id} is canonical target for {len(alias_ids)} alias(es). "
             "Use --force to deactivate anyway."
         )
@@ -511,10 +541,14 @@ def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
             or 0
         )
 
-    conn.commit()
-
-    account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
-    linked_subscriptions = _linked_subscriptions(conn, account_id)
+    if dry_run:
+        account = _account_preview(row, is_active=0 if was_active else int(row["is_active"] or 0))
+        linked_subscriptions = _linked_subscriptions(conn, account_id)
+        conn.rollback()
+    else:
+        conn.commit()
+        account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
+        linked_subscriptions = _linked_subscriptions(conn, account_id)
 
     cli_parts = [f"Account {account_id} deactivated" if account_rows_updated else f"Account {account_id} already inactive"]
     if alias_ids and force:
@@ -524,6 +558,12 @@ def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
         cli_parts.append(f"cascade_subs={deactivated_subscriptions}")
     if linked_subscriptions:
         cli_parts.append(f"linked_subscriptions={len(linked_subscriptions)}")
+    if dry_run:
+        cli_parts[0] = (
+            f"[DRY RUN] Would deactivate account {account_id}"
+            if account_rows_updated
+            else f"[DRY RUN] Account {account_id} is already inactive"
+        )
 
     return {
         "data": {
@@ -531,6 +571,7 @@ def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "account_id": account_id,
             "deactivated": bool(account_rows_updated),
             "already_inactive": not was_active,
+            **({"dry_run": True} if dry_run else {}),
             "cascade": {
                 "enabled": cascade,
                 "deactivated_transactions": deactivated_transactions,
@@ -554,9 +595,10 @@ def handle_deactivate(args, conn: sqlite3.Connection) -> dict[str, Any]:
 
 
 def handle_activate(args, conn: sqlite3.Connection) -> dict[str, Any]:
+    dry_run = bool(getattr(args, "dry_run", False))
     account_id = str(_arg(args, "id", default="") or "").strip()
     if not account_id:
-        raise ValueError("id is required")
+        raise ValidationError("id is required")
 
     row = _fetch_account_or_raise(conn, account_id)
     was_active = int(row["is_active"] or 0) == 1
@@ -576,9 +618,12 @@ def handle_activate(args, conn: sqlite3.Connection) -> dict[str, Any]:
             ).rowcount
             or 0
         )
-    conn.commit()
-
-    account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
+    if dry_run:
+        account = _account_preview(row, is_active=1)
+        conn.rollback()
+    else:
+        conn.commit()
+        account = _account_to_dict(_fetch_account_or_raise(conn, account_id))
 
     return {
         "data": {
@@ -586,14 +631,23 @@ def handle_activate(args, conn: sqlite3.Connection) -> dict[str, Any]:
             "account_id": account_id,
             "activated": bool(account_rows_updated),
             "already_active": was_active,
+            **({"dry_run": True} if dry_run else {}),
         },
         "summary": {
             "total_accounts": 1,
             "activated_accounts": int(bool(account_rows_updated)),
         },
         "cli_report": (
-            f"Account {account_id} activated"
-            if account_rows_updated
-            else f"Account {account_id} already active"
+            (
+                f"[DRY RUN] Would activate account {account_id}"
+                if account_rows_updated
+                else f"[DRY RUN] Account {account_id} is already active"
+            )
+            if dry_run
+            else (
+                f"Account {account_id} activated"
+                if account_rows_updated
+                else f"Account {account_id} already active"
+            )
         ),
     }

@@ -5,6 +5,7 @@ import uuid
 from pathlib import Path
 
 from finance_cli.__main__ import main
+from finance_cli.categorizer import MatchResult
 from finance_cli.db import connect, initialize_database
 
 
@@ -97,6 +98,7 @@ def test_cat_normalize_dry_run_reports_counts(tmp_path: Path, monkeypatch, capsy
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["status"] == "success"
+    assert payload["cli_report"].splitlines()[0] == "[DRY RUN] Would normalize categories"
     assert payload["data"]["dry_run"] is True
     assert payload["data"]["source_category_backfilled"]["plaid"] == 1
     assert payload["data"]["source_category_backfilled"]["csv_pdf"] == 2
@@ -131,6 +133,7 @@ def test_cat_normalize_remaps_and_deletes_legacy_categories(tmp_path: Path, monk
     payload = json.loads(capsys.readouterr().out)
 
     assert payload["status"] == "success"
+    assert payload["cli_report"].splitlines()[0] == "Normalized categories"
     assert payload["data"]["dry_run"] is False
     assert payload["data"]["transactions_moved"] == 1
     assert payload["data"]["transactions_nulled"] == 1
@@ -299,3 +302,82 @@ def test_cat_auto_categorize_reprocesses_mapping_sources_and_skips_reviewed(tmp_
         "ROW PLAID",
         "ROW CATEGORY_MAPPING",
     }
+
+
+def test_cat_auto_categorize_summary_total_amount_matches_previewed_rows(
+    tmp_path: Path,
+    monkeypatch,
+    capsys,
+) -> None:
+    db_path = tmp_path / "finance.db"
+    monkeypatch.setenv("FINANCE_CLI_DB", str(db_path))
+    initialize_database(db_path)
+
+    category_id = uuid.uuid4().hex
+    matched_expense_id = uuid.uuid4().hex
+    matched_refund_id = uuid.uuid4().hex
+    unmatched_id = uuid.uuid4().hex
+
+    with connect(db_path) as conn:
+        conn.execute(
+            "INSERT INTO categories (id, name, is_system) VALUES (?, 'Dining', 1)",
+            (category_id,),
+        )
+        for txn_id, description, amount_cents in (
+            (matched_expense_id, "MATCHED EXPENSE", -1234),
+            (matched_refund_id, "MATCHED REFUND", 500),
+            (unmatched_id, "UNMATCHED ROW", -999),
+        ):
+            conn.execute(
+                """
+                INSERT INTO transactions (
+                    id, date, description, amount_cents, source, is_active
+                ) VALUES (?, '2026-01-01', ?, ?, 'manual', 1)
+                """,
+                (txn_id, description, amount_cents),
+            )
+        conn.commit()
+
+    def _fake_match(conn, description, use_type, source_category=None, is_payment=False):
+        if not str(description).startswith("MATCHED"):
+            return None
+        return MatchResult(
+            category_id=category_id,
+            category_source="keyword_rule",
+            category_confidence=1.0,
+            category_rule_id=None,
+        )
+
+    monkeypatch.setattr("finance_cli.commands.cat.match_transaction", _fake_match)
+
+    code = main(["cat", "auto-categorize", "--dry-run"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+
+    assert payload["status"] == "success"
+    assert payload["data"]["updated"] == 2
+    assert payload["summary"] == {
+        "total_transactions": 2,
+        "total_amount": -7.34,
+    }
+    assert payload["cli_report"] == "[DRY RUN] Would auto-categorize 2 transactions"
+
+    with connect(db_path) as conn:
+        rows = conn.execute(
+            """
+            SELECT id, category_id
+              FROM transactions
+             WHERE id IN (?, ?, ?)
+             ORDER BY id
+            """,
+            (matched_expense_id, matched_refund_id, unmatched_id),
+        ).fetchall()
+
+    assert all(row["category_id"] is None for row in rows)
+
+    code = main(["cat", "auto-categorize"])
+    assert code == 0
+    payload = json.loads(capsys.readouterr().out)
+    assert payload["status"] == "success"
+    assert payload["data"]["updated"] == 2
+    assert payload["cli_report"] == "Auto-categorized 2 transactions"
